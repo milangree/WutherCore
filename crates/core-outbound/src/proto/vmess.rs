@@ -87,8 +87,9 @@ use crate::proto::vmess_kdf::{
     KDF_AEAD_RESP_HEADER_PAYLOAD_IV, KDF_AEAD_RESP_HEADER_PAYLOAD_KEY,
 };
 use crate::transport::{
+    grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
     tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
-    TlsOptions, Transport, WsOptions, XhttpOptions,
+    GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
 };
 
 pub const VMESS_OPTION_CHUNK_STREAM: u8 = 0x01;
@@ -158,8 +159,41 @@ pub struct VmessOutbound {
     pub sni: Option<String>,
     pub insecure: bool,
     pub alpn: Vec<String>,
+    pub network: VmessNetwork,
     pub ws: Option<WsOptions>,
+    pub http: Option<HttpOptions>,
+    pub h2: Option<H2Options>,
+    pub grpc: Option<GrpcOptions>,
     pub xhttp: Option<XhttpOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmessNetwork {
+    Tcp,
+    Ws,
+    Http,
+    H2,
+    Grpc,
+    Xhttp,
+}
+
+impl VmessNetwork {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "ws" | "websocket" => Self::Ws,
+            "http" => Self::Http,
+            "h2" | "http2" | "http/2" => Self::H2,
+            "grpc" | "gun" => Self::Grpc,
+            "xhttp" | "splithttp" => Self::Xhttp,
+            _ => Self::Tcp,
+        }
+    }
+}
+
+impl Default for VmessNetwork {
+    fn default() -> Self {
+        Self::Tcp
+    }
 }
 
 impl VmessOutbound {
@@ -181,8 +215,70 @@ impl VmessOutbound {
             sni: None,
             insecure: false,
             alpn: vec![],
+            network: VmessNetwork::Tcp,
             ws: None,
+            http: None,
+            h2: None,
+            grpc: None,
             xhttp: None,
+        }
+    }
+
+    fn tls_opts(&self) -> TlsOptions {
+        TlsOptions {
+            enabled: self.tls,
+            sni: self.sni.clone(),
+            insecure: self.insecure,
+            alpn: self.alpn.clone(),
+        }
+    }
+
+    async fn dial_transport(&self) -> std::io::Result<BoxedStream> {
+        match self.network {
+            VmessNetwork::Tcp => {
+                if self.tls {
+                    TlsTransport::new(self.tls_opts())
+                        .connect(&self.host, self.port)
+                        .await
+                } else {
+                    TcpTransport::default().connect(&self.host, self.port).await
+                }
+            }
+            VmessNetwork::Ws => {
+                let ws = self.ws.clone().unwrap_or_else(|| WsOptions {
+                    enabled: true,
+                    path: "/".into(),
+                    host: None,
+                    headers: vec![],
+                });
+                WsTransport::new(ws, self.tls)
+                    .connect(&self.host, self.port)
+                    .await
+            }
+            VmessNetwork::Http => {
+                let opts = self.http.clone().unwrap_or_default();
+                HttpTransport::new(opts, self.tls_opts())
+                    .connect(&self.host, self.port)
+                    .await
+            }
+            VmessNetwork::H2 => {
+                let opts = self.h2.clone().unwrap_or_default();
+                H2Transport::new(opts, self.tls_opts())
+                    .connect(&self.host, self.port)
+                    .await
+            }
+            VmessNetwork::Grpc => {
+                let opts = self.grpc.clone().unwrap_or_default();
+                GrpcTransport::new(opts, self.tls_opts())
+                    .connect(&self.host, self.port)
+                    .await
+            }
+            VmessNetwork::Xhttp => {
+                let opts = self.xhttp.clone().unwrap_or_default();
+                XhttpTransport::new(self.host.clone(), self.port, opts)
+                    .connect(&self.host, self.port)
+                    .await
+            }
         }
     }
 }
@@ -196,26 +292,7 @@ impl OutboundAdapter for VmessOutbound {
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let stream: BoxedStream = if let Some(x) = self.xhttp.as_ref().filter(|x| x.enabled) {
-            XhttpTransport::new(self.host.clone(), self.port, x.clone())
-                .connect(&self.host, self.port)
-                .await?
-        } else if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
-            WsTransport::new(ws.clone(), self.tls)
-                .connect(&self.host, self.port)
-                .await?
-        } else if self.tls {
-            TlsTransport::new(TlsOptions {
-                enabled: true,
-                sni: self.sni.clone(),
-                insecure: self.insecure,
-                alpn: self.alpn.clone(),
-            })
-            .connect(&self.host, self.port)
-            .await?
-        } else {
-            TcpTransport::default().connect(&self.host, self.port).await?
-        };
+        let stream: BoxedStream = self.dial_transport().await?;
 
         let cmd_key = compute_cmd_key(&self.uuid);
 

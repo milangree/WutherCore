@@ -28,13 +28,16 @@ use crate::proto::trojan::TrojanOutbound;
 use crate::proto::trusttunnel::TrustTunnelOutbound;
 use crate::proto::tuic::TuicOutbound;
 use crate::proto::vless::VlessOutbound;
-use crate::proto::vmess::{VmessOutbound, VmessSecurity};
+use crate::proto::vless::VlessNetwork;
+use crate::proto::vmess::{VmessNetwork, VmessOutbound, VmessSecurity};
 use crate::proto::vmess_legacy::VmessLegacyOutbound;
 use crate::proto::wireguard::WireGuardOutbound;
 use crate::socks5::Socks5Outbound;
 use crate::stub::StubOutbound;
 use crate::proto::xhttp::Config as XhttpConfig;
-use crate::transport::{WsOptions, XhttpOptions};
+use crate::transport::{
+    GrpcOptions, H2Options, HttpOptions, WsOptions, XhttpOptions,
+};
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
 
@@ -198,13 +201,10 @@ fn build_vmess(node: &ParsedNode) -> SharedOutbound {
         if let Some(alpn) = node.params.get("alpn") {
             ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
         }
-        if node.transport == "ws" || node.params.get("net").map(|s| s == "ws").unwrap_or(false) {
-            ob.ws = Some(WsOptions {
-                enabled: true,
-                path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
-                host: node.params.get("host").cloned(),
-                headers: vec![],
-            });
+        // VMess Legacy 也支持 ws transport
+        let net = resolve_network_string(node);
+        if VmessNetwork::parse(&net) == VmessNetwork::Ws {
+            ob.ws = Some(build_ws_options(node));
         }
         return Arc::new(ob);
     }
@@ -235,20 +235,52 @@ fn build_vmess(node: &ParsedNode) -> SharedOutbound {
     if let Some(alpn) = node.params.get("alpn") {
         ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
     }
-    if node.transport == "ws" || node.params.get("net").map(|s| s == "ws").unwrap_or(false) {
-        ob.ws = Some(WsOptions {
-            enabled: true,
-            path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
-            host: node.params.get("host").cloned(),
-            headers: vec![],
-        });
-    } else if node.transport == "xhttp"
-        || node.transport == "splithttp"
-        || node.params.get("net").map(|s| s == "xhttp" || s == "splithttp").unwrap_or(false)
-    {
-        ob.xhttp = Some(build_xhttp_options(node, ob.sni.clone(), ob.insecure, ob.alpn.clone()));
-    }
+    // VMess network 分发：tcp / ws / http / h2 / grpc / xhttp
+    let network_str = resolve_network_string(node);
+    ob.network = VmessNetwork::parse(&network_str);
+    apply_vmess_network_options(node, &mut ob);
     Arc::new(ob)
+}
+
+/// 从 ParsedNode 解析 network 字段：优先 params["net"]（VMess JSON）/
+/// params["network"]（Clash YAML）/ params["type"]（VLESS URI）
+fn resolve_network_string(node: &ParsedNode) -> String {
+    if let Some(v) = node.params.get("network") {
+        return v.clone();
+    }
+    if let Some(v) = node.params.get("net") {
+        return v.clone();
+    }
+    if !node.transport.is_empty() && node.transport != "tcp" {
+        return node.transport.clone();
+    }
+    "tcp".into()
+}
+
+fn apply_vmess_network_options(node: &ParsedNode, ob: &mut VmessOutbound) {
+    match ob.network {
+        VmessNetwork::Tcp => {}
+        VmessNetwork::Ws => {
+            ob.ws = Some(build_ws_options(node));
+        }
+        VmessNetwork::Http => {
+            ob.http = Some(build_http_options(node));
+        }
+        VmessNetwork::H2 => {
+            ob.h2 = Some(build_h2_options(node));
+        }
+        VmessNetwork::Grpc => {
+            ob.grpc = Some(build_grpc_options(node));
+        }
+        VmessNetwork::Xhttp => {
+            ob.xhttp = Some(build_xhttp_options(
+                node,
+                ob.sni.clone(),
+                ob.insecure,
+                ob.alpn.clone(),
+            ));
+        }
+    }
 }
 
 fn build_vless(node: &ParsedNode) -> SharedOutbound {
@@ -268,17 +300,98 @@ fn build_vless(node: &ParsedNode) -> SharedOutbound {
     if let Some(alpn) = node.params.get("alpn") {
         ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
     }
-    if node.transport == "ws" {
-        ob.ws = Some(WsOptions {
-            enabled: true,
-            path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
-            host: node.params.get("host").cloned(),
-            headers: vec![],
-        });
-    } else if node.transport == "xhttp" || node.transport == "splithttp" {
-        ob.xhttp = Some(build_xhttp_options(node, ob.sni.clone(), ob.insecure, ob.alpn.clone()));
-    }
+    let network_str = resolve_network_string(node);
+    ob.network = VlessNetwork::parse(&network_str);
+    apply_vless_network_options(node, &mut ob);
     Arc::new(ob)
+}
+
+fn apply_vless_network_options(node: &ParsedNode, ob: &mut VlessOutbound) {
+    match ob.network {
+        VlessNetwork::Tcp => {}
+        VlessNetwork::Ws => {
+            ob.ws = Some(build_ws_options(node));
+        }
+        VlessNetwork::Http => {
+            ob.http = Some(build_http_options(node));
+        }
+        VlessNetwork::H2 => {
+            ob.h2 = Some(build_h2_options(node));
+        }
+        VlessNetwork::Grpc => {
+            ob.grpc = Some(build_grpc_options(node));
+        }
+        VlessNetwork::Xhttp => {
+            ob.xhttp = Some(build_xhttp_options(
+                node,
+                ob.sni.clone(),
+                ob.insecure,
+                ob.alpn.clone(),
+            ));
+        }
+    }
+}
+
+fn build_ws_options(node: &ParsedNode) -> WsOptions {
+    WsOptions {
+        enabled: true,
+        path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
+        host: node.params.get("host").cloned(),
+        headers: vec![],
+    }
+}
+
+fn build_http_options(node: &ParsedNode) -> HttpOptions {
+    let path: Vec<String> = node
+        .params
+        .get("path")
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|| vec!["/".into()]);
+    let host: Vec<String> = node
+        .params
+        .get("host")
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    HttpOptions {
+        enabled: true,
+        method: node.params.get("http-method").cloned().unwrap_or_default(),
+        path,
+        host,
+        headers: vec![],
+    }
+}
+
+fn build_h2_options(node: &ParsedNode) -> H2Options {
+    let host: Vec<String> = node
+        .params
+        .get("host")
+        .or_else(|| node.params.get("h2-host"))
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    H2Options {
+        enabled: true,
+        host,
+        path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
+        method: node.params.get("h2-method").cloned().unwrap_or_default(),
+    }
+}
+
+fn build_grpc_options(node: &ParsedNode) -> GrpcOptions {
+    GrpcOptions {
+        enabled: true,
+        service_name: node
+            .params
+            .get("serviceName")
+            .or_else(|| node.params.get("grpc-service-name"))
+            .cloned()
+            .unwrap_or_default(),
+        user_agent: node
+            .params
+            .get("grpc-user-agent")
+            .cloned()
+            .unwrap_or_default(),
+        host: node.params.get("host").cloned().unwrap_or_default(),
+    }
 }
 
 fn build_xhttp_options(
