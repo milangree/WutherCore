@@ -1,0 +1,17 @@
+[package]
+name = "core-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RPKernel 持久化层 —— redb 嵌入式 KV"
+
+[dependencies]
+redb        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+parking_lot = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tokio       = { workspace = true }
+ahash       = { workspace = true }
+once_cell   = { workspace = true }

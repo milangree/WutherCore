@@ -1,0 +1,18 @@
+[package]
+name = "tests-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-config  = { workspace = true }
+core-runtime = { workspace = true }
+core-inbound = { workspace = true }
+core-smart   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

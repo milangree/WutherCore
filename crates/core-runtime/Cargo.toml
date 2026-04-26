@@ -1,0 +1,25 @@
+[package]
+name = "core-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-config   = { workspace = true }
+core-route    = { workspace = true }
+core-ruleset  = { workspace = true }
+core-resolver = { workspace = true }
+core-outbound = { workspace = true }
+core-smart    = { workspace = true }
+core-store    = { workspace = true }
+core-observe  = { workspace = true }
+tokio         = { workspace = true }
+async-trait   = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+parking_lot   = { workspace = true }
+dashmap       = { workspace = true }
+once_cell     = { workspace = true }
+bytes         = { workspace = true }
+futures       = { workspace = true }

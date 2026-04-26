@@ -1,0 +1,14 @@
+version: 1
+profile: desktop
+name: "minimal-desktop"
+
+# 模板 A：最小配置，只需替换订阅链接即可使用。
+feeds:
+  my_airport: "https://example.com/your-subscription"
+
+# 内核会自动补全：
+#   listen.local = 7890, listen.panel = 9090, share = false
+#   groups.main.choose = smart (use 所有 feeds + nodes)
+#   route.preset = cn_smart
+#   resolver.mode = smart
+#   smart.on = true, ui.on = true

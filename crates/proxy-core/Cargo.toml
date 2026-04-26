@@ -1,0 +1,34 @@
+[package]
+name = "proxy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RPKernel CLI 入口 —— Friendly YAML 代理内核"
+
+[[bin]]
+name = "proxy-core"
+path = "src/main.rs"
+
+[dependencies]
+core-config   = { workspace = true }
+core-runtime  = { workspace = true }
+core-feeds    = { workspace = true }
+core-store    = { workspace = true }
+core-ruleset  = { workspace = true }
+core-inbound  = { workspace = true }
+core-outbound = { workspace = true }
+core-route    = { workspace = true }
+core-resolver = { workspace = true }
+core-smart    = { workspace = true }
+core-api      = { workspace = true }
+core-capture  = { workspace = true }
+core-mesh     = { workspace = true }
+core-observe  = { workspace = true }
+clap          = { workspace = true }
+tokio         = { workspace = true }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json    = { workspace = true }
+serde_yaml    = { workspace = true }
+async-trait   = { workspace = true }

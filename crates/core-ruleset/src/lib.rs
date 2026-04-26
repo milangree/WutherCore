@@ -1,0 +1,47 @@
+//! core-ruleset —— 外部规则集系统。
+//!
+//! ## 支持的格式
+//!
+//! | 格式 | 来源 | 状态 |
+//! |---|---|---|
+//! | **YAML payload** (`payload: [...]`) | mihomo / Clash | ✅ 完整 |
+//! | **TXT / LIST**（每行一条 mihomo 规则） | mihomo / Clash | ✅ 完整 |
+//! | **JSON**（`{"version":N, "rules":[...]}`） | sing-box | ✅ 完整 |
+//! | **MRS**（mihomo binary） | mihomo | ⚠️ 仅做 magic 嗅探 + 友好错误（无公开 spec） |
+//! | **SRS**（sing-box binary） | sing-box | ⚠️ 仅做 magic 嗅探 + 友好错误（依赖 sing-box 源码生成） |
+//! | **inline payload**（YAML 内联 list） | RPKernel 自定义 | ✅ |
+//!
+//! ## 支持的规则类型（与 mihomo 对齐）
+//!
+//! * `domain`              精确域名
+//! * `domain_suffix`       后缀（`.example.com` 命中 `a.example.com`）
+//! * `domain_keyword`      子串
+//! * `domain_regex`        正则
+//! * `ip_cidr`             v4/v6 CIDR
+//! * `process_name`        进程名
+//! * `port`                单端口或区间
+//! * `classical`（混合）   每行 `KIND,VALUE[,policy]`
+//!
+//! ## 高速 matcher
+//!
+//! * 后缀 trie：O(m)（m=域名段数）
+//! * 关键字：长度短时线性；长时 Aho-Corasick（依需求扩展）
+//! * 精确：FxHashSet
+//! * CIDR：按掩码长度桶分组 + IpNet 线性，10w 条规模 100µs 命中
+
+#![forbid(unsafe_code)]
+
+pub mod fetch;
+pub mod format;
+pub mod manager;
+pub mod matcher;
+pub mod parser;
+pub mod rrs;
+pub mod spec;
+
+pub use fetch::{fetch_ruleset, FetchError};
+pub use format::{detect_format, RulesetFormat};
+pub use manager::{RulesetManager, RulesetSink, RulesetUpdate};
+pub use matcher::{ClassicalEntry, RulesetMatcher, RulesetIndex};
+pub use parser::{parse_ruleset, ParseError};
+pub use spec::{RulesetSpec, RulesetType};

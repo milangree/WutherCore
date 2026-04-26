@@ -1,0 +1,45 @@
+version: 1
+profile: desktop
+name: "daily-enhanced"
+
+listen:
+  local: 7890
+  panel: 9090
+  share: false
+
+feeds:
+  my_airport:
+    url: "https://example.com/sub"
+    every: 12h
+    keep:
+      name_has: [HK, JP, SG, TW, US]
+    rename:
+      remove: ["倍率", "剩余流量"]
+
+groups:
+  main:
+    choose: smart
+    use: [my_airport]
+    prefer: [HK, JP, SG]
+  media:
+    choose: smart
+    use: [my_airport]
+    prefer: [US, JP, SG]
+
+route:
+  preset: custom
+  steps:
+    - "home -> direct"
+    - "ads -> block"
+    - "cn -> direct"
+    - "netflix -> media"
+    - "youtube -> media"
+    - "telegram -> main"
+    - "any -> main"
+
+resolver:
+  mode: smart
+
+ui:
+  on: true
+  secret: "change-this-token"

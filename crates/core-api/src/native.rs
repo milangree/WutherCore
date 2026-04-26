@@ -1,0 +1,277 @@
+use std::sync::Arc;
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, patch, post},
+    Json, Router,
+};
+use core_route::{FlowContext, NetworkKind};
+use core_runtime::{Runtime, UrlTester};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Clone)]
+pub struct NativeState {
+    pub runtime: Arc<Runtime>,
+    pub started_at: std::time::Instant,
+    pub secret: Option<String>,
+    pub urltest: Arc<UrlTester>,
+}
+
+pub fn router(state: NativeState) -> Router {
+    Router::new()
+        .route("/status", get(status))
+        .route("/traffic", get(traffic))
+        .route("/nodes", get(nodes))
+        .route("/groups", get(groups))
+        .route("/groups/:name", patch(patch_group))
+        .route("/connections", get(list_conns))
+        .route("/connections/:id", delete(close_conn))
+        .route("/resolver/query", get(resolver_query))
+        .route("/route/check", get(route_check))
+        .route("/capture/state", get(capture_state))
+        .route("/smart/why", get(smart_why))
+        .route("/smart/pin", post(smart_pin))
+        .route("/smart/avoid", post(smart_avoid))
+        .route("/smart/reset", post(smart_reset))
+        .route("/smart/cache", get(smart_cache))
+        .route("/smart/nodes/:group", get(smart_nodes))
+        .with_state(state)
+}
+
+async fn status(State(s): State<NativeState>) -> impl IntoResponse {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": s.started_at.elapsed().as_secs(),
+        "profile": format!("{:?}", s.runtime.plan.profile).to_lowercase(),
+        "platform": std::env::consts::OS,
+        "groups": s.runtime.group_names(),
+        "outbounds": s.runtime.outbound_names(),
+    }))
+}
+
+async fn traffic(State(s): State<NativeState>) -> impl IntoResponse {
+    Json(s.runtime.metrics.snapshot())
+}
+
+async fn nodes(State(s): State<NativeState>) -> impl IntoResponse {
+    let nodes: Vec<_> = s
+        .runtime
+        .plan
+        .nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "name": n.name,
+                "protocol": n.protocol.as_str(),
+                "host": n.host,
+                "port": n.port,
+                "tls": n.tls,
+                "transport": n.transport,
+            })
+        })
+        .collect();
+    Json(json!({ "nodes": nodes }))
+}
+
+async fn groups(State(s): State<NativeState>) -> impl IntoResponse {
+    let groups: Vec<_> = s
+        .runtime
+        .groups
+        .read()
+        .iter()
+        .map(|(_, g)| {
+            json!({
+                "name": g.name(),
+                "members": g.members(),
+                "manual": g.current_manual(),
+            })
+        })
+        .collect();
+    Json(json!({ "groups": groups }))
+}
+
+#[derive(Deserialize)]
+struct GroupPatch {
+    pick: String,
+}
+
+async fn patch_group(
+    State(s): State<NativeState>,
+    Path(name): Path<String>,
+    Json(body): Json<GroupPatch>,
+) -> impl IntoResponse {
+    let exists = s.runtime.groups.read().contains_key(&name);
+    if !exists {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown group"}))).into_response();
+    }
+    s.runtime.set_group_manual(&name, &body.pick);
+    (StatusCode::OK, Json(json!({"ok": true, "group": name, "pick": body.pick}))).into_response()
+}
+
+async fn list_conns(State(s): State<NativeState>) -> impl IntoResponse {
+    Json(json!({ "connections": s.runtime.connections.list() }))
+}
+
+async fn close_conn(
+    State(s): State<NativeState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    s.runtime.connections.close(id);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct ResolverQuery {
+    host: String,
+}
+
+async fn resolver_query(
+    State(s): State<NativeState>,
+    Query(q): Query<ResolverQuery>,
+) -> impl IntoResponse {
+    match s.runtime.resolver.resolve(&q.host).await {
+        Ok(ips) => Json(json!({"host": q.host, "ips": ips})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RouteCheck {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    network: Option<String>,
+}
+
+async fn route_check(
+    State(s): State<NativeState>,
+    Query(q): Query<RouteCheck>,
+) -> impl IntoResponse {
+    let port = q.port.unwrap_or(443);
+    let network = match q.network.as_deref() {
+        Some("udp") => NetworkKind::Udp,
+        _ => NetworkKind::Tcp,
+    };
+    let ip = q.host.parse().ok();
+    let ctx = FlowContext {
+        host: q.host.clone(),
+        ip,
+        port,
+        network,
+        process: None,
+        protocol: None,
+    };
+    let (decision, kind, src) = s.runtime.route.decide(&ctx);
+    Json(json!({
+        "host": q.host,
+        "port": port,
+        "network": network.as_str(),
+        "decision": format!("{:?}", decision).to_lowercase(),
+        "matcher": kind,
+        "rule": src,
+    }))
+}
+
+async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
+    let c = &s.runtime.plan.capture;
+    Json(json!({
+        "on": c.on,
+        "method": format!("{:?}", c.method).to_lowercase(),
+        "traffic": format!("{:?}", c.traffic).to_lowercase(),
+        "stack": format!("{:?}", c.stack).to_lowercase(),
+        "platform": std::env::consts::OS,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SmartWhyParams {
+    host: String,
+    #[serde(default = "default_group")]
+    group: String,
+}
+
+fn default_group() -> String {
+    "main".into()
+}
+
+async fn smart_why(
+    State(s): State<NativeState>,
+    Query(q): Query<SmartWhyParams>,
+) -> impl IntoResponse {
+    let groups = s.runtime.groups.read();
+    let g = match groups.get(&q.group) {
+        Some(g) => g,
+        None => return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown group"}))).into_response(),
+    };
+    let ctx = core_smart::SmartContext {
+        group: q.group.clone(),
+        host: q.host.clone(),
+        prefer: vec![],
+        avoid: vec![],
+    };
+    let choice = s.runtime.smart.choose(&ctx, g.members());
+    Json(serde_json::to_value(&choice.explain).unwrap_or_default()).into_response()
+}
+
+#[derive(Deserialize)]
+struct PinBody {
+    host: String,
+    group: String,
+    node: String,
+}
+
+async fn smart_pin(
+    State(s): State<NativeState>,
+    Json(b): Json<PinBody>,
+) -> impl IntoResponse {
+    s.runtime.smart.pin(&b.host, &b.group, &b.node);
+    Json(json!({"ok": true}))
+}
+
+#[derive(Deserialize, Serialize)]
+struct AvoidBody {
+    node: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn smart_avoid(
+    State(s): State<NativeState>,
+    Json(b): Json<AvoidBody>,
+) -> impl IntoResponse {
+    s.runtime
+        .smart
+        .record_failure(&b.node, b.reason.clone().unwrap_or_else(|| "manual avoid".into()));
+    Json(json!({"ok": true}))
+}
+
+async fn smart_reset(State(s): State<NativeState>) -> impl IntoResponse {
+    if let Some(store) = &s.runtime.store {
+        match store.reset() {
+            Ok(()) => Json(json!({"ok": true, "reset": "store cleared"})).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        }
+    } else {
+        Json(json!({"ok": true, "note": "no store configured; nothing persisted"})).into_response()
+    }
+}
+
+async fn smart_cache(State(s): State<NativeState>) -> impl IntoResponse {
+    Json(json!({ "recent_explains": s.runtime.smart.recent_explains() }))
+}
+
+async fn smart_nodes(
+    State(s): State<NativeState>,
+    Path(group): Path<String>,
+) -> impl IntoResponse {
+    let groups = s.runtime.groups.read();
+    if let Some(g) = groups.get(&group) {
+        Json(json!({"group": g.name(), "members": g.members()})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "unknown group"}))).into_response()
+    }
+}

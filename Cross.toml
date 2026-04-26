@@ -1,0 +1,56 @@
+# cross 配置 —— RPKernel
+#
+# 1. 默认 Linux 目标使用稳定的 cross-rs 镜像。
+# 2. Android：cross 0.2.5 自带的 NDK r21 镜像缺 libunwind.a 链接路径，
+#    导致 ring 之类依赖链接失败。pre-build 会把 clang 资源目录里的
+#    libunwind.a 软链到 ld 默认搜索路径。
+#    （更推荐改用 cargo-ndk + 本机 NDK，参见 scripts/README.md。）
+
+[build]
+default-target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5"
+
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+
+[target.aarch64-linux-android]
+image = "ghcr.io/cross-rs/aarch64-linux-android:0.2.5"
+pre-build = [
+    """\
+set -eux ; \
+SRC=$(find /android-ndk -name 'libunwind.a' -path '*aarch64*' 2>/dev/null | head -1) ; \
+DST=/android-ndk/aarch64-linux-android/lib/libunwind.a ; \
+if [ -n "$SRC" ] && [ ! -e "$DST" ] ; then mkdir -p "$(dirname "$DST")" ; ln -sf "$SRC" "$DST" ; fi ; \
+SRC2=$(find /android-ndk -name 'libunwind.a' -path '*linux/aarch64*' 2>/dev/null | head -1) ; \
+DST2=$(find /android-ndk -type d -name 'aarch64-linux-android' -path '*lib/gcc*' 2>/dev/null | head -1) ; \
+if [ -n "$SRC2" ] && [ -n "$DST2" ] ; then ln -sf "$SRC2" "$DST2/libunwind.a" || true ; fi \
+"""
+]
+
+[target.armv7-linux-androideabi]
+image = "ghcr.io/cross-rs/armv7-linux-androideabi:0.2.5"
+pre-build = [
+    """\
+set -eux ; \
+SRC=$(find /android-ndk -name 'libunwind.a' -path '*arm-linux-androideabi*' 2>/dev/null | head -1) ; \
+DST=/android-ndk/arm-linux-androideabi/lib/libunwind.a ; \
+if [ -n "$SRC" ] && [ ! -e "$DST" ] ; then mkdir -p "$(dirname "$DST")" ; ln -sf "$SRC" "$DST" ; fi \
+"""
+]
+
+[target.x86_64-linux-android]
+image = "ghcr.io/cross-rs/x86_64-linux-android:0.2.5"
+
+[target.i686-linux-android]
+image = "ghcr.io/cross-rs/i686-linux-android:0.2.5"

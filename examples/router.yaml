@@ -1,0 +1,43 @@
+version: 1
+profile: router
+name: "transparent-gateway"
+
+listen:
+  local: 7890
+  panel: 9090
+  share: home
+
+feeds:
+  my_airport: "https://example.com/sub"
+
+groups:
+  main:
+    choose: smart
+    use: [my_airport]
+    prefer: [HK, JP, SG, TW]
+
+capture:
+  on: true
+  method: auto
+  traffic: lan
+  resolver: hijack
+  exclude:
+    cidr:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+      - "100.64.0.0/10"
+      - "fd7a:115c:a1e0::/48"
+
+route:
+  preset: cn_smart
+  final: main
+
+resolver:
+  mode: smart
+  fake: auto
+
+mesh:
+  tailscale:
+    on: true
+    keep_tailnet_direct: true

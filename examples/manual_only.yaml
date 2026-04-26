@@ -1,0 +1,19 @@
+version: 1
+profile: desktop
+name: "manual-nodes-only"
+
+# 模板 D：仅手动节点，不依赖订阅。
+nodes:
+  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK-01"
+  - "trojan://password@example.com:443?sni=example.com#US-01"
+  - name: "JP-Manual"
+    link: "vless://uuid@example.com:443?security=tls#JP-Manual"
+
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+
+route:
+  preset: cn_smart
+  final: main

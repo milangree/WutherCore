@@ -1,0 +1,21 @@
+[package]
+name = "core-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-config  = { workspace = true }
+core-smart   = { workspace = true }
+core-runtime = { workspace = true }
+core-route   = { workspace = true }
+core-observe = { workspace = true }
+tokio        = { workspace = true }
+axum         = { workspace = true }
+tower        = { workspace = true }
+tower-http   = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+parking_lot  = { workspace = true }

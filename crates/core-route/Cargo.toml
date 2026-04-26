@@ -1,0 +1,15 @@
+[package]
+name = "core-route"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-config  = { workspace = true }
+core-ruleset = { workspace = true }
+ipnet        = { workspace = true }
+ahash        = { workspace = true }
+once_cell    = { workspace = true }
+regex        = { workspace = true }
+serde        = { workspace = true }
+tracing      = { workspace = true }

@@ -1,0 +1,29 @@
+version: 1
+profile: desktop
+name: "with-real-feed"
+
+# 演示 feeds 完整链路：
+#   - 从本地文件抓 base64 订阅；
+#   - keep 只保留 HK/JP/SG/US；drop 丢弃 Expire；
+#   - rename.remove 去掉机场常见的"倍率/剩余流量"标签；
+# 启动后 main 分组的 members 会自动从 feed 占位符替换为真实节点名。
+feeds:
+  airport:
+    url: "file://D:/RustProjects/RPKernel/data/feeds-test/airport.b64"
+    every: 5m
+    keep:
+      name_has: [HK, JP, SG, US]
+    drop:
+      name_has: [Expire]
+    rename:
+      remove: ["_倍率1x", "_倍率2x", "_剩余流量"]
+
+groups:
+  main:
+    choose: smart
+    use: [airport]
+    prefer: [HK, JP, SG]
+
+route:
+  preset: cn_smart
+  final: main
