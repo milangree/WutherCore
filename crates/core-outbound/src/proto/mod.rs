@@ -38,3 +38,4 @@ pub mod wireguard;
 pub mod vmess;
 pub mod vmess_kdf;
 pub mod vmess_legacy;
+pub mod xhttp;

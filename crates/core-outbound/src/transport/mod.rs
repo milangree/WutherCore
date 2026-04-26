@@ -16,6 +16,9 @@ use crate::adapter::BoxedStream;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
+pub mod xhttp_transport;
+
+pub use xhttp_transport::{XhttpOptions, XhttpTransport};
 
 #[async_trait]
 pub trait Transport: Send + Sync {

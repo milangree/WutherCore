@@ -14,7 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::transport::{tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, TlsOptions, Transport, WsOptions};
+use crate::transport::{
+    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+    TlsOptions, Transport, WsOptions, XhttpOptions,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct VlessOutbound {
@@ -27,6 +30,7 @@ pub struct VlessOutbound {
     pub insecure: bool,
     pub alpn: Vec<String>,
     pub ws: Option<WsOptions>,
+    pub xhttp: Option<XhttpOptions>,
 }
 
 impl VlessOutbound {
@@ -55,8 +59,12 @@ impl OutboundAdapter for VlessOutbound {
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        // 选择传输：ws 优先；否则 tls/tcp。
-        let stream: BoxedStream = if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
+        // 传输层优先级：xhttp > ws > tls > tcp
+        let stream: BoxedStream = if let Some(x) = self.xhttp.as_ref().filter(|x| x.enabled) {
+            XhttpTransport::new(self.host.clone(), self.port, x.clone())
+                .connect(&self.host, self.port)
+                .await?
+        } else if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
             WsTransport::new(ws.clone(), self.tls)
                 .connect(&self.host, self.port).await?
         } else if self.tls {

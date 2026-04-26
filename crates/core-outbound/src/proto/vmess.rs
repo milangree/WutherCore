@@ -87,7 +87,8 @@ use crate::proto::vmess_kdf::{
     KDF_AEAD_RESP_HEADER_PAYLOAD_IV, KDF_AEAD_RESP_HEADER_PAYLOAD_KEY,
 };
 use crate::transport::{
-    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, TlsOptions, Transport, WsOptions,
+    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+    TlsOptions, Transport, WsOptions, XhttpOptions,
 };
 
 pub const VMESS_OPTION_CHUNK_STREAM: u8 = 0x01;
@@ -158,6 +159,7 @@ pub struct VmessOutbound {
     pub insecure: bool,
     pub alpn: Vec<String>,
     pub ws: Option<WsOptions>,
+    pub xhttp: Option<XhttpOptions>,
 }
 
 impl VmessOutbound {
@@ -180,6 +182,7 @@ impl VmessOutbound {
             insecure: false,
             alpn: vec![],
             ws: None,
+            xhttp: None,
         }
     }
 }
@@ -193,7 +196,11 @@ impl OutboundAdapter for VmessOutbound {
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let stream: BoxedStream = if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
+        let stream: BoxedStream = if let Some(x) = self.xhttp.as_ref().filter(|x| x.enabled) {
+            XhttpTransport::new(self.host.clone(), self.port, x.clone())
+                .connect(&self.host, self.port)
+                .await?
+        } else if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
             WsTransport::new(ws.clone(), self.tls)
                 .connect(&self.host, self.port)
                 .await?

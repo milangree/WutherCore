@@ -33,7 +33,8 @@ use crate::proto::vmess_legacy::VmessLegacyOutbound;
 use crate::proto::wireguard::WireGuardOutbound;
 use crate::socks5::Socks5Outbound;
 use crate::stub::StubOutbound;
-use crate::transport::WsOptions;
+use crate::proto::xhttp::Config as XhttpConfig;
+use crate::transport::{WsOptions, XhttpOptions};
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
 
@@ -241,6 +242,11 @@ fn build_vmess(node: &ParsedNode) -> SharedOutbound {
             host: node.params.get("host").cloned(),
             headers: vec![],
         });
+    } else if node.transport == "xhttp"
+        || node.transport == "splithttp"
+        || node.params.get("net").map(|s| s == "xhttp" || s == "splithttp").unwrap_or(false)
+    {
+        ob.xhttp = Some(build_xhttp_options(node, ob.sni.clone(), ob.insecure, ob.alpn.clone()));
     }
     Arc::new(ob)
 }
@@ -269,8 +275,79 @@ fn build_vless(node: &ParsedNode) -> SharedOutbound {
             host: node.params.get("host").cloned(),
             headers: vec![],
         });
+    } else if node.transport == "xhttp" || node.transport == "splithttp" {
+        ob.xhttp = Some(build_xhttp_options(node, ob.sni.clone(), ob.insecure, ob.alpn.clone()));
     }
     Arc::new(ob)
+}
+
+fn build_xhttp_options(
+    node: &ParsedNode,
+    sni: Option<String>,
+    insecure: bool,
+    alpn: Vec<String>,
+) -> XhttpOptions {
+    let mut cfg = XhttpConfig::default();
+    if let Some(host) = node
+        .params
+        .get("host")
+        .or_else(|| node.params.get("xhttp-host"))
+    {
+        cfg.host = host.clone();
+    }
+    if let Some(path) = node.params.get("path") {
+        cfg.path = path.clone();
+    }
+    if let Some(mode) = node.params.get("mode").or_else(|| node.params.get("xhttp-mode")) {
+        cfg.mode = mode.clone();
+    }
+    if let Some(method) = node.params.get("uplink-http-method") {
+        cfg.uplink_http_method = method.clone();
+    }
+    if let Some(no_grpc) = node.params.get("no-grpc-header") {
+        cfg.no_grpc_header = no_grpc == "1" || no_grpc == "true";
+    }
+    if let Some(p) = node.params.get("x-padding-bytes") {
+        cfg.x_padding_bytes = p.clone();
+    }
+    if let Some(m) = node.params.get("x-padding-method") {
+        cfg.x_padding_method = m.clone();
+    }
+    if let Some(o) = node.params.get("x-padding-obfs-mode") {
+        cfg.x_padding_obfs_mode = o == "1" || o == "true";
+    }
+    if let Some(p) = node.params.get("session-placement") {
+        cfg.session_placement = p.clone();
+    }
+    if let Some(p) = node.params.get("seq-placement") {
+        cfg.seq_placement = p.clone();
+    }
+    if let Some(p) = node.params.get("uplink-data-placement") {
+        cfg.uplink_data_placement = p.clone();
+    }
+    if let Some(s) = node.params.get("sc-max-each-post-bytes") {
+        cfg.sc_max_each_post_bytes = s.clone();
+    }
+    if let Some(s) = node.params.get("sc-min-posts-interval-ms") {
+        cfg.sc_min_posts_interval_ms = s.clone();
+    }
+    let alpn_eff = if alpn.is_empty() {
+        vec!["h2".into()]
+    } else {
+        alpn
+    };
+    XhttpOptions {
+        enabled: true,
+        config: cfg,
+        sni,
+        insecure,
+        alpn: alpn_eff,
+        has_reality: node
+            .params
+            .get("security")
+            .map(|s| s == "reality")
+            .unwrap_or(false),
+    }
 }
 
 fn build_trojan(node: &ParsedNode) -> SharedOutbound {
