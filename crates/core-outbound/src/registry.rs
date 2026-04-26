@@ -21,7 +21,11 @@ use crate::proto::snell::{SnellCipher, SnellOutbound};
 use crate::proto::ss2022::{Ss22Cipher, Ss2022Outbound};
 use crate::proto::ssh::SshOutbound;
 use crate::proto::ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol};
+use crate::proto::sudoku::{
+    AeadMethod as SudokuAead, SudokuOutbound,
+};
 use crate::proto::trojan::TrojanOutbound;
+use crate::proto::trusttunnel::TrustTunnelOutbound;
 use crate::proto::tuic::TuicOutbound;
 use crate::proto::vless::VlessOutbound;
 use crate::proto::vmess::{VmessOutbound, VmessSecurity};
@@ -102,10 +106,8 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
         NodeProtocol::Tuic => build_tuic(node),
         NodeProtocol::Wireguard => build_wireguard(node),
         NodeProtocol::Mieru => build_mieru(node),
-        NodeProtocol::Sudoku | NodeProtocol::TrustTunnel => {
-            // mihomo 私有协议；保留 stub 接口，后续 PR 完整迁移
-            StubOutbound::new(node.name.clone(), proto_static_name(&node.protocol))
-        }
+        NodeProtocol::Sudoku => build_sudoku(node),
+        NodeProtocol::TrustTunnel => build_trusttunnel(node),
         ref other => StubOutbound::new(node.name.clone(), proto_static_name(other)),
     }
 }
@@ -460,6 +462,107 @@ fn build_mieru(node: &ParsedNode) -> SharedOutbound {
     let mut ob = MieruOutbound::new(&node.name, &node.host, node.port, user, pwd);
     if let Some(c) = node.params.get("cipher").and_then(|s| MieruCipher::parse(s)) {
         ob.cipher = c;
+    }
+    Arc::new(ob)
+}
+
+fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
+    let key = node
+        .params
+        .get("key")
+        .cloned()
+        .or_else(|| node.password.clone())
+        .unwrap_or_default();
+    if key.is_empty() {
+        return StubOutbound::new(node.name.clone(), "sudoku(missing-key)");
+    }
+    let mut cfg = crate::proto::sudoku::outbound::SudokuConfig::default();
+    cfg.key = key;
+    if let Some(method) = node.params.get("aead-method").or_else(|| node.method.as_ref()) {
+        match SudokuAead::parse(method) {
+            Ok(m) => cfg.aead_method = m,
+            Err(_) => {
+                return StubOutbound::new(node.name.clone(), "sudoku(invalid-aead)");
+            }
+        }
+    }
+    if let Some(t) = node.params.get("table-type") {
+        cfg.table_mode = t.clone();
+    }
+    if let Some(t) = node.params.get("custom-table") {
+        cfg.custom_table = t.clone();
+    }
+    if let Some(min) = node
+        .params
+        .get("padding-min")
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        cfg.padding_min = min;
+    }
+    if let Some(max) = node
+        .params
+        .get("padding-max")
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        cfg.padding_max = max;
+    }
+    if let Some(d) = node
+        .params
+        .get("disable-http-mask")
+        .map(|v| v == "1" || v == "true")
+    {
+        cfg.disable_http_mask = d;
+    }
+    if let Some(pr) = node.params.get("path-root") {
+        cfg.http_mask_path_root = pr.clone();
+    }
+    match SudokuOutbound::new(&node.name, &node.host, node.port, cfg) {
+        Ok(ob) => Arc::new(ob),
+        Err(_) => StubOutbound::new(node.name.clone(), "sudoku(table-build-error)"),
+    }
+}
+
+fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
+    let user = node.user.clone().unwrap_or_default();
+    let pwd = node.password.clone().unwrap_or_default();
+    let mut ob = TrustTunnelOutbound::new(&node.name, &node.host, node.port, user, pwd);
+    ob.sni = node.sni.clone().or(Some(node.host.clone()));
+    ob.insecure = node
+        .params
+        .get("skip-cert-verify")
+        .or_else(|| node.params.get("insecure"))
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if let Some(alpn) = node.params.get("alpn") {
+        ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    if let Some(mc) = node
+        .params
+        .get("max-connections")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        ob.max_connections = mc;
+    }
+    if let Some(min_s) = node
+        .params
+        .get("min-streams")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        ob.min_streams = min_s;
+    }
+    if let Some(max_s) = node
+        .params
+        .get("max-streams")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        ob.max_streams = max_s;
+    }
+    if let Some(hc) = node
+        .params
+        .get("health-check")
+        .map(|v| v == "1" || v == "true")
+    {
+        ob.health_check = hc;
     }
     Arc::new(ob)
 }

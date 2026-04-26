@@ -57,4 +57,8 @@ blake2            = "0.10"
 # 用 chacha20poly1305 + blake2 + curve25519-dalek（与 russh 同版）
 curve25519-dalek  = "4.1"
 pbkdf2            = "0.12"
+hyper             = { version = "1", features = ["client", "http2"] }
+hyper-util        = { version = "0.1", features = ["client", "client-legacy", "tokio", "http2"] }
+http-body-util    = "0.1"
+rand_chacha       = "0.3"
 smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
