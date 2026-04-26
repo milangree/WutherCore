@@ -24,7 +24,9 @@ async fn spawn_echo() -> u16 {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let (mut r, mut w) = sock.split();
                 let _ = tokio::io::copy(&mut r, &mut w).await;
@@ -50,7 +52,7 @@ async fn http_connect_through_mixed() {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
     };
-    tokio::spawn(run_mixed(listener, runtime));
+    tokio::spawn(run_mixed(listener, runtime.clone()));
 
     // 等监听就绪
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -63,16 +65,39 @@ async fn http_connect_through_mixed() {
     let mut buf = [0u8; 256];
     let n = s.read(&mut buf).await.unwrap();
     let resp = std::str::from_utf8(&buf[..n]).unwrap();
-    assert!(
-        resp.contains("200"),
-        "expected 200, got: {resp:?}"
-    );
+    assert!(resp.contains("200"), "expected 200, got: {resp:?}");
 
     // tunnel 已建立，echo 验证
     s.write_all(b"hello").await.unwrap();
     let mut echoed = [0u8; 5];
     s.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"hello");
+
+    let snapshot = runtime.connections.manager_snapshot();
+    let conn = snapshot
+        .connections
+        .iter()
+        .find(|c| c.metadata.destination_port == echo_port.to_string())
+        .expect("active mixed connection should be tracked with real metadata");
+    assert_eq!(conn.metadata.network, "tcp");
+    assert_eq!(conn.metadata.kind, "HTTP");
+    assert_eq!(conn.metadata.source_ip, "127.0.0.1");
+    assert_eq!(conn.metadata.destination_ip, "127.0.0.1");
+    assert_eq!(conn.metadata.destination_port, echo_port.to_string());
+    assert_eq!(conn.metadata.inbound_ip, "127.0.0.1");
+    assert_eq!(conn.metadata.inbound_port, mixed_port.to_string());
+    assert_eq!(conn.metadata.inbound_name, "http-connect");
+    assert_eq!(conn.metadata.host, "127.0.0.1");
+    assert_eq!(
+        conn.metadata.remote_destination,
+        format!("127.0.0.1:{echo_port}")
+    );
+    assert_eq!(conn.chains, vec!["DIRECT"]);
+    assert_eq!(conn.provider_chains, Vec::<String>::new());
+    assert_eq!(conn.rule, "MATCH");
+    assert_eq!(conn.rule_payload, "preset:direct any");
+    assert!(conn.upload >= 5);
+    assert!(conn.download >= 5);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -294,8 +294,12 @@ impl TunDispatcher {
             inbound_name: "tun".into(),
             host: target.host.clone(),               // 真实 domain
             dns_mode: target.dns_mode.as_str().into(), // "fake-ip" / "normal"
+            remote_destination: res.remote_destination.clone(),
+            smart_target: res.smart_target.clone(),
             chains: res.chain.clone(),
-            rule: format!("{:?}", res.decision),
+            provider_chains: res.provider_chains.clone(),
+            rule: res.rule.clone(),
+            rule_payload: res.rule_payload.clone(),
             ..core_observe::ConnectionMeta::default()
         };
         let guard = runtime.connections.open(meta);
@@ -318,10 +322,7 @@ impl TunDispatcher {
             self.udp_sessions.remove(&key);
             return;
         }
-        session
-            .guard
-            .up
-            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        session.guard.record_upload(n as u64);
         runtime.metrics.add_up(n as u64);
 
         // reverse loop：1 个 session 对应 1 条
@@ -350,10 +351,7 @@ impl TunDispatcher {
                             warn!(target: "capture::udp", error = %e, "tun write failed");
                             break;
                         }
-                        session_for_loop
-                            .guard
-                            .down
-                            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        session_for_loop.guard.record_download(n as u64);
                         metrics.add_down(n as u64);
                         session_for_loop.touch();
                     }
@@ -516,11 +514,17 @@ async fn run_accept_consumer(
                             source_port: ev.remote.port().to_string(),
                             destination_ip: ev.original_dst.ip().to_string(),
                             destination_port: ev.original_dst.port().to_string(),
+                            inbound_ip: ev.local.ip().to_string(),
+                            inbound_port: ev.local.port().to_string(),
                             inbound_name: "tun".into(),
                             host: target.host.clone(),               // 真实 domain
                             dns_mode: target.dns_mode.as_str().into(), // "fake-ip"/"normal"/...
+                            remote_destination: res.remote_destination.clone(),
+                            smart_target: res.smart_target.clone(),
                             chains: res.chain.clone(),
-                            rule: format!("{:?}", res.decision),
+                            provider_chains: res.provider_chains.clone(),
+                            rule: res.rule.clone(),
+                            rule_payload: res.rule_payload.clone(),
                             ..core_observe::ConnectionMeta::default()
                         };
                         let guard = runtime.connections.open(meta);

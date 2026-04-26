@@ -6,7 +6,8 @@
 //!   sourcePort / destinationIP / destinationPort / inboundIP / inboundPort /
 //!   inboundName / inboundUser / host / dnsMode / process / processPath /
 //!   specialProxy / specialRules / sniffHost / uuid / chains / rule /
-//!   rulePayload）。
+//!   rulePayload；providerChains 是 tracker 顶层字段，随 meta 在内存中流转但
+//!   不序列化进 metadata 子对象）。
 //! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable meta + 实时
 //!   累计字节数（Arc<AtomicU64>，由 splice 路径在 copy loop 内自增）+ 取消
 //!   信号（Arc<Notify>，DELETE /connections/:id 触发后让数据流主动 shutdown）+
@@ -19,6 +20,8 @@
 //!   从表里 remove。这样即使 splice 任务还在 select! 里等数据，也能立刻收到
 //!   取消信号开始 shutdown，而不是只在表里消失却继续传字节。
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -39,9 +42,17 @@ pub struct ConnectionMeta {
     pub kind: String, // "Mixed" | "HTTP" | "Socks5" | "TPROXY" | "Tun" | "Redirect"
     #[serde(rename = "sourceIP")]
     pub source_ip: String,
+    #[serde(rename = "sourceGeoIP")]
+    pub source_geoip: Vec<String>,
+    #[serde(rename = "sourceIPASN")]
+    pub source_ip_asn: String,
     pub source_port: String,
     #[serde(rename = "destinationIP")]
     pub destination_ip: String,
+    #[serde(rename = "destinationGeoIP")]
+    pub destination_geoip: Vec<String>,
+    #[serde(rename = "destinationIPASN")]
+    pub destination_ip_asn: String,
     pub destination_port: String,
     #[serde(rename = "inboundIP")]
     pub inbound_ip: String,
@@ -50,23 +61,117 @@ pub struct ConnectionMeta {
     pub inbound_user: String,
     pub host: String,
     pub dns_mode: String,
+    pub uid: u32,
     pub process: String,
     pub process_path: String,
     pub special_proxy: String,
     pub special_rules: String,
+    pub remote_destination: String,
+    pub dscp: u8,
     pub sniff_host: String,
+    #[serde(rename = "id")]
     pub uuid: String,
+    pub smart_block: String,
+    pub smart_target: String,
     pub chains: Vec<String>,
+    #[serde(skip)]
+    pub provider_chains: Vec<String>,
     pub rule: String,
     pub rule_payload: String,
 }
 
-/// 速率采样窗口：连续两次 snapshot 间的字节差 / 时间差 = bps。
+impl ConnectionMeta {
+    pub fn normalize_for_tracking(&mut self) {
+        if self.destination_ip.is_empty() {
+            if let Ok(ip) = self.host.parse::<IpAddr>() {
+                self.destination_ip = ip.to_string();
+            }
+        }
+        if self.remote_destination.is_empty() {
+            let host = if !self.host.is_empty() {
+                self.host.as_str()
+            } else {
+                self.destination_ip.as_str()
+            };
+            if let Some(endpoint) = join_host_port(host, &self.destination_port) {
+                self.remote_destination = endpoint;
+            }
+        }
+    }
+}
+
+fn join_host_port(host: &str, port: &str) -> Option<String> {
+    let host = host.trim();
+    let port = port.trim();
+    if host.is_empty() || port.is_empty() {
+        return None;
+    }
+    let host = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
+        _ => host.to_string(),
+    };
+    Some(format!("{host}:{port}"))
+}
+
+/// 速率采样窗口：连续两次 snapshot 间的字节差 / 时间差 = bytes/s。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RateSample {
     pub up: u64,
     pub down: u64,
     pub at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeBucket {
+    start_ms: u64,
+    bytes: u64,
+}
+
+/// 与 mihomo `bucketWindow(10, 100ms)` 等价：保留最近 1 秒内每 100ms 桶，
+/// 每次写入后返回窗口内最高 bytes/s。
+#[derive(Debug)]
+struct BucketWindow {
+    buckets: Vec<TimeBucket>,
+    interval_ms: u64,
+    window_ms: u64,
+}
+
+impl BucketWindow {
+    fn new(bucket_count: usize, interval_ms: u64) -> Self {
+        Self {
+            buckets: vec![
+                TimeBucket {
+                    start_ms: 0,
+                    bytes: 0,
+                };
+                bucket_count
+            ],
+            interval_ms,
+            window_ms: interval_ms.saturating_mul(bucket_count as u64),
+        }
+    }
+
+    fn update_max_rate(&mut self, bytes: u64) -> u64 {
+        if bytes == 0 || self.buckets.is_empty() || self.interval_ms == 0 {
+            return 0;
+        }
+        let now_ms = now_millis();
+        let bucket_start = (now_ms / self.interval_ms) * self.interval_ms;
+        let idx = ((now_ms / self.interval_ms) % self.buckets.len() as u64) as usize;
+        if self.buckets[idx].start_ms != bucket_start {
+            self.buckets[idx].start_ms = bucket_start;
+            self.buckets[idx].bytes = 0;
+        }
+        self.buckets[idx].bytes = self.buckets[idx].bytes.saturating_add(bytes);
+
+        let window_start = now_ms.saturating_sub(self.window_ms);
+        self.buckets
+            .iter()
+            .filter(|b| b.start_ms >= window_start && b.bytes > 0)
+            .map(|b| b.bytes.saturating_mul(1000) / self.interval_ms)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// 一条活跃连接。字段都是 Arc/原子，方便从 splice 任务并发更新而无需锁。
@@ -77,6 +182,8 @@ pub struct ConnectionEntry {
     pub started_at: u64, // unix seconds
     pub bytes_up: Arc<AtomicU64>,
     pub bytes_down: Arc<AtomicU64>,
+    pub max_upload_rate: Arc<AtomicU64>,
+    pub max_download_rate: Arc<AtomicU64>,
     pub cancel: Arc<Notify>,
     pub last_sample: Arc<Mutex<RateSample>>,
 }
@@ -89,11 +196,66 @@ pub struct ConnectionSnapshot {
     pub down_rate_bps: u64,
 }
 
-/// 全局连接表 —— Runtime 单例持有 `Arc<ConnectionTable>`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionInfo {
+    #[serde(rename = "id")]
+    pub id: String,
+    pub metadata: ConnectionMeta,
+    pub upload: u64,
+    pub download: u64,
+    pub start: u64,
+    pub chains: Vec<String>,
+    pub provider_chains: Vec<String>,
+    pub rule: String,
+    pub rule_payload: String,
+    pub max_upload_rate: u64,
+    pub max_download_rate: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionManagerSnapshot {
+    pub download_total: u64,
+    pub upload_total: u64,
+    pub connections: Vec<ConnectionInfo>,
+    pub memory: u64,
+}
+
+#[derive(Debug)]
+struct ManagerRateState {
+    at_ms: u64,
+    upload_blip: u64,
+    download_blip: u64,
+    upload_seen: u64,
+    download_seen: u64,
+}
+
+impl Default for ManagerRateState {
+    fn default() -> Self {
+        Self {
+            at_ms: now_millis(),
+            upload_blip: 0,
+            download_blip: 0,
+            upload_seen: 0,
+            download_seen: 0,
+        }
+    }
+}
+
+/// 全局连接管理器 —— Runtime 单例持有 `Arc<ConnectionTable>`。
+///
+/// 名称保留 `ConnectionTable` 是为了兼容现有调用方；内部语义按 mihomo
+/// `tunnel/statistic.Manager`：连接 join/leave、总流量、traffic blip、smart
+/// target 索引、关闭控制都在这里收敛。
 #[derive(Debug, Default)]
 pub struct ConnectionTable {
     next: AtomicU64,
     entries: DashMap<u64, ConnectionEntry>,
+    smart_target: DashMap<String, Arc<Mutex<BTreeSet<String>>>>,
+    upload_total: AtomicU64,
+    download_total: AtomicU64,
+    rate: Mutex<ManagerRateState>,
 }
 
 impl ConnectionTable {
@@ -105,11 +267,14 @@ impl ConnectionTable {
     /// 推荐 splice 任务持有 guard 直至双向拷贝结束。
     pub fn open(self: &Arc<Self>, mut meta: ConnectionMeta) -> ConnectionGuard {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
+        meta.normalize_for_tracking();
         if meta.uuid.is_empty() {
             meta.uuid = Uuid::new_v4().to_string();
         }
         let bytes_up = Arc::new(AtomicU64::new(0));
         let bytes_down = Arc::new(AtomicU64::new(0));
+        let max_upload_rate = Arc::new(AtomicU64::new(0));
+        let max_download_rate = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(Notify::new());
         let now_ms = now_millis();
         let last_sample = Arc::new(Mutex::new(RateSample {
@@ -117,22 +282,31 @@ impl ConnectionTable {
             down: 0,
             at_ms: now_ms,
         }));
+        let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
+        let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let entry = ConnectionEntry {
             id,
             meta,
             started_at: now_secs(),
             bytes_up: bytes_up.clone(),
             bytes_down: bytes_down.clone(),
+            max_upload_rate: max_upload_rate.clone(),
+            max_download_rate: max_download_rate.clone(),
             cancel: cancel.clone(),
             last_sample,
         };
-        self.entries.insert(id, entry);
+        self.join_indexes(&entry);
+        self.entries.insert(id, entry.clone());
         ConnectionGuard {
             table: self.clone(),
             id,
             up: bytes_up,
             down: bytes_down,
+            max_upload_rate,
+            max_download_rate,
             cancel,
+            upload_window,
+            download_window,
         }
     }
 
@@ -140,6 +314,7 @@ impl ConnectionTable {
     pub fn close(&self, id: u64) -> bool {
         // 先取条目读 cancel，再 remove —— 避免移除后另一线程仍在 list() 看到。
         if let Some((_, entry)) = self.entries.remove(&id) {
+            self.leave_indexes(&entry);
             entry.cancel.notify_waiters();
             true
         } else {
@@ -175,6 +350,7 @@ impl ConnectionTable {
         let snapshot: Vec<_> = self.entries.iter().map(|e| e.value().clone()).collect();
         for e in &snapshot {
             e.cancel.notify_waiters();
+            self.leave_indexes(e);
         }
         self.entries.clear();
         snapshot.len()
@@ -183,7 +359,9 @@ impl ConnectionTable {
     /// 仅由 [`ConnectionGuard::drop`] 调用：静默移除（不再 notify，因为 guard
     /// drop 意味着 splice 已经结束）。
     pub fn remove_silent(&self, id: u64) {
-        self.entries.remove(&id);
+        if let Some((_, entry)) = self.entries.remove(&id) {
+            self.leave_indexes(&entry);
+        }
     }
 
     /// 列出所有活跃连接（克隆）；不计算速率，留给 [`Self::snapshot`]。
@@ -215,6 +393,12 @@ impl ConnectionTable {
                         down: down_now,
                         at_ms: now_ms,
                     };
+                    if u > entry.max_upload_rate.load(Ordering::Relaxed) {
+                        entry.max_upload_rate.store(u, Ordering::Relaxed);
+                    }
+                    if d > entry.max_download_rate.load(Ordering::Relaxed) {
+                        entry.max_download_rate.store(d, Ordering::Relaxed);
+                    }
                     (u, d)
                 };
                 ConnectionSnapshot {
@@ -233,6 +417,184 @@ impl ConnectionTable {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn total(&self) -> (u64, u64) {
+        (
+            self.upload_total.load(Ordering::Relaxed),
+            self.download_total.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn now(&self) -> (u64, u64) {
+        let now_ms = now_millis();
+        let upload = self.upload_total.load(Ordering::Relaxed);
+        let download = self.download_total.load(Ordering::Relaxed);
+        let mut rate = self.rate.lock();
+        let dt = now_ms.saturating_sub(rate.at_ms);
+        if dt >= 1000 {
+            rate.upload_blip = upload.saturating_sub(rate.upload_seen);
+            rate.download_blip = download.saturating_sub(rate.download_seen);
+            rate.upload_seen = upload;
+            rate.download_seen = download;
+            rate.at_ms = now_ms;
+        }
+        (rate.upload_blip, rate.download_blip)
+    }
+
+    pub fn reset_statistic(&self) {
+        self.upload_total.store(0, Ordering::Relaxed);
+        self.download_total.store(0, Ordering::Relaxed);
+        let mut rate = self.rate.lock();
+        *rate = ManagerRateState::default();
+    }
+
+    pub fn manager_snapshot(&self) -> ConnectionManagerSnapshot {
+        let (upload_total, download_total) = self.total();
+        let mut connections: Vec<_> = self
+            .list()
+            .into_iter()
+            .map(|entry| ConnectionInfo {
+                id: entry.meta.uuid.clone(),
+                metadata: entry.meta.clone(),
+                upload: entry.bytes_up.load(Ordering::Relaxed),
+                download: entry.bytes_down.load(Ordering::Relaxed),
+                start: entry.started_at,
+                chains: entry.meta.chains.clone(),
+                provider_chains: entry.meta.provider_chains.clone(),
+                rule: entry.meta.rule.clone(),
+                rule_payload: entry.meta.rule_payload.clone(),
+                max_upload_rate: entry.max_upload_rate.load(Ordering::Relaxed),
+                max_download_rate: entry.max_download_rate.load(Ordering::Relaxed),
+            })
+            .collect();
+        connections.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
+        ConnectionManagerSnapshot {
+            download_total,
+            upload_total,
+            connections,
+            memory: crate::current_rss_bytes(),
+        }
+    }
+
+    pub fn close_by_chain(&self, chain: &str) -> usize {
+        let ids: Vec<u64> = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let meta = &e.value().meta;
+                if meta.chains.iter().any(|c| c == chain) {
+                    Some(*e.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut closed = 0;
+        for id in ids {
+            if self.close(id) {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    pub fn set_smart_block_and_close(&self, key: &str) -> bool {
+        if let Ok(id) = key.parse::<u64>() {
+            if self.mark_smart_block(id) {
+                return self.close(id);
+            }
+        }
+        let mut hit = None;
+        for r in self.entries.iter() {
+            if r.value().meta.uuid == key {
+                hit = Some(*r.key());
+                break;
+            }
+        }
+        if let Some(id) = hit {
+            if self.mark_smart_block(id) {
+                return self.close(id);
+            }
+        }
+        false
+    }
+
+    pub fn get_smart_target_ids(&self, target: &str, asn: &str) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        self.extend_smart_target_ids(target, &mut ids);
+        if !asn.is_empty() && asn != "unknown" {
+            self.extend_smart_target_ids(asn, &mut ids);
+        }
+        ids
+    }
+
+    fn mark_smart_block(&self, id: u64) -> bool {
+        if let Some(mut entry) = self.entries.get_mut(&id) {
+            entry.meta.smart_block = "blocked".into();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push_uploaded(&self, size: u64) {
+        self.upload_total.fetch_add(size, Ordering::Relaxed);
+    }
+
+    fn push_downloaded(&self, size: u64) {
+        self.download_total.fetch_add(size, Ordering::Relaxed);
+    }
+
+    fn join_indexes(&self, entry: &ConnectionEntry) {
+        let target = entry.meta.smart_target.trim();
+        if target.is_empty() {
+            return;
+        }
+        self.add_smart_target_id(target, &entry.meta.uuid);
+        let asn = entry.meta.destination_ip_asn.trim();
+        if !asn.is_empty() && asn != "unknown" {
+            self.add_smart_target_id(asn, &entry.meta.uuid);
+        }
+    }
+
+    fn leave_indexes(&self, entry: &ConnectionEntry) {
+        let target = entry.meta.smart_target.trim();
+        if target.is_empty() {
+            return;
+        }
+        self.remove_smart_target_id(target, &entry.meta.uuid);
+        let asn = entry.meta.destination_ip_asn.trim();
+        if !asn.is_empty() && asn != "unknown" {
+            self.remove_smart_target_id(asn, &entry.meta.uuid);
+        }
+    }
+
+    fn add_smart_target_id(&self, key: &str, uuid: &str) {
+        let set = self
+            .smart_target
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(BTreeSet::new())))
+            .clone();
+        set.lock().insert(uuid.to_string());
+    }
+
+    fn remove_smart_target_id(&self, key: &str, uuid: &str) {
+        let mut should_remove_key = false;
+        if let Some(set) = self.smart_target.get(key) {
+            let mut ids = set.lock();
+            ids.remove(uuid);
+            should_remove_key = ids.is_empty();
+        }
+        if should_remove_key {
+            self.smart_target.remove(key);
+        }
+    }
+
+    fn extend_smart_target_ids(&self, key: &str, out: &mut BTreeSet<String>) {
+        if let Some(set) = self.smart_target.get(key) {
+            out.extend(set.lock().iter().cloned());
+        }
+    }
 }
 
 /// RAII guard：drop 时自动从表移除。所有 splice 路径都应该握住 guard
@@ -242,7 +604,11 @@ pub struct ConnectionGuard {
     pub id: u64,
     pub up: Arc<AtomicU64>,
     pub down: Arc<AtomicU64>,
+    max_upload_rate: Arc<AtomicU64>,
+    max_download_rate: Arc<AtomicU64>,
     pub cancel: Arc<Notify>,
+    upload_window: Arc<Mutex<BucketWindow>>,
+    download_window: Arc<Mutex<BucketWindow>>,
 }
 
 impl ConnectionGuard {
@@ -253,11 +619,75 @@ impl ConnectionGuard {
     pub fn cancel_token(&self) -> Arc<Notify> {
         self.cancel.clone()
     }
+    pub fn accounting(&self) -> ConnectionAccounting {
+        ConnectionAccounting {
+            table: self.table.clone(),
+            up: self.up.clone(),
+            down: self.down.clone(),
+            max_upload_rate: self.max_upload_rate.clone(),
+            max_download_rate: self.max_download_rate.clone(),
+            cancel: self.cancel.clone(),
+            upload_window: self.upload_window.clone(),
+            download_window: self.download_window.clone(),
+        }
+    }
+    pub fn record_upload(&self, size: u64) {
+        self.accounting().record_upload(size);
+    }
+    pub fn record_download(&self, size: u64) {
+        self.accounting().record_download(size);
+    }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.table.remove_silent(self.id);
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectionAccounting {
+    table: Arc<ConnectionTable>,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+    max_upload_rate: Arc<AtomicU64>,
+    max_download_rate: Arc<AtomicU64>,
+    cancel: Arc<Notify>,
+    upload_window: Arc<Mutex<BucketWindow>>,
+    download_window: Arc<Mutex<BucketWindow>>,
+}
+
+impl ConnectionAccounting {
+    pub fn counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.up.clone(), self.down.clone())
+    }
+
+    pub fn cancel_token(&self) -> Arc<Notify> {
+        self.cancel.clone()
+    }
+
+    pub fn record_upload(&self, size: u64) {
+        if size == 0 {
+            return;
+        }
+        self.up.fetch_add(size, Ordering::Relaxed);
+        self.table.push_uploaded(size);
+        let rate = self.upload_window.lock().update_max_rate(size);
+        if rate > self.max_upload_rate.load(Ordering::Relaxed) {
+            self.max_upload_rate.store(rate, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_download(&self, size: u64) {
+        if size == 0 {
+            return;
+        }
+        self.down.fetch_add(size, Ordering::Relaxed);
+        self.table.push_downloaded(size);
+        let rate = self.download_window.lock().update_max_rate(size);
+        if rate > self.max_download_rate.load(Ordering::Relaxed) {
+            self.max_download_rate.store(rate, Ordering::Relaxed);
+        }
     }
 }
 
@@ -362,6 +792,104 @@ mod tests {
         let s = &snap[0];
         // 100ms 内 1MiB 上行 → ≈ 10 MiB/s；允许宽松一点
         assert!(s.up_rate_bps > 5_000_000, "up_rate {}", s.up_rate_bps);
-        assert!(s.down_rate_bps > 10_000_000, "down_rate {}", s.down_rate_bps);
+        assert!(
+            s.down_rate_bps > 10_000_000,
+            "down_rate {}",
+            s.down_rate_bps
+        );
+    }
+
+    #[test]
+    fn manager_records_totals_and_connection_max_rates() {
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            network: "tcp".into(),
+            kind: "HTTP".into(),
+            host: "example.com".into(),
+            chains: vec!["Auto".into(), "node-a".into()],
+            ..ConnectionMeta::default()
+        });
+
+        g.record_upload(512);
+        g.record_download(1024);
+
+        assert_eq!(t.total(), (512, 1024));
+        let snap = t.manager_snapshot();
+        assert_eq!(snap.upload_total, 512);
+        assert_eq!(snap.download_total, 1024);
+        assert_eq!(snap.connections.len(), 1);
+        assert_eq!(snap.connections[0].upload, 512);
+        assert_eq!(snap.connections[0].download, 1024);
+        assert!(snap.connections[0].max_upload_rate >= 512);
+        assert!(snap.connections[0].max_download_rate >= 1024);
+    }
+
+    #[test]
+    fn open_preserves_runtime_provider_chain_and_normalizes_destination_fields() {
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            network: "tcp".into(),
+            kind: "HTTP".into(),
+            host: "example.com".into(),
+            destination_port: "443".into(),
+            smart_target: "example.com".into(),
+            chains: vec!["main".into(), "provider-a/node-1".into()],
+            provider_chains: vec!["provider-a".into()],
+            rule: "MATCH".into(),
+            rule_payload: "preset:global any".into(),
+            ..ConnectionMeta::default()
+        });
+
+        let entry = t.get(g.id).unwrap();
+        assert_eq!(entry.meta.remote_destination, "example.com:443");
+        assert_eq!(entry.meta.smart_target, "example.com");
+
+        let snap = t.manager_snapshot();
+        assert_eq!(snap.connections.len(), 1);
+        assert_eq!(
+            snap.connections[0].provider_chains,
+            vec!["provider-a".to_string()]
+        );
+        assert_eq!(
+            snap.connections[0].metadata.remote_destination,
+            "example.com:443"
+        );
+    }
+
+    #[test]
+    fn smart_target_index_follows_join_and_leave() {
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            smart_target: "example.com".into(),
+            destination_ip_asn: "AS15169".into(),
+            ..ConnectionMeta::default()
+        });
+        let uuid = t.get(g.id).unwrap().meta.uuid;
+
+        let ids = t.get_smart_target_ids("example.com", "AS15169");
+        assert!(ids.contains(&uuid));
+
+        drop(g);
+        assert!(t.get_smart_target_ids("example.com", "AS15169").is_empty());
+    }
+
+    #[test]
+    fn close_by_chain_only_closes_matching_connections() {
+        let t = ConnectionTable::new();
+        let g1 = t.open(ConnectionMeta {
+            chains: vec!["ProviderA".into(), "node-a".into()],
+            ..ConnectionMeta::default()
+        });
+        let g2 = t.open(ConnectionMeta {
+            chains: vec!["ProviderB".into(), "node-b".into()],
+            ..ConnectionMeta::default()
+        });
+        let keep_id = g2.id;
+        std::mem::forget(g1);
+        std::mem::forget(g2);
+
+        assert_eq!(t.close_by_chain("ProviderA"), 1);
+        assert!(t.get(keep_id).is_some());
+        assert_eq!(t.len(), 1);
     }
 }

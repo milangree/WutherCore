@@ -16,10 +16,10 @@ pub mod metrics;
 pub mod tracing_init;
 
 pub use connections::{
-    ConnectionEntry, ConnectionGuard, ConnectionMeta, ConnectionSnapshot, ConnectionTable,
-    RateSample,
+    ConnectionAccounting, ConnectionEntry, ConnectionGuard, ConnectionInfo,
+    ConnectionManagerSnapshot, ConnectionMeta, ConnectionSnapshot, ConnectionTable, RateSample,
 };
-pub use copy_counted::copy_bidirectional_counted;
+pub use copy_counted::{copy_bidirectional_counted, copy_bidirectional_tracked};
 pub use log_bus::{LogBus, LogEvent};
 pub use metrics::{current_rss_bytes, Metrics};
 pub use tracing_init::{init_tracing, init_tracing_with_bus};

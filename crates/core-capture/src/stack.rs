@@ -470,15 +470,12 @@ impl SpliceManager {
             // 有 guard：走 counted copy（per-conn 流量 + cancel 信号）；
             // 无 guard：走原朴素双向拷贝（兼容老路径）。
             if let Some(g) = guard {
-                let (up, down) = g.counters();
-                let cancel = g.cancel_token();
+                let accounting = g.accounting();
                 if let Some(m) = &metrics { m.inc_connection(); }
-                let _ = core_observe::copy_bidirectional_counted(
+                let _ = core_observe::copy_bidirectional_tracked(
                     &mut smol,
                     &mut Box::pin(outbound),
-                    up,
-                    down,
-                    cancel,
+                    accounting,
                     metrics.clone(),
                 )
                 .await;

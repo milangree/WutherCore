@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use base64::Engine;
-use core_observe::{copy_bidirectional_counted, ConnectionMeta};
+use core_observe::{copy_bidirectional_tracked, ConnectionMeta};
 use core_route::NetworkKind;
 use core_runtime::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -348,14 +348,17 @@ async fn relay(
         inbound_name: inbound_label.into(),
         host: host.to_string(),
         dns_mode: "normal".into(),
+        remote_destination: out.remote_destination.clone(),
+        smart_target: out.smart_target.clone(),
         chains: out.chain.clone(),
-        rule: format!("{:?}", out.decision),
+        provider_chains: out.provider_chains.clone(),
+        rule: out.rule.clone(),
+        rule_payload: out.rule_payload.clone(),
         ..ConnectionMeta::default()
     };
     let guard = runtime.connections.open(meta);
     let id = guard.id;
-    let (up_counter, down_counter) = guard.counters();
-    let cancel = guard.cancel_token();
+    let accounting = guard.accounting();
     tracing::info!(
         target: "relay",
         conn_id = id,
@@ -368,20 +371,18 @@ async fn relay(
     );
 
     let metrics = runtime.metrics.clone();
-    let result = copy_bidirectional_counted(
+    let result = copy_bidirectional_tracked(
         &mut inbound,
         &mut out.stream,
-        up_counter.clone(),
-        down_counter.clone(),
-        cancel,
+        accounting,
         Some(metrics.clone()),
     )
     .await;
     metrics.dec_connection();
     // guard drop 时自动从 ConnectionTable 移除；无需显式 close
 
-    let up = up_counter.load(std::sync::atomic::Ordering::Relaxed);
-    let down = down_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let up = guard.up.load(std::sync::atomic::Ordering::Relaxed);
+    let down = guard.down.load(std::sync::atomic::Ordering::Relaxed);
     let total_ms = started.elapsed().as_millis() as u64;
     match &result {
         Ok(_) => tracing::info!(

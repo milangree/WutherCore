@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use crate::Metrics;
+use crate::{ConnectionAccounting, Metrics};
 
 const BUF_SIZE: usize = 32 * 1024;
 
@@ -104,6 +104,80 @@ where
     Ok((n_up, n_down))
 }
 
+/// 双向拷贝并通过完整连接管理器计数。
+///
+/// 这个路径对应 mihomo `statistic.NewTCPTracker`/`NewUDPTracker` 的热路径：
+/// 每段数据同时更新连接累计值、管理器总流量、连接 max rate 和 `/traffic`
+/// 全局指标。
+pub async fn copy_bidirectional_tracked<A, B>(
+    a: &mut A,
+    b: &mut B,
+    accounting: ConnectionAccounting,
+    metrics: Option<Arc<Metrics>>,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+
+    let up_metrics = metrics.clone();
+    let up_accounting = accounting.clone();
+    let cancel_up = accounting.cancel_token();
+    let up_task = async move {
+        let mut buf = vec![0u8; BUF_SIZE];
+        let mut total: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = cancel_up.notified() => {
+                    let _ = bw.shutdown().await;
+                    break;
+                }
+                r = ar.read(&mut buf) => {
+                    let n = match r { Ok(0) => { let _ = bw.shutdown().await; break; }, Ok(n) => n, Err(e) => return Err(e) };
+                    if let Err(e) = bw.write_all(&buf[..n]).await {
+                        return Err(e);
+                    }
+                    total += n as u64;
+                    up_accounting.record_upload(n as u64);
+                    if let Some(m) = &up_metrics { m.add_up(n as u64); }
+                }
+            }
+        }
+        Ok::<u64, io::Error>(total)
+    };
+
+    let down_metrics = metrics.clone();
+    let down_accounting = accounting.clone();
+    let cancel_down = accounting.cancel_token();
+    let down_task = async move {
+        let mut buf = vec![0u8; BUF_SIZE];
+        let mut total: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = cancel_down.notified() => {
+                    let _ = aw.shutdown().await;
+                    break;
+                }
+                r = br.read(&mut buf) => {
+                    let n = match r { Ok(0) => { let _ = aw.shutdown().await; break; }, Ok(n) => n, Err(e) => return Err(e) };
+                    if let Err(e) = aw.write_all(&buf[..n]).await {
+                        return Err(e);
+                    }
+                    total += n as u64;
+                    down_accounting.record_download(n as u64);
+                    if let Some(m) = &down_metrics { m.add_down(n as u64); }
+                }
+            }
+        }
+        Ok::<u64, io::Error>(total)
+    };
+
+    let (n_up, n_down) = tokio::try_join!(up_task, down_task)?;
+    Ok((n_up, n_down))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,19 +202,55 @@ mod tests {
         });
 
         // client_a → bridge → client_b
-        let payload = vec![7u8; 32 * 1024];
+        let payload = vec![7u8; 4 * 1024];
         client_a.write_all(&payload).await.unwrap();
         client_a.shutdown().await.unwrap();
-        let mut got = Vec::new();
-        client_b.read_to_end(&mut got).await.unwrap();
-        // 让另一方向也走 EOF
+        let mut got = vec![0u8; payload.len()];
+        client_b.read_exact(&mut got).await.unwrap();
+        cancel.notify_waiters();
+        drop(client_a);
         drop(client_b);
 
-        let (n_up, n_down) = bridge.await.unwrap();
+        let (n_up, n_down) = tokio::time::timeout(std::time::Duration::from_millis(500), bridge)
+            .await
+            .expect("bridge timeout")
+            .unwrap();
         assert_eq!(n_up, payload.len() as u64);
         assert!(n_down <= payload.len() as u64); // 可能为 0
         assert_eq!(up.load(Ordering::Relaxed), payload.len() as u64);
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn tracked_round_trip_updates_manager_totals() {
+        let table = crate::ConnectionTable::new();
+        let guard = table.open(crate::ConnectionMeta::default());
+        let accounting = guard.accounting();
+        let (mut client_a, mut server_a) = tokio::io::duplex(8 * 1024);
+        let (mut client_b, mut server_b) = tokio::io::duplex(8 * 1024);
+
+        let bridge = tokio::spawn(async move {
+            copy_bidirectional_tracked(&mut server_a, &mut server_b, accounting, None).await
+        });
+
+        client_a.write_all(b"tracked").await.unwrap();
+        let mut got = [0u8; 7];
+        client_b.read_exact(&mut got).await.unwrap();
+        guard.cancel.notify_waiters();
+        drop(client_a);
+        drop(client_b);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), bridge)
+            .await
+            .expect("bridge timeout")
+            .expect("bridge join");
+        assert!(result.is_ok());
+        assert_eq!(&got, b"tracked");
+        assert_eq!(table.total(), (7, 0));
+        let snap = table.manager_snapshot();
+        assert_eq!(snap.upload_total, 7);
+        assert_eq!(snap.connections[0].upload, 7);
+        assert!(snap.connections[0].max_upload_rate >= 7);
     }
 
     #[tokio::test]

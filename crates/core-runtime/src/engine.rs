@@ -1,9 +1,12 @@
 //! Runtime —— 启动 + 持有所有运行时组件 + 提供 dispatch 接口。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use core_config::model::{ChooseStrategy, FeedDetail};
+use core_config::node_uri::ParsedNode;
 use core_config::runtime_plan::RuntimePlan;
 use core_observe::{ConnectionTable, Metrics};
 use core_outbound::{
@@ -33,6 +36,7 @@ pub struct Runtime {
     pub plan: RuntimePlan,
     pub outbounds: parking_lot::RwLock<OutboundRegistry>,
     pub groups: parking_lot::RwLock<BTreeMap<String, Arc<GroupSelector>>>,
+    node_info: parking_lot::RwLock<BTreeMap<String, RuntimeNodeInfo>>,
     pub route: RouteEngine,
     pub resolver: Arc<Resolver>,
     pub smart: Arc<SmartSelector>,
@@ -48,11 +52,26 @@ pub struct Runtime {
     pub urltest: parking_lot::RwLock<Option<Arc<crate::health::UrlTester>>>,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeNodeInfo {
+    provider: Option<String>,
+    remote_destination: String,
+}
+
+impl RuntimeNodeInfo {
+    fn from_node(provider: Option<String>, node: &ParsedNode) -> Self {
+        Self {
+            provider,
+            remote_destination: format_host_port(&node.host, node.port),
+        }
+    }
+}
+
 /// 运行期可热改的配置子集 —— Clash dashboard `/configs` 写入的目标。
 #[derive(Debug, Clone)]
 pub struct MutableConfig {
-    pub mode: String,         // rule / global / direct
-    pub log_level: String,    // debug / info / warning / error / silent
+    pub mode: String,      // rule / global / direct
+    pub log_level: String, // debug / info / warning / error / silent
     pub allow_lan: bool,
     pub ipv6: bool,
     pub tun_enable: bool,
@@ -154,10 +173,12 @@ impl Runtime {
             ipv6: true,
             ..MutableConfig::default()
         };
+        let node_info = initial_node_info(&plan);
         Self {
             plan,
             outbounds: parking_lot::RwLock::new(reg),
             groups: parking_lot::RwLock::new(groups),
+            node_info: parking_lot::RwLock::new(node_info),
             route,
             resolver,
             smart,
@@ -207,7 +228,11 @@ impl Runtime {
     }
 
     pub fn outbound_names(&self) -> Vec<String> {
-        self.outbounds.read().names().map(|s| s.to_string()).collect()
+        self.outbounds
+            .read()
+            .names()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// 把订阅刷新得到的最新节点列表注入到 outbound registry，
@@ -217,9 +242,15 @@ impl Runtime {
         let mut new_names: Vec<String> = Vec::with_capacity(nodes.len());
         {
             let mut reg = self.outbounds.write();
+            let mut info = self.node_info.write();
+            info.retain(|_, v| v.provider.as_deref() != Some(feed_name));
             for n in &nodes {
                 let ob = core_outbound::registry::build_outbound(n);
                 reg.insert(n.name.clone(), ob);
+                info.insert(
+                    n.name.clone(),
+                    RuntimeNodeInfo::from_node(Some(feed_name.to_string()), n),
+                );
                 new_names.push(n.name.clone());
                 self.smart.ensure_node(&n.name);
             }
@@ -258,7 +289,7 @@ impl Runtime {
         );
     }
 
-    pub fn pick_outbound(&self, host: &str, port: u16, network: NetworkKind) -> (RouteDecision, String, SharedOutbound) {
+    pub fn pick_outbound(&self, host: &str, port: u16, network: NetworkKind) -> RoutePick {
         self.metrics.inc_route();
         let ip = host.parse().ok();
         let ctx = FlowContext {
@@ -272,14 +303,18 @@ impl Runtime {
         let (decision, kind, source) = self.route.decide(&ctx);
         debug!(target: "route", host = %host, port, ?decision, kind, source = %source, "rule hit");
 
-        let (label, ob) = match &decision {
+        let (label, outbound) = match &decision {
             RouteDecision::Direct => ("DIRECT".into(), self.must_get("DIRECT")),
             RouteDecision::Block => ("BLOCK".into(), self.must_get("BLOCK")),
             RouteDecision::Group(name) => self.pick_in_group(name, host),
         };
-        let _ = kind;
-        let _ = source;
-        (decision, label, ob)
+        RoutePick {
+            decision,
+            label,
+            outbound,
+            rule: route_rule_name(kind).into(),
+            rule_payload: source,
+        }
     }
 
     fn pick_in_group(&self, group: &str, host: &str) -> (String, SharedOutbound) {
@@ -326,18 +361,18 @@ impl Runtime {
             %host, port, network = net_str,
             "begin",
         );
-        let (decision, label, ob) = self.pick_outbound(host, port, network);
+        let pick = self.pick_outbound(host, port, network);
         info!(
             target: "dial",
             id = dial_id,
             %host, port,
-            outbound = %label,
-            decision = ?decision,
-            protocol = ob.protocol(),
+            outbound = %pick.label,
+            decision = ?pick.decision,
+            protocol = pick.outbound.protocol(),
             "route picked",
         );
-        if matches!(decision, RouteDecision::Block) {
-            info!(target: "dial", id = dial_id, %host, port, outbound = %label, "blocked by rule");
+        if matches!(pick.decision, RouteDecision::Block) {
+            info!(target: "dial", id = dial_id, %host, port, outbound = %pick.label, "blocked by rule");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "blocked",
@@ -350,10 +385,10 @@ impl Runtime {
             dial_id,
         };
         let dial_start = Instant::now();
-        let res = ob.dial_tcp(ctx).await;
+        let res = pick.outbound.dial_tcp(ctx).await;
         let elapsed = started.elapsed();
         let dial_ms = dial_start.elapsed().as_millis() as u64;
-        let group_for_event = match &decision {
+        let group_for_event = match &pick.decision {
             RouteDecision::Group(g) => Some(g.clone()),
             _ => None,
         };
@@ -363,13 +398,13 @@ impl Runtime {
                     target: "dial",
                     id = dial_id,
                     %host, port,
-                    outbound = %label,
+                    outbound = %pick.label,
                     dial_ms,
                     total_ms = elapsed.as_millis() as u64,
                     "ok",
                 );
-                if label != "DIRECT" && label != "BLOCK" {
-                    self.smart.record_success(&label, elapsed);
+                if pick.label != "DIRECT" && pick.label != "BLOCK" {
+                    self.smart.record_success(&pick.label, elapsed);
                 }
                 if let Some(name) = &group_for_event {
                     if let Some(g) = self.groups.read().get(name) {
@@ -382,14 +417,14 @@ impl Runtime {
                     target: "dial",
                     id = dial_id,
                     %host, port,
-                    outbound = %label,
+                    outbound = %pick.label,
                     dial_ms,
                     total_ms = elapsed.as_millis() as u64,
                     error = %e,
                     "failed",
                 );
-                if label != "DIRECT" && label != "BLOCK" {
-                    self.smart.record_failure(&label, e.to_string());
+                if pick.label != "DIRECT" && pick.label != "BLOCK" {
+                    self.smart.record_failure(&pick.label, e.to_string());
                 }
                 if let Some(name) = &group_for_event {
                     if let Some(g) = self.groups.read().get(name).cloned() {
@@ -409,13 +444,21 @@ impl Runtime {
         }
         let stream = res?;
         // chain：分组场景 ["<group>", "<picked-node>"]，否则 ["DIRECT"]/["BLOCK"]/["<node>"]
-        let chain = build_chain(&decision, &label);
+        let chain = build_chain(&pick.decision, &pick.label);
+        let provider_chains = self.provider_chains_for_chain(&chain);
+        let remote_destination = self.remote_destination_for_outbound(&pick.label, host, port);
+        let smart_target = self.smart_target_for_decision(&pick.decision, host);
         Ok(DialResult {
             stream,
-            outbound: label,
-            decision,
+            outbound: pick.label,
+            decision: pick.decision,
             elapsed,
             chain,
+            provider_chains,
+            remote_destination,
+            smart_target,
+            rule: pick.rule,
+            rule_payload: pick.rule_payload,
         })
     }
 
@@ -426,11 +469,7 @@ impl Runtime {
     ///   DIRECT（mihomo 同样直接拒绝，否则黑名单 UDP 会偷偷走出去）。
     /// * outbound 返回 `ErrorKind::Unsupported`（vmess/trojan 暂未实现 UDP 通道
     ///   的占位错误）—— fallback DIRECT，但用 once_cell 限流的 warn 避免每包刷屏。
-    pub async fn dial_udp(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> std::io::Result<UdpDialResult> {
+    pub async fn dial_udp(&self, host: &str, port: u16) -> std::io::Result<UdpDialResult> {
         let started = Instant::now();
         let dial_id = core_outbound::next_dial_id();
         debug!(
@@ -439,9 +478,9 @@ impl Runtime {
             %host, port, network = "udp",
             "begin (udp)",
         );
-        let (decision, label, ob) = self.pick_outbound(host, port, NetworkKind::Udp);
-        if matches!(decision, RouteDecision::Block) {
-            debug!(target: "dial", id = dial_id, %host, port, outbound = %label, "udp blocked");
+        let pick = self.pick_outbound(host, port, NetworkKind::Udp);
+        if matches!(pick.decision, RouteDecision::Block) {
+            debug!(target: "dial", id = dial_id, %host, port, outbound = %pick.label, "udp blocked");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "blocked",
@@ -453,12 +492,16 @@ impl Runtime {
             network: "udp",
             dial_id,
         };
-        let res = ob.dial_udp(ctx.clone()).await;
+        let res = pick.outbound.dial_udp(ctx.clone()).await;
+        let mut actual_label = pick.label.clone();
+        let mut actual_decision = pick.decision.clone();
         let socket = match res {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                warn_udp_unsupported_once(&label);
+                warn_udp_unsupported_once(&pick.label);
                 // fallback DIRECT —— 不丢包，但 dashboard 仍标记"实际 outbound = DIRECT"
+                actual_label = "DIRECT".into();
+                actual_decision = RouteDecision::Direct;
                 let direct = self.must_get("DIRECT");
                 direct.dial_udp(ctx).await?
             }
@@ -467,7 +510,7 @@ impl Runtime {
                     target: "dial",
                     id = dial_id,
                     %host, port,
-                    outbound = %label,
+                    outbound = %pick.label,
                     error = %e,
                     "udp dial failed"
                 );
@@ -475,22 +518,72 @@ impl Runtime {
             }
         };
         let elapsed = started.elapsed();
-        let chain = build_chain(&decision, &label);
+        let chain = build_chain(&actual_decision, &actual_label);
+        let provider_chains = self.provider_chains_for_chain(&chain);
+        let remote_destination = self.remote_destination_for_outbound(&actual_label, host, port);
+        let smart_target = self.smart_target_for_decision(&actual_decision, host);
         debug!(
             target: "dial",
             id = dial_id,
             %host, port,
-            outbound = %label,
+            outbound = %actual_label,
             total_ms = elapsed.as_millis() as u64,
             "udp ok",
         );
         Ok(UdpDialResult {
             socket,
-            outbound: label,
-            decision,
+            outbound: actual_label,
+            decision: actual_decision,
             elapsed,
             chain,
+            provider_chains,
+            remote_destination,
+            smart_target,
+            rule: pick.rule,
+            rule_payload: pick.rule_payload,
         })
+    }
+
+    fn provider_chains_for_chain(&self, chain: &[String]) -> Vec<String> {
+        let info = self.node_info.read();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for label in chain {
+            let provider = info
+                .get(label)
+                .and_then(|v| v.provider.clone())
+                .or_else(|| infer_provider_from_name(&self.plan.feeds, label));
+            if let Some(provider) = provider {
+                if !provider.is_empty() && seen.insert(provider.clone()) {
+                    out.push(provider);
+                }
+            }
+        }
+        out
+    }
+
+    fn remote_destination_for_outbound(&self, label: &str, host: &str, port: u16) -> String {
+        if label != "DIRECT" && label != "BLOCK" {
+            if let Some(info) = self.node_info.read().get(label) {
+                if !info.remote_destination.is_empty() {
+                    return info.remote_destination.clone();
+                }
+            }
+        }
+        format_host_port(host, port)
+    }
+
+    fn smart_target_for_decision(&self, decision: &RouteDecision, host: &str) -> String {
+        let RouteDecision::Group(group) = decision else {
+            return String::new();
+        };
+        let Some(group) = self.plan.groups.get(group) else {
+            return String::new();
+        };
+        if !matches!(group.choose, ChooseStrategy::Smart) {
+            return String::new();
+        }
+        host.trim_end_matches('.').to_string()
     }
 }
 
@@ -520,6 +613,55 @@ fn warn_udp_unsupported_once(label: &str) {
     }
 }
 
+fn initial_node_info(plan: &RuntimePlan) -> BTreeMap<String, RuntimeNodeInfo> {
+    plan.nodes
+        .iter()
+        .map(|node| {
+            let provider = infer_provider_from_name(&plan.feeds, &node.name);
+            (
+                node.name.clone(),
+                RuntimeNodeInfo::from_node(provider, node),
+            )
+        })
+        .collect()
+}
+
+fn infer_provider_from_name(
+    feeds: &BTreeMap<String, FeedDetail>,
+    node_name: &str,
+) -> Option<String> {
+    feeds.keys().find_map(|feed| {
+        if node_name.starts_with(&format!("{feed}/")) || node_name.contains(&format!("[{feed}]")) {
+            Some(feed.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    let host = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
+        _ => host.to_string(),
+    };
+    format!("{host}:{port}")
+}
+
+fn route_rule_name(kind: &str) -> &'static str {
+    match kind {
+        "any" | "fallback" => "MATCH",
+        "domain" => "DOMAIN",
+        "suffix" | "ads" | "service" => "DOMAIN-SUFFIX",
+        "home" | "ip" => "IP-CIDR",
+        "cn" => "GEOIP",
+        "port" => "DST-PORT",
+        "network" | "proto" => "NETWORK",
+        "process" => "PROCESS-NAME",
+        "set" => "RULE-SET",
+        _ => "MATCH",
+    }
+}
+
 fn build_chain(decision: &RouteDecision, label: &str) -> Vec<String> {
     match decision {
         RouteDecision::Direct => vec!["DIRECT".to_string()],
@@ -534,6 +676,14 @@ fn build_chain(decision: &RouteDecision, label: &str) -> Vec<String> {
     }
 }
 
+pub struct RoutePick {
+    pub decision: RouteDecision,
+    pub label: String,
+    pub outbound: SharedOutbound,
+    pub rule: String,
+    pub rule_payload: String,
+}
+
 pub struct DialResult {
     pub stream: core_outbound::adapter::BoxedStream,
     pub outbound: String,
@@ -544,6 +694,11 @@ pub struct DialResult {
     /// mihomo 主分支的 chain 通常是 `[outbound, group]` 倒序，本实现保持 `[group, node]`
     /// 顺序方便阅读，dashboard 两种顺序都能正确展示链路。
     pub chain: Vec<String>,
+    pub provider_chains: Vec<String>,
+    pub remote_destination: String,
+    pub smart_target: String,
+    pub rule: String,
+    pub rule_payload: String,
 }
 
 pub struct UdpDialResult {
@@ -552,6 +707,11 @@ pub struct UdpDialResult {
     pub decision: RouteDecision,
     pub elapsed: std::time::Duration,
     pub chain: Vec<String>,
+    pub provider_chains: Vec<String>,
+    pub remote_destination: String,
+    pub smart_target: String,
+    pub rule: String,
+    pub rule_payload: String,
 }
 
 /// "0x2024" / "8228" → u32。
@@ -689,5 +849,83 @@ route:
         let _runtime = Runtime::build(plan);
 
         assert_eq!(core_outbound::outbound_fwmark(), 0x2d0);
+    }
+
+    #[test]
+    fn applied_feed_nodes_produce_real_provider_chain_and_remote_destination() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        runtime.apply_feed_nodes(
+            "provider-a",
+            vec![core_config::node_uri::ParsedNode::new(
+                "provider-a/node-1",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.10",
+                10001,
+            )],
+        );
+
+        let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        let chain = build_chain(&pick.decision, &pick.label);
+
+        assert_eq!(pick.label, "provider-a/node-1");
+        assert_eq!(
+            chain,
+            vec!["main".to_string(), "provider-a/node-1".to_string()]
+        );
+        assert_eq!(
+            runtime.provider_chains_for_chain(&chain),
+            vec!["provider-a".to_string()]
+        );
+        assert_eq!(
+            runtime.remote_destination_for_outbound(&pick.label, "www.google.com", 443),
+            "203.0.113.10:10001"
+        );
+    }
+
+    #[test]
+    fn smart_group_sets_smart_target_from_real_route_decision() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#smart-node"
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+
+        let pick = runtime.pick_outbound("Example.COM.", 443, NetworkKind::Tcp);
+
+        assert!(matches!(pick.decision, RouteDecision::Group(ref group) if group == "main"));
+        assert_eq!(
+            runtime.smart_target_for_decision(&pick.decision, "Example.COM."),
+            "Example.COM"
+        );
     }
 }

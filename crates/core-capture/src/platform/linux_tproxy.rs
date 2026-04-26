@@ -22,7 +22,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use core_observe::{copy_bidirectional_counted, ConnectionMeta};
+use core_observe::{copy_bidirectional_tracked, ConnectionMeta};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -97,23 +97,24 @@ pub async fn run_tcp_tproxy(
                         inbound_name: "tproxy".into(),
                         host: original_dst.ip().to_string(),
                         dns_mode: "normal".into(),
+                        remote_destination: res.remote_destination.clone(),
+                        smart_target: res.smart_target.clone(),
                         chains: res.chain.clone(),
-                        rule: format!("{:?}", res.decision),
+                        provider_chains: res.provider_chains.clone(),
+                        rule: res.rule.clone(),
+                        rule_payload: res.rule_payload.clone(),
                         ..ConnectionMeta::default()
                     };
                     let guard = runtime.connections.open(meta);
                     let conn_id = guard.id;
-                    let (up, down) = guard.counters();
-                    let cancel = guard.cancel_token();
+                    let accounting = guard.accounting();
                     let metrics = runtime.metrics.clone();
                     metrics.inc_connection();
                     let mut inbound = stream;
-                    let result = copy_bidirectional_counted(
+                    let result = copy_bidirectional_tracked(
                         &mut inbound,
                         &mut res.stream,
-                        up,
-                        down,
-                        cancel,
+                        accounting,
                         Some(metrics.clone()),
                     )
                     .await;

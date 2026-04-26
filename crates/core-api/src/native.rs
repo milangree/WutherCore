@@ -120,23 +120,22 @@ async fn list_conns(State(s): State<NativeState>) -> impl IntoResponse {
     let conns: Vec<_> = s
         .runtime
         .connections
-        .snapshot()
+        .manager_snapshot()
+        .connections
         .into_iter()
-        .map(|item| {
-            let entry = item.entry;
-            let up = entry.bytes_up.load(std::sync::atomic::Ordering::Relaxed);
-            let down = entry.bytes_down.load(std::sync::atomic::Ordering::Relaxed);
+        .map(|conn| {
             json!({
-                "id": entry.meta.uuid,
-                "metadata": entry.meta,
-                "upload": up,
-                "download": down,
-                "start_at": entry.started_at,
-                "chains": entry.meta.chains,
-                "rule": entry.meta.rule,
-                "rulePayload": entry.meta.rule_payload,
-                "maxUploadRate": item.up_rate_bps,
-                "maxDownloadRate": item.down_rate_bps,
+                "id": conn.id,
+                "metadata": conn.metadata,
+                "upload": conn.upload,
+                "download": conn.download,
+                "start_at": conn.start,
+                "chains": conn.chains,
+                "providerChains": conn.provider_chains,
+                "rule": conn.rule,
+                "rulePayload": conn.rule_payload,
+                "maxUploadRate": conn.max_upload_rate,
+                "maxDownloadRate": conn.max_download_rate,
             })
         })
         .collect();

@@ -498,7 +498,12 @@ impl GroupSelector {
         tester: Option<&Arc<UrlTester>>,
     ) -> Option<String> {
         // selected fixed：只要 alive 就用它；dead 则清掉 fixed 让顺序找
-        if let Some(s) = self.manual_pick.read().clone() {
+        // ⚠️ 必须先 let-bind 让 read guard 在语句结束时立刻释放 —— Rust 2021 下
+        //   `if let Some(s) = self.manual_pick.read().clone() { ... }` 的临时
+        //   RwLockReadGuard 会存活到 if-let body 结束；body 内 `self.manual_pick.write()`
+        //   就会同线程死锁 parking_lot 的 RwLock。
+        let manual_now: Option<String> = self.manual_pick.read().clone();
+        if let Some(s) = manual_now {
             if members.iter().any(|m| m == &s) {
                 if tester
                     .map(|t| t.alive_for_url(&s, url))
@@ -506,7 +511,7 @@ impl GroupSelector {
                 {
                     return Some(s);
                 }
-                // dead → 释放 fixed
+                // dead → 释放 fixed（此时 read guard 已 drop，write 不会死锁）
                 *self.manual_pick.write() = None;
             }
         }

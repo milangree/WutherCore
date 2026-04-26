@@ -45,7 +45,7 @@ use axum::extract::{
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use core_runtime::Runtime;
 use futures::Stream;
@@ -64,6 +64,7 @@ pub fn router(state: NativeState) -> Router {
         // ---------- connections ----------
         .route("/connections", get(connections).delete(connections_close_all))
         .route("/connections/:id", delete(connections_close_one))
+        .route("/connections/smart/:id", delete(connections_smart_block))
         // ---------- proxies ----------
         .route("/proxies", get(proxies))
         .route("/proxies/:name", get(proxy_one).put(proxy_put))
@@ -109,18 +110,23 @@ async fn traffic(
     if let Some(ws) = ws {
         return ws.on_upgrade(move |sock| traffic_ws(sock, s));
     }
-    Json(s.runtime.metrics.clash_traffic()).into_response()
+    Json(connection_manager_traffic(&s)).into_response()
 }
 
 async fn traffic_ws(mut sock: WebSocket, s: NativeState) {
     let mut tick = tokio::time::interval(Duration::from_millis(1000));
     loop {
         tick.tick().await;
-        let payload = s.runtime.metrics.clash_traffic().to_string();
+        let payload = connection_manager_traffic(&s).to_string();
         if sock.send(Message::Text(payload)).await.is_err() {
             break;
         }
     }
+}
+
+fn connection_manager_traffic(s: &NativeState) -> Value {
+    let (up, down) = s.runtime.connections.now();
+    json!({ "up": up, "down": down })
 }
 
 async fn memory(
@@ -238,38 +244,35 @@ async fn connections_ws(mut sock: WebSocket, s: NativeState, interval_ms: u64) {
 }
 
 fn connections_snapshot(s: &NativeState) -> Value {
-    let metrics = &s.runtime.metrics;
-    let bytes_up = metrics.bytes_up.load(std::sync::atomic::Ordering::Relaxed);
-    let bytes_down = metrics.bytes_down.load(std::sync::atomic::Ordering::Relaxed);
-    let conns: Vec<Value> = s
-        .runtime
+    let manager = s.runtime.connections.manager_snapshot();
+    let download_total = manager.download_total;
+    let upload_total = manager.upload_total;
+    let memory = manager.memory;
+    let conns: Vec<Value> = manager
         .connections
-        .snapshot()
         .into_iter()
-        .map(|item| {
-            let entry = item.entry;
-            let up = entry.bytes_up.load(std::sync::atomic::Ordering::Relaxed);
-            let down = entry.bytes_down.load(std::sync::atomic::Ordering::Relaxed);
+        .map(|conn| {
             // mihomo 用 uuid 字符串作为外部 id；保留 numeric id 兼容旧脚本。
             json!({
-                "id": entry.meta.uuid,
-                "metadata": entry.meta,
-                "upload": up,
-                "download": down,
-                "start": iso8601(entry.started_at),
-                "chains": entry.meta.chains,
-                "rule": entry.meta.rule,
-                "rulePayload": entry.meta.rule_payload,
-                "maxUploadRate": item.up_rate_bps,
-                "maxDownloadRate": item.down_rate_bps,
+                "id": conn.id,
+                "metadata": conn.metadata,
+                "upload": conn.upload,
+                "download": conn.download,
+                "start": iso8601(conn.start),
+                "chains": conn.chains,
+                "providerChains": conn.provider_chains,
+                "rule": conn.rule,
+                "rulePayload": conn.rule_payload,
+                "maxUploadRate": conn.max_upload_rate,
+                "maxDownloadRate": conn.max_download_rate,
             })
         })
         .collect();
     json!({
-        "downloadTotal": bytes_down,
-        "uploadTotal": bytes_up,
+        "downloadTotal": download_total,
+        "uploadTotal": upload_total,
         "connections": conns,
-        "memory": core_observe::current_rss_bytes(),
+        "memory": memory,
     })
 }
 
@@ -288,6 +291,14 @@ async fn connections_close_one(
         return (StatusCode::NO_CONTENT, Json(json!({}))).into_response();
     }
     (StatusCode::NOT_FOUND, Json(json!({"message": "no such connection"}))).into_response()
+}
+
+async fn connections_smart_block(
+    State(s): State<NativeState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let _ = s.runtime.connections.set_smart_block_and_close(&id);
+    StatusCode::NO_CONTENT
 }
 
 /* ====================== proxies ====================== */

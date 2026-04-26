@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use core_api::native::NativeState;
 use core_config::loader::load_from_str;
+use core_observe::ConnectionMeta;
 use core_runtime::{Runtime, UrlTester};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -138,6 +139,47 @@ async fn connections_close_all_returns_count() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     assert_eq!(v["closed"], 0);
+}
+
+#[tokio::test]
+async fn connections_snapshot_uses_connection_manager() {
+    let state = build_state();
+    let runtime = state.runtime.clone();
+    let guard = runtime.connections.open(ConnectionMeta {
+        network: "tcp".into(),
+        kind: "HTTP".into(),
+        host: "example.com".into(),
+        destination_ip_asn: "AS15169".into(),
+        smart_target: "example.com".into(),
+        chains: vec!["main".into(), "NodeA".into()],
+        rule: "MATCH".into(),
+        rule_payload: "main".into(),
+        ..ConnectionMeta::default()
+    });
+    guard.record_upload(7);
+    guard.record_download(11);
+
+    let app = core_api::compat::router(state);
+    let resp = app
+        .oneshot(Request::builder().uri("/connections").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["uploadTotal"], 7);
+    assert_eq!(v["downloadTotal"], 11);
+    assert_eq!(v["connections"].as_array().unwrap().len(), 1);
+    let conn = &v["connections"][0];
+    assert_eq!(conn["upload"], 7);
+    assert_eq!(conn["download"], 11);
+    assert_eq!(conn["metadata"]["id"], conn["id"]);
+    assert_eq!(conn["metadata"]["smartTarget"], "example.com");
+    assert_eq!(conn["metadata"]["destinationIPASN"], "AS15169");
+    assert!(conn.get("providerChains").is_some());
+    assert!(conn["maxUploadRate"].as_u64().unwrap() >= 7);
+    assert!(conn["maxDownloadRate"].as_u64().unwrap() >= 11);
+
+    drop(guard);
 }
 
 #[tokio::test]
