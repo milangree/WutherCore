@@ -15,7 +15,7 @@
 //! ## 防泄漏（§7.3）
 //!
 //! 1. capture 模式默认 hijack 53 端口（fake-ip）；
-//! 2. proxy 域名通过 overseas group 解析；
+//! 2. DNS 默认路径使用 `nameserver`，按 `nameserver-policy` 与 `fallback-filter` 切换上游；
 //! 3. 代理节点 host 通过 bootstrap，永不进入业务 policy 流；
 //! 4. Tailnet / 局域网域名 → direct local；
 //! 5. 失败时绝不静默回退到系统 DNS（除非 mode=system）。
@@ -25,18 +25,28 @@
 pub mod cache;
 pub mod fake_ip;
 pub mod group;
+pub mod hosts;
+pub mod mapping;
+pub mod middleware;
+pub mod packet;
 pub mod policy;
 pub mod resolver;
+pub mod service;
+pub mod singleflight;
 pub mod upstream;
 
 pub use cache::{CacheConfig, DnsCache, Hit, QType};
-pub use fake_ip::FakeIpPool;
+pub use fake_ip::{FakeIpFilter, FakeIpPool};
 pub use group::{DnsGroup, GroupStrategy};
+pub use hosts::HostsTable;
+pub use mapping::IpHostMapping;
 pub use policy::{
-    parse_rule_line, DnsAction, DnsRR, EvalContext, HostMatch, PolicyEngine, PolicyRule,
-    PreRcode, PredefinedResponse, QueryOptions, RejectMethod, RejectOptions, RejectThrottle,
+    parse_rule_line, DnsAction, DnsRR, EvalContext, HostMatch, PolicyEngine, PolicyRule, PreRcode,
+    PredefinedResponse, QueryOptions, RejectMethod, RejectOptions, RejectThrottle,
 };
-pub use resolver::{ResolveError, Resolver, ResolverBuilder};
-pub use upstream::{DnsError, DnsUpstream};
+pub use resolver::{ResolveAnswer, ResolveError, Resolver, ResolverBuilder, ResolverConfigError};
+pub use service::DnsService;
+pub use singleflight::Singleflight;
 pub use upstream::hickory::{HickoryKind, HickoryUpstream};
 pub use upstream::system::SystemUpstream;
+pub use upstream::{DnsError, DnsUpstream, FilteredUpstream, UpstreamParams};

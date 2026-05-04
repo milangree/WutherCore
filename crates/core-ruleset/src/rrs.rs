@@ -1,4 +1,4 @@
-//! RRS —— RPKernel Rule Set 自研二进制规则集格式。
+//! RRS —— WutherCore Rule Set 自研二进制规则集格式。
 //!
 //! ## 设计目标
 //!
@@ -62,15 +62,15 @@ const SECTION_ORDER: &[ClassicalKind] = &[
     ClassicalKind::DomainSuffix,
     ClassicalKind::DomainKeyword,
     ClassicalKind::DomainRegex,
-    ClassicalKind::IpCidr,         // V4
-    ClassicalKind::SrcIpCidr,      // V6（占位 —— 复用 SrcIpCidr 当作 V6 入口）
+    ClassicalKind::IpCidr,    // V4
+    ClassicalKind::SrcIpCidr, // V6（占位 —— 复用 SrcIpCidr 当作 V6 入口）
     ClassicalKind::DstPort,
     ClassicalKind::ProcessName,
 ];
 
 /* ============================================================
-   Encode
-   ============================================================ */
+Encode
+============================================================ */
 
 /// 把任意 [`ClassicalEntry`] 序列编码为 RRS 字节流。
 pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
@@ -87,7 +87,9 @@ pub fn encode(entries: &[ClassicalEntry]) -> Vec<u8> {
     for e in entries {
         match e.kind {
             ClassicalKind::Domain => domains.push(e.value.to_ascii_lowercase()),
-            ClassicalKind::DomainSuffix => suffixes.push(e.value.trim_matches('.').to_ascii_lowercase()),
+            ClassicalKind::DomainSuffix => {
+                suffixes.push(e.value.trim_matches('.').to_ascii_lowercase())
+            }
             ClassicalKind::DomainKeyword => keywords.push(e.value.to_ascii_lowercase()),
             ClassicalKind::DomainRegex => regex.push(e.value.clone()),
             ClassicalKind::IpCidr | ClassicalKind::SrcIpCidr => {
@@ -196,8 +198,8 @@ fn encode_port_section(out: &mut Vec<u8>, items: &[(u16, u16)]) {
 }
 
 /* ============================================================
-   Decode
-   ============================================================ */
+Decode
+============================================================ */
 
 /// 反序列化 RRS 二进制为 [`ClassicalEntry`] 列表。
 pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
@@ -250,7 +252,11 @@ pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
                     let s = std::str::from_utf8(bytes)
                         .map_err(|e| err(format!("non-utf8: {e}")))?
                         .to_string();
-                    out.push(ClassicalEntry { kind, value: s, policy: None });
+                    out.push(ClassicalEntry {
+                        kind,
+                        value: s,
+                        policy: None,
+                    });
                 }
             }
             ClassicalKind::IpCidr => {
@@ -296,8 +302,16 @@ pub fn decode(buf: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
                     let hi_b = br.take(2)?;
                     let lo = u16::from_be_bytes([lo_b[0], lo_b[1]]);
                     let hi = u16::from_be_bytes([hi_b[0], hi_b[1]]);
-                    let v = if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") };
-                    out.push(ClassicalEntry { kind: ClassicalKind::DstPort, value: v, policy: None });
+                    let v = if lo == hi {
+                        format!("{lo}")
+                    } else {
+                        format!("{lo}-{hi}")
+                    };
+                    out.push(ClassicalEntry {
+                        kind: ClassicalKind::DstPort,
+                        value: v,
+                        policy: None,
+                    });
                 }
             }
             _ => unreachable!(),
@@ -330,8 +344,12 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
-    fn remaining(&self) -> usize { self.buf.len() - self.pos }
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
         if self.pos + n > self.buf.len() {
             return Err(err(format!("unexpected EOF at {} (need {})", self.pos, n)));
@@ -372,8 +390,8 @@ impl<'a> Reader<'a> {
 }
 
 /* ============================================================
-   双向转换辅助 —— 把 entries 序列化回各种文本格式
-   ============================================================ */
+双向转换辅助 —— 把 entries 序列化回各种文本格式
+============================================================ */
 
 pub fn entries_to_yaml(entries: &[ClassicalEntry]) -> String {
     let mut out = String::from("payload:\n");
@@ -429,35 +447,54 @@ pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
     let mut out = String::from("{\n  \"version\": 2,\n  \"rules\": [\n    {");
     let mut first = true;
     for (k, v) in &bucket {
-        if !first { out.push(','); }
+        if !first {
+            out.push(',');
+        }
         first = false;
         out.push_str(&format!("\n      \"{k}\": ["));
         for (i, s) in v.iter().enumerate() {
-            if i > 0 { out.push(','); }
-            out.push_str(&format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")));
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\"{}\"",
+                s.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
         }
         out.push(']');
     }
     if !ports.is_empty() {
-        if !first { out.push(','); }
+        if !first {
+            out.push(',');
+        }
         let mut singles: Vec<&str> = Vec::new();
         let mut ranges: Vec<&str> = Vec::new();
         for p in &ports {
-            if p.contains('-') { ranges.push(p); } else { singles.push(p); }
+            if p.contains('-') {
+                ranges.push(p);
+            } else {
+                singles.push(p);
+            }
         }
         if !singles.is_empty() {
             out.push_str("\n      \"port\": [");
             for (i, s) in singles.iter().enumerate() {
-                if i > 0 { out.push(','); }
+                if i > 0 {
+                    out.push(',');
+                }
                 out.push_str(s);
             }
             out.push(']');
         }
         if !ranges.is_empty() {
-            if !singles.is_empty() { out.push(','); }
+            if !singles.is_empty() {
+                out.push(',');
+            }
             out.push_str("\n      \"port_range\": [");
             for (i, s) in ranges.iter().enumerate() {
-                if i > 0 { out.push(','); }
+                if i > 0 {
+                    out.push(',');
+                }
                 out.push_str(&format!("\"{}\"", s.replace('-', ":")));
             }
             out.push(']');
@@ -486,7 +523,11 @@ mod tests {
     use super::*;
 
     fn entry(k: ClassicalKind, v: &str) -> ClassicalEntry {
-        ClassicalEntry { kind: k, value: v.into(), policy: None }
+        ClassicalEntry {
+            kind: k,
+            value: v.into(),
+            policy: None,
+        }
     }
 
     #[test]
@@ -515,7 +556,7 @@ mod tests {
         assert!(values.contains("fd00::/8"));
         assert!(values.contains("443"));
         assert!(values.contains("1000-2000"));
-        assert!(values.contains("code"));      // 进程名小写
+        assert!(values.contains("code")); // 进程名小写
     }
 
     #[test]
@@ -548,7 +589,10 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_body() {
-        let mut bin = encode(&[entry(ClassicalKind::Domain, "x.com"), entry(ClassicalKind::Domain, "y.com")]);
+        let mut bin = encode(&[
+            entry(ClassicalKind::Domain, "x.com"),
+            entry(ClassicalKind::Domain, "y.com"),
+        ]);
         // 翻转 body 的某一字节
         let n = bin.len();
         bin[n - 3] ^= 0xff;
@@ -560,12 +604,20 @@ mod tests {
     fn size_smaller_than_yaml() {
         let mut entries = Vec::new();
         for i in 0..1000u32 {
-            entries.push(entry(ClassicalKind::DomainSuffix, &format!("host{}.example.com", i)));
+            entries.push(entry(
+                ClassicalKind::DomainSuffix,
+                &format!("host{}.example.com", i),
+            ));
         }
         let bin = encode(&entries);
         let yaml = entries_to_yaml(&entries);
         let txt = entries_to_txt(&entries);
-        assert!(bin.len() < yaml.len() / 2, "rrs={} yaml={}", bin.len(), yaml.len());
+        assert!(
+            bin.len() < yaml.len() / 2,
+            "rrs={} yaml={}",
+            bin.len(),
+            yaml.len()
+        );
         assert!(bin.len() < txt.len(), "rrs={} txt={}", bin.len(), txt.len());
     }
 
@@ -581,8 +633,14 @@ mod tests {
         let json = entries_to_singbox_json(&out);
         // 用 sing-box parser 反解
         let back = crate::parser::sb_json::parse(json.as_bytes()).unwrap();
-        assert!(back.iter().any(|e| e.kind == ClassicalKind::DomainSuffix && e.value == "example.com"));
-        assert!(back.iter().any(|e| e.kind == ClassicalKind::DstPort && e.value == "443"));
-        assert!(back.iter().any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000"));
+        assert!(back
+            .iter()
+            .any(|e| e.kind == ClassicalKind::DomainSuffix && e.value == "example.com"));
+        assert!(back
+            .iter()
+            .any(|e| e.kind == ClassicalKind::DstPort && e.value == "443"));
+        assert!(back
+            .iter()
+            .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000"));
     }
 }

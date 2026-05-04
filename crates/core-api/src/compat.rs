@@ -171,7 +171,17 @@ async fn logs(
 }
 
 async fn logs_ws(mut sock: WebSocket, s: NativeState, level_filter: String) {
-    let mut rx = s.runtime.logs.subscribe();
+    // 原子拿历史 + 订阅，避免 push 在两步之间发生导致同事件被双投递。
+    let (history, mut rx) = s.runtime.logs.subscribe_with_history();
+    for ev in history {
+        if !level_pass(&level_filter, &ev.level) {
+            continue;
+        }
+        let payload = serde_json::to_string(&ev).unwrap_or_default();
+        if sock.send(Message::Text(payload)).await.is_err() {
+            return;
+        }
+    }
     while let Ok(ev) = rx.recv().await {
         if !level_pass(&level_filter, &ev.level) {
             continue;
@@ -189,14 +199,25 @@ fn log_event_stream(
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     use tokio_stream::wrappers::BroadcastStream;
     use tokio_stream::StreamExt;
-    let rx = s.runtime.logs.subscribe();
-    BroadcastStream::new(rx).filter_map(move |r| match r {
-        Ok(ev) if level_pass(&level_filter, &ev.level) => {
-            let body = serde_json::to_string(&ev).unwrap_or_default();
-            Some(Ok(Event::default().data(body)))
-        }
+
+    // 与 WS 路径同因——保持 snapshot/subscribe 原子化避免事件双发。
+    let (snapshot, rx) = s.runtime.logs.subscribe_with_history();
+    let history_filter = level_filter.clone();
+    let history =
+        tokio_stream::iter(snapshot).filter_map(move |ev| log_event_sse(&history_filter, ev));
+    let live = BroadcastStream::new(rx).filter_map(move |r| match r {
+        Ok(ev) => log_event_sse(&level_filter, ev),
         _ => None,
-    })
+    });
+    history.chain(live)
+}
+
+fn log_event_sse(filter: &str, ev: core_observe::LogEvent) -> Option<Result<Event, Infallible>> {
+    if !level_pass(filter, &ev.level) {
+        return None;
+    }
+    let body = serde_json::to_string(&ev).unwrap_or_default();
+    Some(Ok(Event::default().data(body)))
 }
 
 fn level_pass(filter: &str, msg: &str) -> bool {
@@ -290,7 +311,11 @@ async fn connections_close_one(
     if s.runtime.connections.close_by_uuid_or_numeric(&id) {
         return (StatusCode::NO_CONTENT, Json(json!({}))).into_response();
     }
-    (StatusCode::NOT_FOUND, Json(json!({"message": "no such connection"}))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"message": "no such connection"})),
+    )
+        .into_response()
 }
 
 async fn connections_smart_block(
@@ -315,7 +340,11 @@ async fn proxy_one(
     if let Some(v) = map.get(&name) {
         Json(v.clone()).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"message": "proxy not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "proxy not found"})),
+        )
+            .into_response()
     }
 }
 
@@ -331,7 +360,10 @@ async fn proxy_put(
 ) -> impl IntoResponse {
     let groups = s.runtime.groups.read();
     let Some(g) = groups.get(&group) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"message": "group not found"})))
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "group not found"})),
+        )
             .into_response();
     };
     if !g.members().iter().any(|m| m == &body.name) {
@@ -360,7 +392,27 @@ async fn proxy_delay(
     Query(q): Query<DelayQ>,
 ) -> axum::response::Response {
     let to = q.timeout.map(Duration::from_millis);
-    match s.urltest.test_node(&s.runtime, &name, q.url.as_deref(), to).await {
+    // Mihomo `proxy.URLTest()` 对 group 名递归到当前选中成员；WutherCore 的
+    // `test_node` 只查 outbounds 注册表（不含 group），group 名直接 UnknownNode，
+    // dashboard 看到全是 timeout。这里仿照 mihomo：name 是 group → 转测它的
+    // `now` 成员；group 没选过 → 用 members.first() 兜底；name 不是 group →
+    // 走原 test_node 路径。
+    let target = match s.runtime.groups.read().get(&name) {
+        Some(g) => g
+            .to_clash_json()
+            .get("now")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .or_else(|| g.members().first().cloned())
+            .unwrap_or_else(|| name.clone()),
+        None => name.clone(),
+    };
+    match s
+        .urltest
+        .test_node(&s.runtime, &target, q.url.as_deref(), to)
+        .await
+    {
         Ok(ms) => Json(json!({"delay": ms, "meanDelay": ms})).into_response(),
         Err(e) => (
             StatusCode::REQUEST_TIMEOUT,
@@ -459,7 +511,28 @@ fn collect_proxy_map(s: &NativeState) -> serde_json::Map<String, Value> {
     }
 
     for (name, g) in runtime.groups.read().iter() {
-        proxies.insert(name.clone(), g.to_clash_json());
+        let mut json = g.to_clash_json();
+        // Mihomo: 一个 group 的 `history` / `alive` / `extra` 取自当前选中的成员
+        // （Selector 的当前选择，URLTest 的最佳延迟节点）。
+        // WutherCore 的 `to_clash_json` 自身拿不到 UrlTester，所以 group 始终输出
+        // `history: []`、`alive: true`，dashboard 把空 history 当作"未测/超时"
+        // 显示——这就是用户看到的"永远超时"症状。这里在 API 边界上回填。
+        if let Some(now) = json
+            .get("now")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert("history".into(), history_for(&now));
+                obj.insert(
+                    "alive".into(),
+                    Value::Bool(urltest.alive_for_url(&now, &default_url)),
+                );
+                obj.insert("extra".into(), extra_for(urltest, &now));
+            }
+        }
+        proxies.insert(name.clone(), json);
     }
     for n in &runtime.plan.nodes {
         proxies.insert(
@@ -549,7 +622,10 @@ async fn provider_proxy_one(
     Path(name): Path<String>,
 ) -> axum::response::Response {
     if !s.runtime.plan.feeds.contains_key(&name) {
-        return (StatusCode::NOT_FOUND, Json(json!({"message": "provider not found"})))
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "provider not found"})),
+        )
             .into_response();
     }
     Json(provider_json(&s, &name)).into_response()
@@ -583,7 +659,9 @@ async fn provider_proxy_healthcheck(
         .plan
         .nodes
         .iter()
-        .filter(|n| n.name.starts_with(&format!("{}/", name)) || n.name.contains(&format!("[{}]", name)))
+        .filter(|n| {
+            n.name.starts_with(&format!("{}/", name)) || n.name.contains(&format!("[{}]", name))
+        })
         .map(|n| n.name.clone())
         .collect();
     let res = s.urltest.test_many(&s.runtime, &nodes, None, None).await;
@@ -617,8 +695,7 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
             .nodes
             .iter()
             .filter(|n| {
-                n.name.starts_with(&format!("{}/", name))
-                    || n.name.contains(&format!("[{}]", name))
+                n.name.starts_with(&format!("{}/", name)) || n.name.contains(&format!("[{}]", name))
             })
             .map(|n| {
                 json!({
@@ -634,7 +711,14 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
         .feeds
         .as_ref()
         .and_then(|m| m.status(name))
-        .map(|st| (st.last_refreshed_ms, st.next_due_ms, st.last_raw_bytes, st.last_from_cache))
+        .map(|st| {
+            (
+                st.last_refreshed_ms,
+                st.next_due_ms,
+                st.last_raw_bytes,
+                st.last_from_cache,
+            )
+        })
         .unwrap_or((0, 0, 0, false));
     json!({
         "name": name,
@@ -683,7 +767,11 @@ async fn provider_rule_one(
         }))
         .into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"message": "ruleset not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "ruleset not found"})),
+        )
+            .into_response()
     }
 }
 
@@ -715,12 +803,17 @@ async fn rules(State(s): State<NativeState>) -> Json<Value> {
             RouteMatcher::Service(svc) => ("RULE-SET", svc.clone()),
             RouteMatcher::Domain(d) => ("DOMAIN", d.clone()),
             RouteMatcher::Suffix(d) => ("DOMAIN-SUFFIX", d.clone()),
+            RouteMatcher::Keyword(k) => ("DOMAIN-KEYWORD", k.clone()),
             RouteMatcher::Cidr(c) => ("IP-CIDR", c.clone()),
             RouteMatcher::Port(p) => ("DST-PORT", p.to_string()),
+            RouteMatcher::PortRange(lo, hi) => ("DST-PORT", format!("{lo}-{hi}")),
             RouteMatcher::Network(n) => ("NETWORK", n.clone()),
             RouteMatcher::Process(p) => ("PROCESS-NAME", p.clone()),
             RouteMatcher::Set(s) => ("RULE-SET", s.clone()),
             RouteMatcher::Proto(p) => ("PROCESS-PATH", p.clone()),
+            // mihomo 标准里没有 AND/OR 组合规则；为面板可读，输出占位类型。
+            RouteMatcher::And(parts) => ("AND", format!("{} clauses", parts.len())),
+            RouteMatcher::Or(parts) => ("OR", format!("{} clauses", parts.len())),
         };
         let proxy = match &st.action {
             RouteAction::Direct => "DIRECT".to_string(),
@@ -837,7 +930,10 @@ async fn dns_query(
     Query(q): Query<DnsQ>,
 ) -> axum::response::Response {
     let Some(name) = q.name else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"message": "name required"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "name required"})),
+        )
             .into_response();
     };
     let qtype_label = q.qtype.as_deref().unwrap_or("A").to_uppercase();
@@ -913,7 +1009,10 @@ fn iso8601(ts_secs: u64) -> String {
     let minute = (secs_of_day / 60) % 60;
     let second = secs_of_day % 60;
     let (y, m, d) = civil_from_days(days);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hour, minute, second)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hour, minute, second
+    )
 }
 
 /// Howard Hinnant 公元日历算法：从 1970-01-01 起的天数 → (year, month, day)。

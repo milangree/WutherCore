@@ -88,7 +88,11 @@ pub fn rank64(bm: &[u64], ranks: &[i32], i: i32) -> i32 {
     let i = i as usize;
     let word = i >> 6;
     let bit = i & 63;
-    let base = if word < ranks.len() { ranks[word] } else { *ranks.last().unwrap_or(&0) };
+    let base = if word < ranks.len() {
+        ranks[word]
+    } else {
+        *ranks.last().unwrap_or(&0)
+    };
     if bit == 0 || word >= bm.len() {
         base
     } else {
@@ -106,7 +110,7 @@ pub fn select32_r64(bm: &[u64], selects: &[i32], ranks: &[i32], i: i32) -> i32 {
     }
     let bucket = (i / 64) as usize;
     let _inside = (i % 64) as u32; // 暂未使用：select_within_word 在 word 内重新定位
-    // 起点：第 bucket 个 64-step 采样位置
+                                   // 起点：第 bucket 个 64-step 采样位置
     let start_bit = if bucket < selects.len() {
         selects[bucket] as usize
     } else {
@@ -191,7 +195,11 @@ mod tests {
         let (selects, ranks) = index_select32_r64(&bm);
         // rank 与朴素一致
         for i in [0, 1, 63, 64, 100, 200, 511, 512, 1023, 1024] {
-            assert_eq!(rank64(&bm, &ranks, i as i32), naive_rank(&bm, i), "rank({i})");
+            assert_eq!(
+                rank64(&bm, &ranks, i as i32),
+                naive_rank(&bm, i),
+                "rank({i})"
+            );
         }
         // select：先用朴素跑一遍看有多少 "1"
         let total: usize = bm.iter().map(|w| w.count_ones() as usize).sum();

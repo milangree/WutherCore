@@ -34,6 +34,10 @@ pub enum NodeProtocol {
     Mieru,
     Sudoku,
     TrustTunnel,
+    /// DNS hijack outbound (mihomo `type: dns`)：把 port-53 流量在本地直接
+    /// 用 resolver 应答，不连远端。常配合 `RULE-SET / DST-PORT 53 → DNS_Hijack`
+    /// 把 LAN 客户端的 DNS 截到本机解析。
+    Dns,
     Other(String),
 }
 
@@ -59,6 +63,7 @@ impl NodeProtocol {
             "mieru" => Self::Mieru,
             "sudoku" => Self::Sudoku,
             "trusttunnel" => Self::TrustTunnel,
+            "dns" => Self::Dns,
             other => Self::Other(other.into()),
         }
     }
@@ -84,6 +89,7 @@ impl NodeProtocol {
             Self::Mieru => "mieru",
             Self::Sudoku => "sudoku",
             Self::TrustTunnel => "trusttunnel",
+            Self::Dns => "dns",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -110,7 +116,12 @@ pub struct ParsedNode {
 }
 
 impl ParsedNode {
-    pub fn new(name: impl Into<String>, protocol: NodeProtocol, host: impl Into<String>, port: u16) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        protocol: NodeProtocol,
+        host: impl Into<String>,
+        port: u16,
+    ) -> Self {
         Self {
             name: name.into(),
             protocol,
@@ -145,18 +156,41 @@ pub fn parse_uri(uri: &str) -> ConfigResult<ParsedNode> {
     let parsed = match proto {
         NodeProtocol::Shadowsocks => parse_ss(uri)?,
         NodeProtocol::Vmess => parse_vmess(uri)?,
-        NodeProtocol::Vless | NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
+        NodeProtocol::Vless
+        | NodeProtocol::Trojan
+        | NodeProtocol::Hysteria2
+        | NodeProtocol::Tuic
         | NodeProtocol::Hysteria => parse_url_like(uri, proto)?,
         NodeProtocol::Http | NodeProtocol::Socks5 => parse_http_socks(uri, proto)?,
         NodeProtocol::Ssh => parse_url_like(uri, NodeProtocol::Ssh)?,
         NodeProtocol::Wireguard => parse_url_like(uri, NodeProtocol::Wireguard)?,
+        NodeProtocol::Dns => parse_dns_hijack(uri)?,
         _ => parse_url_like(uri, proto)?,
     };
     Ok(parsed)
 }
 
+/// `dns://...` —— DNS hijack 出站。host/port 仅占位（实际不连），
+/// fragment 是节点名，缺省时取 `DNS`。
+fn parse_dns_hijack(uri: &str) -> ConfigResult<ParsedNode> {
+    // dns:// 后面允许空，name 从 fragment 取，缺省为 "DNS"。
+    let (rest, fragment) = uri[6..].split_once('#').unwrap_or((&uri[6..], ""));
+    let name = if fragment.is_empty() {
+        "DNS".to_string()
+    } else {
+        pct_decode(fragment)
+    };
+    let _ = rest; // 忽略 host/port —— 不需要实际目标
+    let mut node = ParsedNode::new(name, NodeProtocol::Dns, "0.0.0.0", 0);
+    node.raw = uri.to_string();
+    node.udp = true;
+    Ok(node)
+}
+
 fn pct_decode(s: &str) -> String {
-    percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 fn fragment_name(url: &Url, fallback: &str) -> String {
@@ -190,16 +224,18 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
 
     let mut node = ParsedNode::new(name, proto.clone(), host, port);
     node.raw = uri.to_string();
-    node.tls = matches!(proto, NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic)
-        || params
-            .get("security")
-            .map(|s| matches!(s.as_str(), "tls" | "reality"))
-            .unwrap_or(false);
-    node.sni = params.get("sni").cloned().or_else(|| params.get("peer").cloned());
-    node.transport = params
-        .get("type")
+    node.tls = matches!(
+        proto,
+        NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
+    ) || params
+        .get("security")
+        .map(|s| matches!(s.as_str(), "tls" | "reality"))
+        .unwrap_or(false);
+    node.sni = params
+        .get("sni")
         .cloned()
-        .unwrap_or_else(|| "tcp".into());
+        .or_else(|| params.get("peer").cloned());
+    node.transport = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
     let user = url.username();
     if !user.is_empty() {
         let decoded = pct_decode(user);
@@ -253,9 +289,9 @@ fn parse_ss(uri: &str) -> ConfigResult<ParsedNode> {
         let (userinfo, hostpart) = body.split_at(at_idx);
         let hostpart = &hostpart[1..]; // 跳过 '@'
         let userinfo = decode_base64_loose(userinfo).unwrap_or_else(|| userinfo.to_string());
-        let (method, password) = userinfo
-            .split_once(':')
-            .ok_or_else(|| ConfigError::bad_node(format!("ss userinfo 缺少 method:password: {uri}")))?;
+        let (method, password) = userinfo.split_once(':').ok_or_else(|| {
+            ConfigError::bad_node(format!("ss userinfo 缺少 method:password: {uri}"))
+        })?;
 
         let (host_port, query) = match hostpart.find('?') {
             Some(idx) => (&hostpart[..idx], Some(&hostpart[idx + 1..])),
@@ -318,8 +354,12 @@ fn parse_vmess(uri: &str) -> ConfigResult<ParsedNode> {
         .ok_or_else(|| ConfigError::bad_node(format!("vmess 缺少 add: {uri}")))?;
     let port = v
         .get("port")
-        .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
-        .ok_or_else(|| ConfigError::bad_node(format!("vmess 缺少 port: {uri}")))? as u16;
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .ok_or_else(|| ConfigError::bad_node(format!("vmess 缺少 port: {uri}")))?
+        as u16;
     let name = v
         .get("ps")
         .and_then(|x| x.as_str())

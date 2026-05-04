@@ -32,6 +32,7 @@ sonobat.db
 
 # 第三方参考源码（仅本地对照阅读，不进仓）
 mihomo-smart/
+sing-tun/
 
 # 临时调试脚本
 tproxy.sh

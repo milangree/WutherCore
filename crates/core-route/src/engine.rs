@@ -125,8 +125,17 @@ impl RouteEngine {
 
     pub fn decide(&self, ctx: &FlowContext) -> (RouteDecision, &'static str, String) {
         for step in &self.plan.steps {
-            if step_matches(&step.matcher, ctx, &self.extra_cidrs, self.rulesets.as_ref()) {
-                return (RouteDecision::from_action(&step.action), matcher_kind(&step.matcher), step.source.clone());
+            if step_matches(
+                &step.matcher,
+                ctx,
+                &self.extra_cidrs,
+                self.rulesets.as_ref(),
+            ) {
+                return (
+                    RouteDecision::from_action(&step.action),
+                    matcher_kind(&step.matcher),
+                    step.source.clone(),
+                );
             }
         }
         (RouteDecision::Direct, "fallback", "implicit-direct".into())
@@ -142,8 +151,12 @@ fn matcher_kind(m: &RouteMatcher) -> &'static str {
         RouteMatcher::Service(_) => "service",
         RouteMatcher::Domain(_) => "domain",
         RouteMatcher::Suffix(_) => "suffix",
+        RouteMatcher::Keyword(_) => "keyword",
         RouteMatcher::Cidr(_) => "ip",
         RouteMatcher::Port(_) => "port",
+        RouteMatcher::PortRange(_, _) => "port_range",
+        RouteMatcher::And(_) => "and",
+        RouteMatcher::Or(_) => "or",
         RouteMatcher::Network(_) => "network",
         RouteMatcher::Process(_) => "process",
         RouteMatcher::Set(_) => "set",
@@ -162,11 +175,15 @@ fn step_matches(
         RouteMatcher::Home => match_home(ctx),
         RouteMatcher::Cn => match_cn(ctx),
         RouteMatcher::Ads => match_suffix_list(&ctx.host, builtin::ADS_SUFFIXES),
-        RouteMatcher::Service(name) => match_suffix_list(&ctx.host, builtin::service_suffixes(name)),
+        RouteMatcher::Service(name) => {
+            match_suffix_list(&ctx.host, builtin::service_suffixes(name))
+        }
         RouteMatcher::Domain(d) => host_eq(&ctx.host, d),
         RouteMatcher::Suffix(s) => host_suffix(&ctx.host, s),
+        RouteMatcher::Keyword(k) => host_contains(&ctx.host, k),
         RouteMatcher::Cidr(s) => match_cidr(ctx, s, extra_cidrs),
         RouteMatcher::Port(p) => ctx.port == *p,
+        RouteMatcher::PortRange(lo, hi) => ctx.port >= *lo && ctx.port <= *hi,
         RouteMatcher::Network(n) => n.eq_ignore_ascii_case(ctx.network.as_str()),
         RouteMatcher::Process(name) => ctx
             .process
@@ -185,6 +202,16 @@ fn step_matches(
             .as_ref()
             .map(|p| crate::sniff::proto_name_matches(name, p))
             .unwrap_or(false),
+        // `.all` / `.any` 都是短路求值 —— 任一 child 决定结果就立刻退出，
+        // 不会把整个 children 列表跑完。这是 typed-key object 形式相对"展开为
+        // 多条独立规则"的主要性能优势：N 条 OR 写法只产生 1 条 RouteStep，
+        // step_matches 这一层只调一次。
+        RouteMatcher::And(parts) => parts
+            .iter()
+            .all(|m| step_matches(m, ctx, extra_cidrs, rulesets)),
+        RouteMatcher::Or(parts) => parts
+            .iter()
+            .any(|m| step_matches(m, ctx, extra_cidrs, rulesets)),
     }
 }
 
@@ -196,6 +223,12 @@ fn host_suffix(host: &str, suffix: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     let s = suffix.trim_start_matches('.').to_ascii_lowercase();
     h == s || h.ends_with(&format!(".{s}"))
+}
+
+/// mihomo `DOMAIN-KEYWORD,foo` —— host 含子串 `foo`（大小写不敏感）。
+fn host_contains(host: &str, keyword: &str) -> bool {
+    host.to_ascii_lowercase()
+        .contains(&keyword.to_ascii_lowercase())
 }
 
 fn match_suffix_list(host: &str, list: &[&str]) -> bool {
@@ -244,7 +277,7 @@ fn match_cidr(ctx: &FlowContext, cidr: &str, extra: &[IpNet]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_config::runtime_plan::{RouteStep, RoutePlan};
+    use core_config::runtime_plan::{RoutePlan, RouteStep};
 
     fn plan_cn_smart() -> RoutePlan {
         let mut p = RoutePlan {
@@ -299,5 +332,73 @@ mod tests {
     fn host_suffix_case_insensitive() {
         assert!(super::host_suffix("Mail.QQ.com", "qq.com"));
         assert!(!super::host_suffix("noqq.com", "qq.com"));
+    }
+
+    /// `Or([Port(53), Port(5353)])` 应该在端口为 53 或 5353 时命中，其它时不命中。
+    /// 单条规则覆盖多个端口，避免在步表里展开成 N 条独立 step。
+    #[test]
+    fn or_matcher_short_circuits_on_first_match() {
+        let plan = RoutePlan {
+            preset: "custom".into(),
+            r#final: "main".into(),
+            steps: vec![
+                RouteStep {
+                    matcher: RouteMatcher::Or(vec![
+                        RouteMatcher::Port(53),
+                        RouteMatcher::Port(5353),
+                    ]),
+                    action: RouteAction::Group("hijack".into()),
+                    source: "or-test".into(),
+                },
+                RouteStep {
+                    matcher: RouteMatcher::Any,
+                    action: RouteAction::Group("main".into()),
+                    source: "any".into(),
+                },
+            ],
+            sets: Default::default(),
+        };
+        let eng = RouteEngine::new(plan);
+        let (d53, _, _) = eng.decide(&FlowContext::for_domain("a.com", 53, NetworkKind::Udp));
+        let (d5353, _, _) = eng.decide(&FlowContext::for_domain("a.com", 5353, NetworkKind::Udp));
+        let (d80, _, _) = eng.decide(&FlowContext::for_domain("a.com", 80, NetworkKind::Tcp));
+        assert_eq!(d53, RouteDecision::Group("hijack".into()));
+        assert_eq!(d5353, RouteDecision::Group("hijack".into()));
+        assert_eq!(d80, RouteDecision::Group("main".into()));
+    }
+
+    /// `And([Port(53), Network(udp)])` 只在端口和协议同时命中时触发。
+    #[test]
+    fn and_matcher_requires_all_clauses() {
+        let plan = RoutePlan {
+            preset: "custom".into(),
+            r#final: "main".into(),
+            steps: vec![
+                RouteStep {
+                    matcher: RouteMatcher::And(vec![
+                        RouteMatcher::Port(53),
+                        RouteMatcher::Network("udp".into()),
+                    ]),
+                    action: RouteAction::Group("hijack".into()),
+                    source: "and-test".into(),
+                },
+                RouteStep {
+                    matcher: RouteMatcher::Any,
+                    action: RouteAction::Group("main".into()),
+                    source: "any".into(),
+                },
+            ],
+            sets: Default::default(),
+        };
+        let eng = RouteEngine::new(plan);
+        // 53/udp 命中
+        let (d_udp, _, _) = eng.decide(&FlowContext::for_domain("a.com", 53, NetworkKind::Udp));
+        assert_eq!(d_udp, RouteDecision::Group("hijack".into()));
+        // 53/tcp 不命中（端口对，网络不对）
+        let (d_tcp, _, _) = eng.decide(&FlowContext::for_domain("a.com", 53, NetworkKind::Tcp));
+        assert_eq!(d_tcp, RouteDecision::Group("main".into()));
+        // 80/udp 不命中（网络对，端口不对）
+        let (d_other, _, _) = eng.decide(&FlowContext::for_domain("a.com", 80, NetworkKind::Udp));
+        assert_eq!(d_other, RouteDecision::Group("main".into()));
     }
 }

@@ -28,6 +28,27 @@ use crate::{ConnectionAccounting, Metrics};
 
 const BUF_SIZE: usize = 32 * 1024;
 
+/// 把 `read` 结果归类为：拿到 N 字节继续 / 干净 EOF 该 break / 真错。
+///
+/// rustls 在 TLS 对端关 TCP 不发 close_notify 时返回 `UnexpectedEof`，RFC 8446
+/// 上是 SHOULD 不是 MUST，实践中海量服务器都不发；mihomo / clash / sing-box
+/// 一致把它当 clean EOF 吃掉，这里也对齐——HTTP 等应用层有自己的长度校验，
+/// TLS-level 的截断攻击检测对代理场景没意义。
+enum ReadOutcome {
+    Data(usize),
+    Eof,
+    Err(io::Error),
+}
+
+fn classify_read(r: io::Result<usize>) -> ReadOutcome {
+    match r {
+        Ok(0) => ReadOutcome::Eof,
+        Ok(n) => ReadOutcome::Data(n),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => ReadOutcome::Eof,
+        Err(e) => ReadOutcome::Err(e),
+    }
+}
+
 /// 双向拷贝 a ↔ b，每段透传到 per-conn + 全局 counter。
 ///
 /// 返回 `(up_total, down_total)` —— 即便一方提前出错也会尽量返回到那一刻为止
@@ -60,7 +81,11 @@ where
                     break;
                 }
                 r = ar.read(&mut buf) => {
-                    let n = match r { Ok(0) => { let _ = bw.shutdown().await; break; }, Ok(n) => n, Err(e) => return Err(e) };
+                    let n = match classify_read(r) {
+                        ReadOutcome::Data(n) => n,
+                        ReadOutcome::Eof => { let _ = bw.shutdown().await; break; }
+                        ReadOutcome::Err(e) => return Err(e),
+                    };
                     if let Err(e) = bw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
@@ -86,7 +111,11 @@ where
                     break;
                 }
                 r = br.read(&mut buf) => {
-                    let n = match r { Ok(0) => { let _ = aw.shutdown().await; break; }, Ok(n) => n, Err(e) => return Err(e) };
+                    let n = match classify_read(r) {
+                        ReadOutcome::Data(n) => n,
+                        ReadOutcome::Eof => { let _ = aw.shutdown().await; break; }
+                        ReadOutcome::Err(e) => return Err(e),
+                    };
                     if let Err(e) = aw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
@@ -135,7 +164,11 @@ where
                     break;
                 }
                 r = ar.read(&mut buf) => {
-                    let n = match r { Ok(0) => { let _ = bw.shutdown().await; break; }, Ok(n) => n, Err(e) => return Err(e) };
+                    let n = match classify_read(r) {
+                        ReadOutcome::Data(n) => n,
+                        ReadOutcome::Eof => { let _ = bw.shutdown().await; break; }
+                        ReadOutcome::Err(e) => return Err(e),
+                    };
                     if let Err(e) = bw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
@@ -161,7 +194,11 @@ where
                     break;
                 }
                 r = br.read(&mut buf) => {
-                    let n = match r { Ok(0) => { let _ = aw.shutdown().await; break; }, Ok(n) => n, Err(e) => return Err(e) };
+                    let n = match classify_read(r) {
+                        ReadOutcome::Data(n) => n,
+                        ReadOutcome::Eof => { let _ = aw.shutdown().await; break; }
+                        ReadOutcome::Err(e) => return Err(e),
+                    };
                     if let Err(e) = aw.write_all(&buf[..n]).await {
                         return Err(e);
                     }
@@ -182,6 +219,28 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// rustls 在 peer 关 TCP 不发 close_notify 时返回 `UnexpectedEof`；
+    /// 该错误必须被归类为 clean EOF，否则 relay 层会 `warn!` 一条假错误。
+    /// 这是 mihomo / clash / sing-box 的一致行为。
+    #[test]
+    fn classify_unexpected_eof_is_clean_eof() {
+        let err = io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed without close_notify");
+        assert!(matches!(classify_read(Err(err)), ReadOutcome::Eof));
+    }
+
+    /// 真正的错误（连接重置等）继续按 Err 透传，不能被吃掉。
+    #[test]
+    fn classify_other_io_errors_propagate() {
+        let err = io::Error::new(io::ErrorKind::ConnectionReset, "RST");
+        assert!(matches!(classify_read(Err(err)), ReadOutcome::Err(_)));
+    }
+
+    #[test]
+    fn classify_normal_data_and_eof() {
+        assert!(matches!(classify_read(Ok(0)), ReadOutcome::Eof));
+        assert!(matches!(classify_read(Ok(42)), ReadOutcome::Data(42)));
+    }
 
     #[tokio::test]
     async fn round_trip_counts_bytes() {

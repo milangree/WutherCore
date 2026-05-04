@@ -112,8 +112,19 @@ pub fn service_suffixes(name: &str) -> &'static [&'static str] {
     match name {
         "telegram" => &["telegram.org", "t.me", "tdesktop.com", "telegra.ph"],
         "youtube" => &["youtube.com", "youtu.be", "ytimg.com", "googlevideo.com"],
-        "netflix" => &["netflix.com", "nflxvideo.net", "nflxext.com", "nflximg.net", "nflxso.net"],
-        "github" => &["github.com", "githubusercontent.com", "githubassets.com", "ghcr.io"],
+        "netflix" => &[
+            "netflix.com",
+            "nflxvideo.net",
+            "nflxext.com",
+            "nflximg.net",
+            "nflxso.net",
+        ],
+        "github" => &[
+            "github.com",
+            "githubusercontent.com",
+            "githubassets.com",
+            "ghcr.io",
+        ],
         "apple" => &["apple.com", "icloud.com", "mzstatic.com", "cdn-apple.com"],
         "google" => &[
             "google.com",

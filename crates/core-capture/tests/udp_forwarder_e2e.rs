@@ -34,8 +34,12 @@ async fn eim_mode_reuses_outbound_socket() {
     };
     let eim = Arc::new(EimNatTable::new(cfg.udp_timeout));
     let inner_src: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
-    let s1 = send_one(&cfg, &eim, inner_src, dst, b"hello").await.unwrap();
-    let s2 = send_one(&cfg, &eim, inner_src, dst, b"world").await.unwrap();
+    let s1 = send_one(&cfg, &eim, inner_src, dst, b"hello")
+        .await
+        .unwrap();
+    let s2 = send_one(&cfg, &eim, inner_src, dst, b"world")
+        .await
+        .unwrap();
     assert!(Arc::ptr_eq(&s1, &s2));
     let mut buf = vec![0u8; 1500];
     let (n, peer) = tokio::time::timeout(Duration::from_secs(2), s1.recv_from(&mut buf))

@@ -2,7 +2,9 @@
 //!
 //! 这些 test 不依赖 OS / TUN，纯 in-process，跨平台都能跑。
 
-use core_capture::packet::{parse_ip_packet, IpVersion, L4};
+use core_capture::packet::{
+    encode_tun_ip_frame, parse_ip_packet, parse_tun_frame, FrameFormat, IpVersion, L4,
+};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     IpAddress, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl,
@@ -23,7 +25,8 @@ fn build_v6_udp(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; ip.buffer_len() + udp.header_len() + payload.len()];
     let mut ip_pkt = Ipv6Packet::new_unchecked(&mut buf[..]);
     ip.emit(&mut ip_pkt);
-    let mut udp_pkt = UdpPacket::new_unchecked(&mut ip_pkt.payload_mut()[..udp.header_len() + payload.len()]);
+    let mut udp_pkt =
+        UdpPacket::new_unchecked(&mut ip_pkt.payload_mut()[..udp.header_len() + payload.len()]);
     udp.emit(
         &mut udp_pkt,
         &IpAddress::Ipv6(src),
@@ -113,4 +116,82 @@ fn ignores_truncated_buffer() {
     let buf = build_v4_tcp(1, 2, TcpControl::Syn);
     let r = parse_ip_packet(&buf[..10]); // 截断到 IP 头一半
     assert!(r.is_err());
+}
+
+#[test]
+fn parses_linux_tun_pi_prefixed_frame() {
+    let ip = build_v4_tcp(33333, 443, TcpControl::Syn);
+    let mut frame = vec![0x00, 0x00, 0x08, 0x00];
+    frame.extend_from_slice(&ip);
+
+    let parsed = parse_tun_frame(&frame).expect("pi-prefixed tun frame should parse");
+
+    assert_eq!(parsed.format, FrameFormat::LinuxTunPi);
+    assert_eq!(parsed.ip_offset, 4);
+    assert_eq!(parsed.packet.network(), Some("tcp"));
+    assert_eq!(parsed.ip_packet(&frame)[0] >> 4, 4);
+}
+
+#[test]
+fn parses_ethernet_wrapped_ipv6_frame() {
+    let ip = build_v6_udp(12345, 53, b"dns");
+    let mut frame = vec![
+        0, 1, 2, 3, 4, 5, // dst
+        6, 7, 8, 9, 10, 11, // src
+        0x86, 0xdd, // IPv6 ethertype
+    ];
+    frame.extend_from_slice(&ip);
+
+    let parsed = parse_tun_frame(&frame).expect("ethernet-wrapped ipv6 frame should parse");
+
+    assert_eq!(parsed.format, FrameFormat::Ethernet);
+    assert_eq!(parsed.ip_offset, 14);
+    assert_eq!(parsed.packet.network(), Some("udp"));
+    assert_eq!(parsed.ip_packet(&frame)[0] >> 4, 6);
+}
+
+#[test]
+fn parses_virtio_net_header_prefixed_ipv6_frame() {
+    let ip = build_v6_udp(12345, 443, b"virtio-header");
+    let mut frame = vec![0; 10];
+    frame.extend_from_slice(&ip);
+
+    let parsed = parse_tun_frame(&frame).expect("virtio-net header prefixed frame should parse");
+
+    assert_eq!(parsed.format, FrameFormat::VirtioNetHeader);
+    assert_eq!(parsed.ip_offset, 10);
+    assert_eq!(parsed.packet.network(), Some("udp"));
+    assert_eq!(parsed.ip_packet(&frame)[0] >> 4, 6);
+}
+
+#[test]
+fn encodes_virtio_net_header_for_tun_write_back() {
+    let ip = build_v6_udp(12345, 443, b"virtio-write-back");
+
+    let frame = encode_tun_ip_frame(FrameFormat::VirtioNetHeader, &ip)
+        .expect("virtio-net frame should encode");
+
+    assert_eq!(frame.len(), ip.len() + 10);
+    assert_eq!(&frame[..10], &[0u8; 10]);
+    assert_eq!(&frame[10..], ip.as_slice());
+
+    let parsed = parse_tun_frame(frame.as_ref()).expect("encoded virtio frame should parse");
+    assert_eq!(parsed.format, FrameFormat::VirtioNetHeader);
+    assert_eq!(parsed.ip_offset, 10);
+    assert_eq!(parsed.ip_packet(frame.as_ref()), ip.as_slice());
+}
+
+#[test]
+fn parses_virtio_net_mrg_rxbuf_header_prefixed_ipv6_frame() {
+    let ip = build_v6_udp(12345, 443, b"virtio-mrg-rxbuf");
+    let mut frame = vec![0; 12];
+    frame.extend_from_slice(&ip);
+
+    let parsed =
+        parse_tun_frame(&frame).expect("virtio-net mrg-rxbuf header prefixed frame should parse");
+
+    assert_eq!(parsed.format, FrameFormat::VirtioNetHeaderMrgRxbuf);
+    assert_eq!(parsed.ip_offset, 12);
+    assert_eq!(parsed.packet.network(), Some("udp"));
+    assert_eq!(parsed.ip_packet(&frame)[0] >> 4, 6);
 }

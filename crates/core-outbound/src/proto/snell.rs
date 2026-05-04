@@ -47,9 +47,13 @@ use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
 use rand::RngCore;
 use sha1::Sha1;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio::sync::Mutex as AsyncMutex;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
+use crate::adapter::{
+    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+};
+use crate::proto::addr::encode_socks_addr;
 use crate::transport::{tcp::TcpTransport, Transport};
 
 const PAYLOAD_MAX: usize = 0x3fff;
@@ -105,9 +109,13 @@ pub struct SnellOutbound {
 pub enum SnellObfs {
     None,
     /// HTTP 单字节随机 obfs；与 mihomo `obfs=http` 兼容
-    Http { host: String },
+    Http {
+        host: String,
+    },
     /// TLS 1.2 ServerHello 模拟；与 mihomo `obfs=tls` 兼容
-    Tls { host: String },
+    Tls {
+        host: String,
+    },
 }
 
 impl SnellOutbound {
@@ -144,14 +152,25 @@ impl SnellOutbound {
 
 #[async_trait]
 impl OutboundAdapter for SnellOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "snell" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "snell"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: self.udp,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut stream = TcpTransport::default().connect(&self.host, self.port).await?;
+        let mut stream = TcpTransport::default()
+            .connect(&self.host, self.port)
+            .await?;
 
         // 1) salt
         let salt_len = self.cipher.key_len();
@@ -187,6 +206,15 @@ impl OutboundAdapter for SnellOutbound {
         let mut send = SnellCryptor::new(self.cipher, &send_key);
         let pkt = send.encrypt_chunk(&cmd_payload)?;
         stream.write_all(&pkt).await?;
+        tracing::info!(
+            target: "dial::snell",
+            id = ctx.dial_id,
+            proxy = %self.name,
+            server = %format!("{}:{}", self.host, self.port),
+            target = %format!("{}:{}", ctx.host, ctx.port),
+            network = ctx.network,
+            "request command sent",
+        );
 
         Ok(Box::pin(SnellStream {
             inner: stream,
@@ -198,6 +226,68 @@ impl OutboundAdapter for SnellOutbound {
             plain_buf: BytesMut::with_capacity(16 * 1024),
             response_state: ResponseState::WaitStatus,
         }))
+    }
+
+    async fn dial_udp(&self, mut ctx: DialContext) -> std::io::Result<BoxedUdp> {
+        if !self.udp {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("outbound `{}`/snell udp disabled by config", self.name),
+            ));
+        }
+        ctx.network = "udp";
+        let stream = self.dial_tcp(ctx.clone()).await?;
+        let (read, write) = tokio::io::split(stream);
+        tracing::info!(
+            target: "dial::snell",
+            id = ctx.dial_id,
+            proxy = %self.name,
+            target = %format!("{}:{}", ctx.host, ctx.port),
+            "udp stream ok",
+        );
+        Ok(Box::new(SnellUdp {
+            read: AsyncMutex::new(read),
+            write: AsyncMutex::new(write),
+        }))
+    }
+}
+
+struct SnellUdp {
+    read: AsyncMutex<ReadHalf<BoxedStream>>,
+    write: AsyncMutex<WriteHalf<BoxedStream>>,
+}
+
+#[async_trait]
+impl UdpSocketLike for SnellUdp {
+    async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize> {
+        let addr = encode_socks_addr(target, port);
+        let packet = encode_udp_packet(&addr, buf);
+        let mut write = self.write.lock().await;
+        write.write_all(&packet).await?;
+        Ok(buf.len())
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut read = self.read.lock().await;
+        let mut len = [0u8; 2];
+        read.read_exact(&mut len).await?;
+        let body_len = u16::from_be_bytes(len) as usize;
+        let mut packet = Vec::with_capacity(2 + body_len);
+        packet.extend_from_slice(&len);
+        packet.resize(2 + body_len, 0);
+        if body_len > 0 {
+            read.read_exact(&mut packet[2..]).await?;
+        }
+        let (_, _, payload) = decode_udp_packet(&packet)?;
+        let copy_len = payload.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+        Ok(copy_len)
+    }
+
+    async fn close(&self) -> std::io::Result<()> {
+        let mut write = self.write.lock().await;
+        let _ = write.shutdown().await;
+        Ok(())
     }
 }
 
@@ -214,12 +304,17 @@ struct SnellCryptor {
 impl SnellCryptor {
     fn new(cipher: SnellCipher, key: &[u8]) -> Self {
         let aead = match cipher {
-            SnellCipher::Aes128Gcm => SnellAead::Aes128(Aes128Gcm::new_from_slice(key).expect("len")),
+            SnellCipher::Aes128Gcm => {
+                SnellAead::Aes128(Aes128Gcm::new_from_slice(key).expect("len"))
+            }
             SnellCipher::Chacha20Poly1305 => {
                 SnellAead::Chacha(ChaCha20Poly1305::new_from_slice(key).expect("len"))
             }
         };
-        Self { aead, nonce: [0u8; 12] }
+        Self {
+            aead,
+            nonce: [0u8; 12],
+        }
     }
 
     fn next_nonce(&mut self) -> [u8; 12] {
@@ -227,7 +322,9 @@ impl SnellCryptor {
         for b in self.nonce.iter_mut() {
             let (v, c) = b.overflowing_add(1);
             *b = v;
-            if !c { break; }
+            if !c {
+                break;
+            }
         }
         n
     }
@@ -268,7 +365,10 @@ impl SnellCryptor {
 
 enum RecvState {
     WaitSalt,
-    Ready { recv: SnellCryptor, expecting_len: Option<usize> },
+    Ready {
+        recv: SnellCryptor,
+        expecting_len: Option<usize>,
+    },
 }
 
 #[derive(Debug)]
@@ -327,7 +427,10 @@ impl AsyncRead for SnellStream {
                         };
                         Ok(true)
                     }
-                    RecvState::Ready { recv, expecting_len } => {
+                    RecvState::Ready {
+                        recv,
+                        expecting_len,
+                    } => {
                         let tag = 16;
                         if expecting_len.is_none() {
                             if this.cipher_buf.len() < 2 + tag {
@@ -414,10 +517,15 @@ fn handle_payload(
                             format!("snell error errno={errno}: {msg}"),
                         ));
                     }
-                    *state = ResponseState::Error { remaining: 3 + msg_len - dec.len(), errno };
+                    *state = ResponseState::Error {
+                        remaining: 3 + msg_len - dec.len(),
+                        errno,
+                    };
                 }
                 other => {
-                    return Err(io_err_owned(format!("snell unknown status byte 0x{other:02x}")));
+                    return Err(io_err_owned(format!(
+                        "snell unknown status byte 0x{other:02x}"
+                    )));
                 }
             }
         }
@@ -458,7 +566,9 @@ impl AsyncWrite for SnellStream {
         let mut written = 0;
         while written < pkt.len() {
             match this.inner.as_mut().poll_write(cx, &pkt[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -550,8 +660,14 @@ mod tests {
 
     #[test]
     fn cipher_parse() {
-        assert_eq!(SnellCipher::parse("aes-128-gcm"), Some(SnellCipher::Aes128Gcm));
-        assert_eq!(SnellCipher::parse("chacha20-poly1305"), Some(SnellCipher::Chacha20Poly1305));
+        assert_eq!(
+            SnellCipher::parse("aes-128-gcm"),
+            Some(SnellCipher::Aes128Gcm)
+        );
+        assert_eq!(
+            SnellCipher::parse("chacha20-poly1305"),
+            Some(SnellCipher::Chacha20Poly1305)
+        );
         assert_eq!(SnellCipher::parse("rc4"), None);
     }
 
@@ -604,5 +720,11 @@ mod tests {
             SnellObfs::Http { ref host } => assert_eq!(host, "example.com"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn udp_capability_is_declared_when_enabled() {
+        let ob = SnellOutbound::new("s", "1.2.3.4", 8388, SnellCipher::Aes128Gcm, "p");
+        assert!(ob.capabilities().udp);
     }
 }

@@ -21,7 +21,7 @@
 //! * Salamander obfs（自定义 AsyncUdpSocket 包装）
 //! * 自动 keep-alive（quinn 内置）
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -34,7 +34,10 @@ use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
 use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
+use crate::adapter::{
+    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    OutboundAdapter,
+};
 
 #[derive(Debug, Clone)]
 pub struct Hysteria2Outbound {
@@ -119,9 +122,10 @@ impl Hysteria2Outbound {
             "0.0.0.0:0".parse().unwrap()
         };
 
-        let endpoint = if let Some(obfs_pwd) = &self.obfs_password {
+        let (endpoint, loopback_guard) = if let Some(obfs_pwd) = &self.obfs_password {
             // 用 Salamander obfs 包装 UDP socket
             let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+            let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
             std_socket.set_nonblocking(true)?;
             let obfs_runtime = quinn::TokioRuntime;
             let obfs_socket = SalamanderSocket::new(std_socket, obfs_pwd.as_bytes())?;
@@ -133,12 +137,20 @@ impl Hysteria2Outbound {
             )
             .map_err(|e| io_err(format!("hysteria2 endpoint with obfs: {e}")))?;
             endpoint.set_default_client_config(client_config);
-            endpoint
+            (endpoint, loopback_guard)
         } else {
-            let mut endpoint = Endpoint::client(bind_addr)
-                .map_err(|e| io_err(format!("hysteria2 endpoint: {e}")))?;
+            let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+            let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+            std_socket.set_nonblocking(true)?;
+            let mut endpoint = Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                std_socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| io_err(format!("hysteria2 endpoint: {e}")))?;
             endpoint.set_default_client_config(client_config);
-            endpoint
+            (endpoint, loopback_guard)
         };
 
         // 4) 建立 QUIC 连接
@@ -151,10 +163,9 @@ impl Hysteria2Outbound {
 
         // 5) 走 H3 鉴权
         let h3_conn_quinn = h3_quinn::Connection::new(connection.clone());
-        let (mut h3_driver, mut h3_send) =
-            h3::client::new(h3_conn_quinn)
-                .await
-                .map_err(|e| io_err(format!("h3 init: {e}")))?;
+        let (mut h3_driver, mut h3_send) = h3::client::new(h3_conn_quinn)
+            .await
+            .map_err(|e| io_err(format!("h3 init: {e}")))?;
 
         // driver 必须 spawn 否则不会驱动 QUIC
         tokio::spawn(async move {
@@ -204,16 +215,26 @@ impl Hysteria2Outbound {
         Ok(Hysteria2Session {
             connection,
             endpoint,
+            _loopback_guard: loopback_guard,
         })
     }
 }
 
 #[async_trait]
 impl OutboundAdapter for Hysteria2Outbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "hysteria2" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "hysteria2"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -247,13 +268,12 @@ impl OutboundAdapter for Hysteria2Outbound {
         }
         if status != 0 {
             let msg_str = String::from_utf8_lossy(&msg).into_owned();
-            return Err(io_err(format!("hysteria2 server status={status}: {msg_str}")));
+            return Err(io_err(format!(
+                "hysteria2 server status={status}: {msg_str}"
+            )));
         }
 
-        Ok(Box::pin(QuinnBiStream {
-            send,
-            recv,
-        }))
+        Ok(Box::pin(QuinnBiStream { send, recv }))
     }
 }
 
@@ -263,6 +283,7 @@ struct Hysteria2Session {
     /// endpoint 持有住，否则 socket 关闭
     #[allow(dead_code)]
     endpoint: Endpoint,
+    _loopback_guard: crate::loopback::LoopbackUdpGuard,
 }
 
 impl Hysteria2Session {
@@ -309,16 +330,10 @@ impl tokio::io::AsyncWrite for QuinnBiStream {
             Poll::Pending => Poll::Pending,
         }
     }
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.send).poll_flush(cx)
     }
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.send).poll_shutdown(cx)
     }
 }
@@ -499,17 +514,8 @@ impl quinn::UdpPoller for SalamanderPoller {
 /* ---------------- 工具 ---------------- */
 
 async fn resolve_first(host: &str, port: u16) -> std::io::Result<SocketAddr> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    if let Ok(ip) = host.parse::<Ipv6Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| io_err(format!("dns lookup: {e}")))?
-        .collect();
-    addrs
+    resolve_host(host, port)
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| io_err("no addr resolved"))

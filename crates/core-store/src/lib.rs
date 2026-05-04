@@ -5,7 +5,7 @@
 //! * **ACID + MVCC**，崩溃安全；
 //! * **写性能**：多次小写入合并到一次提交（内置 write batch）；
 //! * **读性能**：读取走 mmap，零拷贝 borrowed access；
-//! * **单文件**：`data/state/rpkernel.redb`，便于备份/迁移。
+//! * **单文件**：`data/state/wuthercore.redb`，便于备份/迁移。
 //!
 //! 支持的 schema（见 [`schema`]）：
 //!
@@ -30,5 +30,7 @@ pub mod schema;
 pub mod store;
 
 pub use async_writer::{AsyncWriter, WriteOp};
-pub use blobs::{DnsCacheBlob, DomainBestBlob, FeedMetaBlob, HistoryEntry, NegativeBlob, NodeStatsBlob};
+pub use blobs::{
+    DnsCacheBlob, DomainBestBlob, FeedMetaBlob, HistoryEntry, NegativeBlob, NodeStatsBlob,
+};
 pub use store::{Store, StoreError};

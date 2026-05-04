@@ -15,11 +15,11 @@
 //! 还原信息保存在 [`SystemProxyGuard]，drop 时自动尝试还原。
 
 use core_config::model::TunHttpProxyOptions;
+#[cfg(target_os = "linux")]
+use tracing::debug;
 use tracing::info;
 #[cfg(target_os = "windows")]
 use tracing::warn;
-#[cfg(target_os = "linux")]
-use tracing::debug;
 
 #[derive(Debug)]
 pub struct SystemProxyGuard {
@@ -42,10 +42,21 @@ struct Snapshot {
 impl SystemProxyGuard {
     pub fn install(opts: &TunHttpProxyOptions) -> Self {
         if !opts.enabled {
-            return Self { applied: false, snapshot: Snapshot::default() };
+            return Self {
+                applied: false,
+                snapshot: Snapshot::default(),
+            };
         }
-        let server = if opts.server.is_empty() { "127.0.0.1" } else { &opts.server };
-        let port = if opts.server_port == 0 { 8080 } else { opts.server_port };
+        let server = if opts.server.is_empty() {
+            "127.0.0.1"
+        } else {
+            &opts.server
+        };
+        let port = if opts.server_port == 0 {
+            8080
+        } else {
+            opts.server_port
+        };
         let snapshot = apply_platform(server, port, &opts.bypass_domain);
         info!(
             target: "capture::sysproxy",
@@ -53,7 +64,10 @@ impl SystemProxyGuard {
             bypass = ?opts.bypass_domain,
             "system http proxy installed"
         );
-        Self { applied: true, snapshot }
+        Self {
+            applied: true,
+            snapshot,
+        }
     }
 
     pub fn revert(self) {
@@ -81,7 +95,14 @@ fn apply_platform(server: &str, port: u16, bypass: &[String]) -> Snapshot {
         bypass.join(";")
     };
     let st = std::process::Command::new("netsh")
-        .args(["winhttp", "set", "proxy", &proxy, "bypass-list=", &bypass_list])
+        .args([
+            "winhttp",
+            "set",
+            "proxy",
+            &proxy,
+            "bypass-list=",
+            &bypass_list,
+        ])
         .status();
     if let Ok(s) = st {
         if !s.success() {
@@ -163,7 +184,9 @@ fn apply_platform(server: &str, port: u16, _bypass: &[String]) -> Snapshot {
             .args(["-setsecurewebproxy", svc, server, &port_s])
             .status();
     }
-    Snapshot { macos_services: services }
+    Snapshot {
+        macos_services: services,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -195,22 +218,41 @@ fn apply_platform(server: &str, port: u16, bypass: &[String]) -> Snapshot {
         .args(["set", "org.gnome.system.proxy.http", "host", server])
         .status();
     let _ = std::process::Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.http", "port", &port.to_string()])
+        .args([
+            "set",
+            "org.gnome.system.proxy.http",
+            "port",
+            &port.to_string(),
+        ])
         .status();
     let _ = std::process::Command::new("gsettings")
         .args(["set", "org.gnome.system.proxy.https", "host", server])
         .status();
     let _ = std::process::Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.https", "port", &port.to_string()])
+        .args([
+            "set",
+            "org.gnome.system.proxy.https",
+            "port",
+            &port.to_string(),
+        ])
         .status();
     if !bypass.is_empty() {
-        let bypass_str = format!("[{}]", bypass.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "));
+        let bypass_str = format!(
+            "[{}]",
+            bypass
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let _ = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.system.proxy", "ignore-hosts", &bypass_str])
             .status();
     }
     debug!(target: "capture::sysproxy", "GNOME gsettings configured");
-    Snapshot { linux_gsettings_mode: old }
+    Snapshot {
+        linux_gsettings_mode: old,
+    }
 }
 
 #[cfg(target_os = "linux")]

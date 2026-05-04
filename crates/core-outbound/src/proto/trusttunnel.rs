@@ -156,7 +156,12 @@ impl TrustTunnelOutbound {
                 }
                 let cnt = c.stream_count.load(Ordering::Relaxed);
                 if chosen.is_none()
-                    || cnt < chosen.as_ref().unwrap().stream_count.load(Ordering::Relaxed)
+                    || cnt
+                        < chosen
+                            .as_ref()
+                            .unwrap()
+                            .stream_count
+                            .load(Ordering::Relaxed)
                 {
                     chosen = Some(c.clone());
                 }
@@ -222,10 +227,19 @@ impl TrustTunnelOutbound {
 
 #[async_trait]
 impl OutboundAdapter for TrustTunnelOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "trusttunnel" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "trusttunnel"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -285,7 +299,9 @@ impl TtClient {
             .map_err(|e| io_err(format!("request build: {e}")))?;
         req.headers_mut().insert(
             "host",
-            target_host.parse().map_err(|e| io_err(format!("host: {e}")))?,
+            target_host
+                .parse()
+                .map_err(|e| io_err(format!("host: {e}")))?,
         );
         req.headers_mut().insert(
             "user-agent",
@@ -409,10 +425,7 @@ impl AsyncWrite for TtStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.shutdown_sent {
             self.shutdown_sent = true;
             // 关闭 send channel：让 RequestBody 的 rx 看到 None
@@ -517,10 +530,7 @@ where
 /* ---------------- UDP 包编解码 ---------------- */
 
 /// 把 UDP 包编码成 trusttunnel UDP 帧（客户端 -> 服务器方向）。
-pub fn encode_udp_packet_to_server(
-    src_addr: &std::net::SocketAddr,
-    payload: &[u8],
-) -> Vec<u8> {
+pub fn encode_udp_packet_to_server(src_addr: &std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
     let app_name = format!("{} {}", platform_str(), APP_NAME);
     let app_name_bytes = app_name.as_bytes();
     let app_name_len = app_name_bytes.len().min(255) as u8;
@@ -532,7 +542,7 @@ pub fn encode_udp_packet_to_server(
     // src addr (16B) - 客户端不知道实际 src，全 0
     buf.extend_from_slice(&[0u8; 16]);
     buf.extend_from_slice(&[0u8; 2]); // src port
-    // dst addr (16B 填充)
+                                      // dst addr (16B 填充)
     let dst = pad_ip16(src_addr.ip());
     buf.extend_from_slice(&dst);
     buf.extend_from_slice(&src_addr.port().to_be_bytes());
@@ -674,7 +684,7 @@ mod tests {
         let ob = TrustTunnelOutbound::new("tt", "x.com", 443, "u", "p");
         assert!(ob.capabilities().multiplex);
         assert!(ob.capabilities().tcp);
-        assert!(ob.capabilities().udp);
+        assert!(!ob.capabilities().udp);
     }
 
     #[test]

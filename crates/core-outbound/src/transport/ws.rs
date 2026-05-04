@@ -42,7 +42,10 @@ impl Transport for WsTransport {
         let url = format!("{scheme}://{host}:{port}{path}");
         let mut req = url.into_client_request().map_err(io_other)?;
         let headers = req.headers_mut();
-        headers.insert("Host", HeaderValue::from_str(host_header).map_err(io_other)?);
+        headers.insert(
+            "Host",
+            HeaderValue::from_str(host_header).map_err(io_other)?,
+        );
         for (k, v) in &self.options.headers {
             if let (Ok(name), Ok(val)) = (
                 tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(k.as_bytes()),
@@ -155,17 +158,11 @@ where
             Err(e) => Poll::Ready(Err(io_other(e))),
         }
     }
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
         this.inner.as_mut().poll_flush(cx).map_err(io_other)
     }
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
         this.inner.as_mut().poll_close(cx).map_err(io_other)
     }

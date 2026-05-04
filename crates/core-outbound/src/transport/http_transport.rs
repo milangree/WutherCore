@@ -21,9 +21,9 @@ use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
 #[derive(Debug, Clone, Default)]
 pub struct HttpOptions {
     pub enabled: bool,
-    pub method: String,         // 默认 GET
-    pub path: Vec<String>,      // 候选 path 列表，随机选一个
-    pub host: Vec<String>,      // 候选 Host 头列表
+    pub method: String,                 // 默认 GET
+    pub path: Vec<String>,              // 候选 path 列表，随机选一个
+    pub host: Vec<String>,              // 候选 Host 头列表
     pub headers: Vec<(String, String)>, // 额外头部
 }
 
@@ -47,12 +47,20 @@ impl Transport for HttpTransport {
         let (path, host_header) = {
             let mut rng = rand::thread_rng();
             let p = if !self.opts.path.is_empty() {
-                self.opts.path.choose(&mut rng).cloned().unwrap_or_else(|| "/".into())
+                self.opts
+                    .path
+                    .choose(&mut rng)
+                    .cloned()
+                    .unwrap_or_else(|| "/".into())
             } else {
                 "/".into()
             };
             let h = if !self.opts.host.is_empty() {
-                self.opts.host.choose(&mut rng).cloned().unwrap_or_else(|| host.to_string())
+                self.opts
+                    .host
+                    .choose(&mut rng)
+                    .cloned()
+                    .unwrap_or_else(|| host.to_string())
             } else {
                 host.to_string()
             };
@@ -78,7 +86,12 @@ impl Transport for HttpTransport {
             buf.extend_from_slice(v.as_bytes());
             buf.extend_from_slice(b"\r\n");
         }
-        if !self.opts.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+        if !self
+            .opts
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        {
             buf.extend_from_slice(
                 b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n",
             );

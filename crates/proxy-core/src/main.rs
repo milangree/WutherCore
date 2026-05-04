@@ -1,4 +1,4 @@
-//! proxy-core —— RPKernel 顶层 CLI。
+//! proxy-core —— WutherCore 顶层 CLI。
 //!
 //! 子命令：
 //! * `run -c <yaml>`：启动内核（Mixed 入站 + API + capture 诊断）。
@@ -15,16 +15,20 @@ use clap::{Parser, Subcommand};
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
-use core_store::Store;
-use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
+use core_inbound::ensure_best_effort_privilege;
 use core_inbound::run_mixed;
 use core_inbound::MixedListener;
-use core_inbound::ensure_best_effort_privilege;
+use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
+use core_store::Store;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "proxy-core", version, about = "RPKernel —— Friendly YAML 代理内核")]
+#[command(
+    name = "proxy-core",
+    version,
+    about = "WutherCore —— Friendly YAML 代理内核"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -78,7 +82,7 @@ enum RulesetCmd {
         #[arg(long, default_value = "data/rulesets")]
         cache_dir: PathBuf,
     },
-    /// 双向转换：yaml/txt/list/json/rrs 互转（含 RPKernel 自研 RRS）。
+    /// 双向转换：yaml/txt/list/json/rrs 互转（含 WutherCore 自研 RRS）。
     ///
     /// 例：
     ///   proxy-core ruleset convert geosite-cn.yaml geosite-cn.rrs
@@ -102,12 +106,12 @@ enum RulesetCmd {
 enum StoreCmd {
     /// 显示 store 路径、大小与各表行数。
     Info {
-        #[arg(long, default_value = "data/state/rpkernel.redb")]
+        #[arg(long, default_value = "data/state/wuthercore.redb")]
         path: PathBuf,
     },
     /// 清空所有学习数据（保留 schema 版本）。
     Reset {
-        #[arg(long, default_value = "data/state/rpkernel.redb")]
+        #[arg(long, default_value = "data/state/wuthercore.redb")]
         path: PathBuf,
     },
 }
@@ -134,10 +138,10 @@ fn main() -> anyhow::Result<()> {
     // 使用 ring 作为唯一安装的提供者；已安装时返回 Err，忽略即可。
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // 早期初始化（无 LogBus）—— 让 CLI 子命令也能打日志；
-    // run 子命令在 Runtime 构造后会再 init_with_bus 接到 /logs WS。
-    core_observe::init_tracing();
     let cli = Cli::parse();
+    if !matches!(&cli.cmd, Cmd::Run { .. }) {
+        core_observe::init_tracing();
+    }
     match cli.cmd {
         Cmd::Run { config } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -147,14 +151,22 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Check { config } => cmd_check(config),
         Cmd::Explain { config } => cmd_explain(config),
-        Cmd::Migrate { kind, input, output } => cmd_migrate(kind, input, output),
+        Cmd::Migrate {
+            kind,
+            input,
+            output,
+        } => cmd_migrate(kind, input, output),
         Cmd::Feeds { action } => {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
             rt.block_on(cmd_feeds(action))
         }
         Cmd::Store { action } => cmd_store(action),
         Cmd::Ruleset { action } => {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
             rt.block_on(cmd_ruleset(action))
         }
     }
@@ -214,10 +226,16 @@ async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        RulesetCmd::Convert { input, output, input_format, output_format } => {
+        RulesetCmd::Convert {
+            input,
+            output,
+            input_format,
+            output_format,
+        } => {
             let body = std::fs::read(&input).context("read input")?;
             let in_path = input.to_string_lossy().to_string();
-            let in_fmt = core_ruleset::detect_format(input_format.as_deref(), Some(&in_path), &body);
+            let in_fmt =
+                core_ruleset::detect_format(input_format.as_deref(), Some(&in_path), &body);
             let entries = core_ruleset::parse_ruleset(in_fmt, &body)
                 .map_err(|e| anyhow::anyhow!("解析失败 ({:?}): {e}", in_fmt))?;
             let out_fmt = output_format
@@ -226,15 +244,15 @@ async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
                 .unwrap_or("rrs")
                 .to_ascii_lowercase();
             let out_bytes: Vec<u8> = match out_fmt.as_str() {
-                "rrs" | "rpkernel" => core_ruleset::rrs::encode(&entries),
+                "rrs" | "wuthercore" => core_ruleset::rrs::encode(&entries),
                 "yaml" | "yml" => core_ruleset::rrs::entries_to_yaml(&entries).into_bytes(),
                 "txt" | "list" | "text" => core_ruleset::rrs::entries_to_txt(&entries).into_bytes(),
                 "json" | "singbox" | "sing-box" => {
                     core_ruleset::rrs::entries_to_singbox_json(&entries).into_bytes()
                 }
-                other => anyhow::bail!(
-                    "不支持的输出格式 \"{other}\"；支持：yaml / txt / json / rrs"
-                ),
+                other => {
+                    anyhow::bail!("不支持的输出格式 \"{other}\"；支持：yaml / txt / json / rrs")
+                }
             };
             std::fs::write(&output, &out_bytes).context("write output")?;
             println!(
@@ -357,10 +375,20 @@ async fn cmd_feeds(action: FeedsCmd) -> anyhow::Result<()> {
                             "{name:>20}  {} 个节点  {} bytes  {}",
                             update.nodes.len(),
                             update.raw_bytes,
-                            if update.from_cache { "(disk-cache)" } else { "(online)" }
+                            if update.from_cache {
+                                "(disk-cache)"
+                            } else {
+                                "(online)"
+                            }
                         );
                         for n in update.nodes.iter().take(5) {
-                            println!("    - {} [{}://{}:{}]", n.name, n.protocol.as_str(), n.host, n.port);
+                            println!(
+                                "    - {} [{}://{}:{}]",
+                                n.name,
+                                n.protocol.as_str(),
+                                n.host,
+                                n.port
+                            );
                         }
                         if update.nodes.len() > 5 {
                             println!("    ... 还有 {} 个", update.nodes.len() - 5);
@@ -374,10 +402,70 @@ async fn cmd_feeds(action: FeedsCmd) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_config::model::{Log, LogFile, LogFormat, LogLevel};
+
+    #[test]
+    fn user_log_config_maps_to_observe_tracing_config() {
+        let log = Log {
+            on: true,
+            level: LogLevel::Debug,
+            filter: Some("info,capture::traffic=trace".into()),
+            stdout: false,
+            file: LogFile {
+                on: true,
+                path: "data/logs/custom.log".into(),
+            },
+            format: LogFormat::Json,
+        };
+
+        let tracing = tracing_config_from_user_log(&log);
+
+        assert!(tracing.enabled);
+        assert_eq!(tracing.level, "debug");
+        assert_eq!(
+            tracing.filter.as_deref(),
+            Some("info,capture::traffic=trace")
+        );
+        assert!(!tracing.stdout);
+        assert_eq!(tracing.format, core_observe::TracingFormat::Json);
+        let file = tracing.file.expect("file sink enabled");
+        assert!(file.enabled);
+        assert_eq!(file.path, PathBuf::from("data/logs/custom.log"));
+    }
+
+    #[test]
+    fn log_off_disables_observe_tracing_even_if_sinks_are_set() {
+        let log = Log {
+            on: false,
+            level: LogLevel::Trace,
+            filter: None,
+            stdout: true,
+            file: LogFile {
+                on: true,
+                path: "data/logs/custom.log".into(),
+            },
+            format: LogFormat::Text,
+        };
+
+        let tracing = tracing_config_from_user_log(&log);
+
+        assert!(!tracing.enabled);
+        assert!(tracing.stdout);
+        assert!(tracing.file.is_some());
+    }
+}
+
 fn cmd_check(config: PathBuf) -> anyhow::Result<()> {
     let plan = load_from_path(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("OK: {} 节点 / {} 分组 / {} 条规则",
-        plan.nodes.len(), plan.groups.len(), plan.route.steps.len());
+    println!(
+        "OK: {} 节点 / {} 分组 / {} 条规则",
+        plan.nodes.len(),
+        plan.groups.len(),
+        plan.route.steps.len()
+    );
     Ok(())
 }
 
@@ -390,8 +478,9 @@ fn cmd_explain(config: PathBuf) -> anyhow::Result<()> {
 fn cmd_migrate(kind: String, input: PathBuf, output: PathBuf) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(&input).context("read input")?;
     let friendly = match kind.as_str() {
-        "mihomo" | "clash" => core_config::migrate::migrate_mihomo(&text)
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        "mihomo" | "clash" => {
+            core_config::migrate::migrate_mihomo(&text).map_err(|e| anyhow::anyhow!("{e}"))?
+        }
         other => anyhow::bail!("尚不支持的迁移源: {other}（目前支持 mihomo）"),
     };
     std::fs::write(&output, friendly).context("write output")?;
@@ -399,8 +488,32 @@ fn cmd_migrate(kind: String, input: PathBuf, output: PathBuf) -> anyhow::Result<
     Ok(())
 }
 
+fn tracing_config_from_user_log(log: &core_config::model::Log) -> core_observe::TracingConfig {
+    let file = log.file.on.then(|| core_observe::TracingFileConfig {
+        enabled: true,
+        path: PathBuf::from(&log.file.path),
+    });
+    let format = match log.format {
+        core_config::model::LogFormat::Json => core_observe::TracingFormat::Json,
+        core_config::model::LogFormat::Text => core_observe::TracingFormat::Text,
+    };
+    core_observe::TracingConfig {
+        enabled: log.on && !matches!(log.level, core_config::model::LogLevel::Off),
+        level: log.level.as_filter().into(),
+        filter: log.filter.clone(),
+        stdout: log.stdout,
+        file,
+        format,
+    }
+}
+
 async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     let plan = load_from_path(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(log) = &plan.log {
+        core_observe::init_tracing_with_config(tracing_config_from_user_log(log), None);
+    } else {
+        core_observe::init_tracing();
+    }
     info!(name = %plan.name, profile = ?plan.profile, "config loaded");
 
     // 启动钩子：检测特权 + Android 优先尝试 su 提权再降级。
@@ -419,8 +532,8 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
     info!(target: "mesh", "{}", core_mesh::diagnose(&plan.mesh));
 
-    // 打开持久化 store（默认 data/state/rpkernel.redb）。
-    let store = match Store::open("data/state/rpkernel.redb") {
+    // 打开持久化 store（默认 data/state/wuthercore.redb）。
+    let store = match Store::open("data/state/wuthercore.redb") {
         Ok(s) => {
             info!(target: "store", path = %s.path().display(), "store opened");
             Some(s)
@@ -442,10 +555,11 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         Some(ruleset_index.clone()),
     ));
 
-    // 用 LogBus 重新初始化 tracing layer —— 让 /v1/logs 与 Clash 兼容 /logs WS 流式输出。
-    // try_init 内部对重复初始化是 no-op，所以早期 fmt layer 仍生效，
-    // 我们这里再追加 BusLayer。
-    core_observe::init_tracing_with_bus(Some(runtime.logs.clone()));
+    // 把运行期 LogBus 挂到 tracing 桥上 —— 让 /v1/logs 与 Clash 兼容 /logs WS
+    // 流式输出。tracing 可能已被早期初始化占用，所以 observe 层使用可后挂载的
+    // bus sink，而不是依赖第二次 try_init。
+    core_observe::attach_log_bus(runtime.logs.clone());
+    info!(target: "observe", "runtime log bus attached");
 
     // RulesetManager —— 把配置 route.sets 翻成 core-ruleset 的 RulesetSpec
     // 并启动后台轮询拉取。这一步必须在 runtime / capture 之间，确保启动 INFO
@@ -454,8 +568,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         let specs = build_ruleset_specs(&plan.route.sets);
         let count = specs.len();
         let cache_dir = std::path::PathBuf::from("data/ruleset");
-        let mgr =
-            RulesetManager::new(specs, Some(cache_dir.clone()), ruleset_index.clone());
+        let mgr = RulesetManager::new(specs, Some(cache_dir.clone()), ruleset_index.clone());
         mgr.clone().start();
         if count == 0 {
             info!(target: "ruleset", "no route.sets configured; manager idle");
@@ -479,13 +592,30 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         std::time::Duration::from_secs(60),
     );
 
+    // 连接表周期摘要日志 —— `log.connection-summary-interval > 0s` 时启用。
+    // 帮助回答"连接表为什么这么大"：每 N 秒输出 by-process / by-dst / by-rule
+    // 聚合 + 长连接清单。0 = 关（默认）。
+    let conn_log_interval = runtime
+        .plan
+        .log
+        .as_ref()
+        .map(|l| l.connection_summary_interval)
+        .unwrap_or_default();
+    let _conntable_log_handle = runtime.spawn_conntable_logger(conn_log_interval);
+
     // 始终创建 FeedManager —— 即便 feeds 为空，dashboard 的 /providers/proxies
     // 仍能拿到一致的（空）provider 列表；start() 在空配置下是 noop，不 spawn 任何 task。
     let feed_mgr_handle = {
         let cache = FeedDiskCache::new("data/feeds").ok();
         let mgr = FeedManager::new(plan.feeds.clone(), cache);
-        mgr.set_sink(Arc::new(RuntimeFeedSink { runtime: runtime.clone() }));
+        mgr.set_sink(Arc::new(RuntimeFeedSink {
+            runtime: runtime.clone(),
+        }));
         let m = mgr.clone();
+        let bootstrapped = m.bootstrap_cache().await;
+        if bootstrapped > 0 {
+            info!(target: "feeds", providers = bootstrapped, "feed cache bootstrapped before capture start");
+        }
         m.start();
         if plan.feeds.is_empty() {
             info!(target: "feeds", "no feeds configured; manager idle");
@@ -497,7 +627,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
 
     // 启动 capture supervisor（如果配置开启）—— 复用上面建好的 ruleset_index。
     let mut capture_handle: Option<Arc<core_capture::CaptureSupervisor>> = None;
-    match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh) {
+    match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh, plan.resolver.ipv6) {
         Ok(Some(sup)) => {
             // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
             sup.set_ip_set_provider(Arc::new(RulesetIpSetProvider {
@@ -514,6 +644,40 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     let mut handles = Vec::new();
+
+    // Standalone DNS server —— mihomo `dns.listen` 等价。
+    // 与 mihomo `dns/server.go::ReCreateServer` 行为一致：空地址 / port=0 → disabled。
+    // 把空串过滤前置，是为了避免 spawn_dns_listener 走 disabled 分支后还要在这里
+    // 区分"用户没填"和"填了但 mihomo 视作禁用"两种情形——把 `None` 配置直接跳过。
+    let mut dns_listener_handle: Option<core_runtime::DnsListener> = None;
+    if let Some(listen_addr) = plan
+        .resolver
+        .listen
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match core_runtime::spawn_dns_listener(listen_addr, runtime.dns_service.clone()).await {
+            Ok(h) if h.is_disabled() => {
+                info!(
+                    target: "dns::listener",
+                    listen = %listen_addr,
+                    "DNS listener disabled (mihomo: port=0 or empty addr → no bind)"
+                );
+            }
+            Ok(h) => {
+                if let (Some(udp), Some(tcp)) = (h.addr(), h.tcp_addr()) {
+                    info!(addr = %udp, tcp = %tcp, "DNS server (UDP+TCP) ready");
+                }
+                dns_listener_handle = Some(h);
+            }
+            Err(e) => {
+                warn!(target: "dns::listener", listen = %listen_addr, error = %e, "DNS listener bind failed");
+            }
+        }
+    }
+    // 防止编译器优化掉 handle —— drop 时取消两个后台 task。
+    let _dns_listener_keepalive = dns_listener_handle;
 
     // Mixed 入站
     if let Some(mixed) = &plan.listen.mixed {
@@ -557,7 +721,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    info!("RPKernel started, press Ctrl-C to stop.");
+    info!("WutherCore started, press Ctrl-C to stop.");
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal, bye.");
     if let Some(sup) = capture_handle {

@@ -23,6 +23,11 @@ use core_observe::ConnectionGuard;
 use core_outbound::adapter::BoxedUdp;
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
+
+/// 新 UDP flow 在 outbound dial 完成前最多缓存的 payload 数。
+/// 与 mihomo NAT 首包入队语义对齐：TUN pump 只负责投递，不等待拨号。
+pub const UDP_PENDING_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct UdpFlowKey {
@@ -48,8 +53,41 @@ impl UdpSession {
     }
 }
 
+pub struct PendingUdpSession {
+    sender: mpsc::Sender<Vec<u8>>,
+    last_seen: Mutex<Instant>,
+}
+
+impl PendingUdpSession {
+    pub fn new(capacity: usize) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Arc::new(Self {
+                sender: tx,
+                last_seen: Mutex::new(Instant::now()),
+            }),
+            rx,
+        )
+    }
+
+    pub fn try_send(&self, payload: Vec<u8>) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+        self.sender.try_send(payload)?;
+        self.touch();
+        Ok(())
+    }
+
+    pub fn touch(&self) {
+        *self.last_seen.lock() = Instant::now();
+    }
+
+    fn last_seen(&self) -> Instant {
+        *self.last_seen.lock()
+    }
+}
+
 pub struct UdpSessionTable {
     inner: DashMap<UdpFlowKey, Arc<UdpSession>>,
+    pending: DashMap<UdpFlowKey, Arc<PendingUdpSession>>,
     idle: Duration,
 }
 
@@ -57,6 +95,7 @@ impl std::fmt::Debug for UdpSessionTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpSessionTable")
             .field("len", &self.inner.len())
+            .field("pending_len", &self.pending.len())
             .field("idle", &self.idle)
             .finish()
     }
@@ -64,7 +103,11 @@ impl std::fmt::Debug for UdpSessionTable {
 
 impl UdpSessionTable {
     pub fn new(idle: Duration) -> Self {
-        Self { inner: DashMap::new(), idle }
+        Self {
+            inner: DashMap::new(),
+            pending: DashMap::new(),
+            idle,
+        }
     }
 
     pub fn lookup(&self, key: &UdpFlowKey) -> Option<Arc<UdpSession>> {
@@ -76,15 +119,33 @@ impl UdpSessionTable {
     }
 
     pub fn remove(&self, key: &UdpFlowKey) {
-        self.inner.remove(key);
+        if let Some((_, session)) = self.inner.remove(key) {
+            session.guard.cancel.notify_waiters();
+        }
+    }
+
+    pub fn lookup_pending(&self, key: &UdpFlowKey) -> Option<Arc<PendingUdpSession>> {
+        self.pending.get(key).map(|e| e.value().clone())
+    }
+
+    pub fn insert_pending(&self, key: UdpFlowKey, session: Arc<PendingUdpSession>) {
+        self.pending.insert(key, session);
+    }
+
+    pub fn remove_pending(&self, key: &UdpFlowKey) {
+        self.pending.remove(key);
     }
 
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.is_empty() && self.pending.is_empty()
     }
 
     /// 周期 GC：移除超过 idle 没活动的 session。返回移除条数。
@@ -94,7 +155,7 @@ impl UdpSessionTable {
     /// * 实际调用方（reverse loop）下一次 recv_from 出错或被 cancel 唤醒时退出。
     pub fn purge(&self) -> usize {
         let cutoff = Instant::now() - self.idle;
-        let to_remove: Vec<UdpFlowKey> = self
+        let sessions_to_remove: Vec<UdpFlowKey> = self
             .inner
             .iter()
             .filter_map(|e| {
@@ -106,12 +167,26 @@ impl UdpSessionTable {
                 }
             })
             .collect();
-        let n = to_remove.len();
-        for k in to_remove {
+        let pending_to_remove: Vec<UdpFlowKey> = self
+            .pending
+            .iter()
+            .filter_map(|e| {
+                if e.value().last_seen() < cutoff {
+                    Some(*e.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = sessions_to_remove.len() + pending_to_remove.len();
+        for k in sessions_to_remove {
             // 触发 cancel 让 reverse loop 退出；从表移除。
             if let Some((_, s)) = self.inner.remove(&k) {
                 s.guard.cancel.notify_waiters();
             }
+        }
+        for k in pending_to_remove {
+            self.pending.remove(&k);
         }
         n
     }
@@ -135,6 +210,24 @@ mod tests {
         assert_eq!(t.len(), 0);
         assert!(t.lookup(&fake_key(1, 53)).is_none());
         assert_eq!(t.purge(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_queue_buffers_packets_until_dial_worker_establishes_session() {
+        let t = UdpSessionTable::new(Duration::from_secs(60));
+        let key = fake_key(50000, 443);
+        let (pending, mut rx) = super::PendingUdpSession::new(2);
+
+        t.insert_pending(key, pending.clone());
+        pending.try_send(vec![1, 2, 3]).unwrap();
+        pending.try_send(vec![4, 5, 6]).unwrap();
+
+        assert!(t.lookup_pending(&key).is_some());
+        assert_eq!(rx.recv().await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(rx.recv().await.unwrap(), vec![4, 5, 6]);
+
+        t.remove_pending(&key);
+        assert!(t.lookup_pending(&key).is_none());
     }
 
     // 注：完整的 lookup/insert 单测需要构造 UdpSession（依赖 BoxedUdp + ConnectionGuard

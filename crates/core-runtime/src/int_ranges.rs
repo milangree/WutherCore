@@ -57,7 +57,9 @@ impl IntRanges {
         if self.parts.is_empty() {
             return true;
         }
-        self.parts.iter().any(|r| status >= r.start && status <= r.end)
+        self.parts
+            .iter()
+            .any(|r| status >= r.start && status <= r.end)
     }
 
     pub fn parts(&self) -> &[Range] {
@@ -67,14 +69,23 @@ impl IntRanges {
 
 fn parse_one(c: &str) -> Result<Range, String> {
     if let Some((a, b)) = c.split_once('-') {
-        let start: u16 = a.trim().parse().map_err(|e| format!("bad range '{c}': {e}"))?;
-        let end: u16 = b.trim().parse().map_err(|e| format!("bad range '{c}': {e}"))?;
+        let start: u16 = a
+            .trim()
+            .parse()
+            .map_err(|e| format!("bad range '{c}': {e}"))?;
+        let end: u16 = b
+            .trim()
+            .parse()
+            .map_err(|e| format!("bad range '{c}': {e}"))?;
         if end < start {
             return Err(format!("bad range '{c}': end < start"));
         }
         Ok(Range { start, end })
     } else {
-        let v: u16 = c.trim().parse().map_err(|e| format!("bad value '{c}': {e}"))?;
+        let v: u16 = c
+            .trim()
+            .parse()
+            .map_err(|e| format!("bad value '{c}': {e}"))?;
         Ok(Range { start: v, end: v })
     }
 }

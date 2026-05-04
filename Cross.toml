@@ -1,4 +1,4 @@
-# cross 配置 —— RPKernel
+# cross 配置 —— WutherCore
 #
 # 1. 默认 Linux 目标使用稳定的 cross-rs 镜像。
 # 2. Android：cross 0.2.5 自带的 NDK r21 镜像缺 libunwind.a 链接路径，

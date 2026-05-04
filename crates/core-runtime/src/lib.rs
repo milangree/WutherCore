@@ -5,15 +5,19 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dns_listener;
 pub mod engine;
 pub mod group_selector;
 pub mod health;
 pub mod int_ranges;
+pub mod listener_handler;
 
-pub use engine::{Runtime, RuntimeError};
+pub use dns_listener::{spawn_dns_listener, DnsListener, DnsListenerError};
+pub use engine::{DialResult, RoutePick, Runtime, RuntimeError, UdpDialResult};
 pub use group_selector::{FlowMeta, GroupOptions, GroupSelector, LbStrategy};
 pub use health::{
     spawn_periodic, DelayError, HistoryEntry, NodeUrlStats, UrlTestConfig, UrlTestOpts, UrlTester,
     DEAD_DELAY, FAST_PICK_TTL,
 };
 pub use int_ranges::{IntRanges, Range};
+pub use listener_handler::{InboundMetadata, ListenerHandler, PreparedTcp, PreparedUdpPacket};

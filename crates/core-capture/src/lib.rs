@@ -20,27 +20,44 @@
 #![deny(unsafe_code)]
 
 pub mod android_caps;
+pub mod android_vpn_config;
 pub mod dial_meta;
 pub mod doctor;
 pub mod eim_nat;
 pub mod engine;
 pub mod fakeip_dns;
+pub mod frame_cache;
+pub mod gc;
 pub mod ipset;
 pub mod nat;
+pub mod net_monitor;
 pub mod packet;
 pub mod platform;
 pub mod route_table;
 pub mod stack;
+pub mod stack_system;
 pub mod supervisor;
 pub mod sys_proxy;
+pub mod netstack_dispatch;
+pub mod system_dispatch;
+pub mod tcp_nat;
+mod tproxy_rules;
 pub mod tun;
 pub mod tun_dispatch;
+pub mod uid_filter;
+pub(crate) mod tun_pump;
+pub mod tun_inbound;
 pub mod tun_io;
-mod tproxy_rules;
+pub mod tun_logging;
 pub mod udp_forwarder;
+pub mod udp_handle;
 pub mod udp_session;
 
 pub use android_caps::{AndroidCapability, AndroidTier};
+pub use android_vpn_config::{
+    build_vpn_service_config, build_vpn_service_config_json, AndroidIpPrefix,
+    AndroidVpnServiceConfig,
+};
 pub use dial_meta::{build_dial_target, DialTarget, DnsMode};
 
 pub use doctor::{diagnose, DoctorReport};
@@ -50,17 +67,21 @@ pub use engine::{
     EngineKind,
 };
 pub use ipset::{noop as noop_ipset_provider, IpSetProvider, NoopIpSetProvider};
+pub use nat::{FlowKey, HostPin, NatEntry, NatTable};
+pub use packet::{IpHeader, IpVersion, ParsedPacket, TcpFlags, TcpSummary, UdpSummary, L4};
+pub use route_table::{ManagedRoute, RouteBackend, RouteTable, SystemBackend};
 pub use stack::{
     AcceptedTcp, SharedStack, SmolStream, SpliceManager, StackNotify, UserSpaceStack,
     VirtualTunDevice, DEFAULT_LISTENER_POOL,
 };
+pub use stack_system::{ProcessOutcome, SystemStack, SystemStackHandle};
+pub use supervisor::CaptureSupervisor;
+pub use sys_proxy::SystemProxyGuard;
+pub use system_dispatch::{SystemDispatcher, SystemDispatcherHandles};
+pub use tcp_nat::{NatSession, TcpNat};
+pub use tun::{TunConfig, TunDevice};
 pub use tun_dispatch::{TunDispatcher, TunDispatcherHandles};
+pub use tun_inbound::{TunDropReason, TunInbound, TunOutboundMeta, TunPacket, TunSession};
+pub use tun_io::{open_tun_device, TunIo, TunIoError};
 pub use udp_forwarder::{run_return_loop, send_one as udp_send_one, UdpForwarderConfig};
 pub use udp_session::{UdpFlowKey, UdpSession, UdpSessionTable};
-pub use nat::{FlowKey, HostPin, NatEntry, NatTable};
-pub use sys_proxy::SystemProxyGuard;
-pub use packet::{IpHeader, IpVersion, L4, ParsedPacket, TcpFlags, TcpSummary, UdpSummary};
-pub use route_table::{ManagedRoute, RouteBackend, RouteTable, SystemBackend};
-pub use supervisor::CaptureSupervisor;
-pub use tun::{TunConfig, TunDevice};
-pub use tun_io::{open_tun_device, TunIo, TunIoError};

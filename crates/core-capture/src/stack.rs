@@ -26,24 +26,24 @@
 //! * SpliceManager 跟踪每个 SocketHandle 的 outbound 任务，graceful close。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::Mutex;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv6Address,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
-use tracing::{debug, warn};
-
-use crate::tun_io::TunIo;
+use tracing::{info, warn};
 
 /* ============================================================
-   VirtualTunDevice：smoltcp::phy::Device 实现
-   ============================================================ */
+VirtualTunDevice：smoltcp::phy::Device 实现
+============================================================ */
 
 pub struct VirtualTunDevice {
     rx_queue: VecDeque<Vec<u8>>,
@@ -53,7 +53,11 @@ pub struct VirtualTunDevice {
 
 impl VirtualTunDevice {
     pub fn new(mtu: usize) -> Self {
-        Self { rx_queue: VecDeque::new(), tx_queue: VecDeque::new(), mtu }
+        Self {
+            rx_queue: VecDeque::new(),
+            tx_queue: VecDeque::new(),
+            mtu,
+        }
     }
     pub fn inject(&mut self, pkt: Vec<u8>) {
         self.rx_queue.push_back(pkt);
@@ -90,10 +94,17 @@ impl Device for VirtualTunDevice {
 
     fn receive(&mut self, _ts: SmolInstant) -> Option<(VirtualRxToken, VirtualTxToken<'_>)> {
         let pkt = self.rx_queue.pop_front()?;
-        Some((VirtualRxToken { buf: pkt }, VirtualTxToken { queue: &mut self.tx_queue }))
+        Some((
+            VirtualRxToken { buf: pkt },
+            VirtualTxToken {
+                queue: &mut self.tx_queue,
+            },
+        ))
     }
     fn transmit(&mut self, _ts: SmolInstant) -> Option<VirtualTxToken<'_>> {
-        Some(VirtualTxToken { queue: &mut self.tx_queue })
+        Some(VirtualTxToken {
+            queue: &mut self.tx_queue,
+        })
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -104,8 +115,8 @@ impl Device for VirtualTunDevice {
 }
 
 /* ============================================================
-   UserSpaceStack：Interface + SocketSet + 监听 socket 池
-   ============================================================ */
+UserSpaceStack：Interface + SocketSet + 监听 socket 池
+============================================================ */
 
 #[derive(Debug, Clone)]
 pub struct AcceptedTcp {
@@ -129,14 +140,15 @@ pub struct UserSpaceStack {
 }
 
 impl UserSpaceStack {
-    pub fn new(mtu: usize, v4: Ipv4Address, v6: Ipv6Address) -> Self {
+    pub fn new(mtu: usize, v4: Ipv4Address, v6: Option<Ipv6Address>) -> Self {
         let mut device = VirtualTunDevice::new(mtu);
         let config = Config::new(HardwareAddress::Ip);
-        let mut iface =
-            Interface::new(config, &mut device, SmolInstant::from_millis(now_millis()));
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(now_millis()));
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(v4), 32));
-            let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(v6), 128));
+            if let Some(v6_addr) = v6 {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(v6_addr), 128));
+            }
         });
         // ⭐ 关键：TUN 上的真实包目标 IP 是任意 destination（如 1.2.3.4），
         // 不会等于本 iface 自身的 IP（198.18.0.1）。set_any_ip(true) 让 smoltcp
@@ -182,7 +194,6 @@ impl UserSpaceStack {
         }
     }
 
-
     pub fn poll(&mut self) -> bool {
         let now = SmolInstant::from_millis(now_millis());
         self.iface.poll(now, &mut self.device, &mut self.sockets)
@@ -209,7 +220,8 @@ impl UserSpaceStack {
             let s = self.sockets.get::<tcp::Socket>(h);
             if matches!(s.state(), tcp::State::Established) {
                 if let (Some(local), Some(remote)) = (s.local_endpoint(), s.remote_endpoint()) {
-                    if let (Some(l), Some(r)) = (endpoint_to_addr(local), endpoint_to_addr(remote)) {
+                    if let (Some(l), Some(r)) = (endpoint_to_addr(local), endpoint_to_addr(remote))
+                    {
                         out.push(AcceptedTcp {
                             handle: h,
                             local: l,
@@ -281,8 +293,8 @@ fn now_millis() -> i64 {
 }
 
 /* ============================================================
-   StackEngine：异步驱动 + accept 派发 + splice 管理
-   ============================================================ */
+StackEngine：异步驱动 + accept 派发 + splice 管理
+============================================================ */
 
 /// 共享栈把柄：被 driver 任务和 splice 任务共用。
 pub type SharedStack = Arc<Mutex<UserSpaceStack>>;
@@ -299,8 +311,8 @@ pub const DEFAULT_LISTENER_POOL: usize = 32;
 // （smoltcp `listen(port=0)` → `ListenError::Unaddressable`），是个 silent bug。
 
 /* ============================================================
-   smoltcp Socket ↔ tokio AsyncRead/AsyncWrite 桥
-   ============================================================ */
+smoltcp Socket ↔ tokio AsyncRead/AsyncWrite 桥
+============================================================ */
 
 /// 一条已 accept 的 smoltcp TCP socket，包装成 tokio Stream。
 ///
@@ -317,7 +329,13 @@ pub struct SmolStream {
 
 impl SmolStream {
     pub fn new(handle: SocketHandle, stack: SharedStack, notify: StackNotify) -> Self {
-        Self { handle, stack, notify, closed_read: false, closed_write: false }
+        Self {
+            handle,
+            stack,
+            notify,
+            closed_read: false,
+            closed_write: false,
+        }
     }
 
     /// 由 splice 任务在收尾时调用。
@@ -430,8 +448,8 @@ impl AsyncWrite for SmolStream {
 }
 
 /* ============================================================
-   SpliceManager：管理 (smoltcp socket ↔ outbound stream) 转发任务
-   ============================================================ */
+SpliceManager：管理 (smoltcp socket ↔ outbound stream) 转发任务
+============================================================ */
 
 pub struct SpliceManager {
     handles: Mutex<HashMap<SocketHandle, tokio::task::JoinHandle<()>>>,
@@ -439,7 +457,9 @@ pub struct SpliceManager {
 
 impl Default for SpliceManager {
     fn default() -> Self {
-        Self { handles: Mutex::new(HashMap::new()) }
+        Self {
+            handles: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -470,16 +490,35 @@ impl SpliceManager {
             // 有 guard：走 counted copy（per-conn 流量 + cancel 信号）；
             // 无 guard：走原朴素双向拷贝（兼容老路径）。
             if let Some(g) = guard {
+                let conn_id = g.id;
                 let accounting = g.accounting();
-                if let Some(m) = &metrics { m.inc_connection(); }
-                let _ = core_observe::copy_bidirectional_tracked(
+                if let Some(m) = &metrics {
+                    m.inc_connection();
+                }
+                let result = core_observe::copy_bidirectional_tracked(
                     &mut smol,
                     &mut Box::pin(outbound),
                     accounting,
                     metrics.clone(),
                 )
                 .await;
-                if let Some(m) = &metrics { m.dec_connection(); }
+                if let Some(m) = &metrics {
+                    m.dec_connection();
+                }
+                let up = g.up.load(Ordering::Relaxed);
+                let down = g.down.load(Ordering::Relaxed);
+                let up_s = crate::tun_pump::format_bytes(up);
+                let down_s = crate::tun_pump::format_bytes(down);
+                match &result {
+                    Ok(_) => info!(
+                        target: "capture::traffic",
+                        "[TCP] #{conn_id} closed | up {up_s} down {down_s}"
+                    ),
+                    Err(e) => warn!(
+                        target: "capture::traffic",
+                        "[TCP] #{conn_id} error: {e} | up {up_s} down {down_s}"
+                    ),
+                }
                 drop(g);
             } else {
                 let (mut sr, mut sw) = tokio::io::split(outbound);
@@ -539,7 +578,7 @@ mod tests {
         let mut stack = UserSpaceStack::new(
             1500,
             Ipv4Address::new(198, 18, 0, 1),
-            Ipv6Address::new(0xfc00, 0, 0, 0, 0, 0, 0, 1),
+            Some(Ipv6Address::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
         );
         stack.ensure_listener_for(443, 4);
         let _ = stack.poll();

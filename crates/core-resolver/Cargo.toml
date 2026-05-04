@@ -17,6 +17,10 @@ parking_lot       = { workspace = true }
 dashmap           = { workspace = true }
 ipnet             = { workspace = true }
 hickory-resolver  = { workspace = true }
+quinn             = { workspace = true }
+rustls            = { workspace = true }
+tokio-rustls      = { workspace = true }
+webpki-roots      = { workspace = true }
 anyhow            = { workspace = true }
 thiserror         = { workspace = true }
 tracing           = { workspace = true }

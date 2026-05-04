@@ -48,7 +48,10 @@ pub struct EimNatTable {
 
 impl EimNatTable {
     pub fn new(ttl: Duration) -> Self {
-        Self { map: DashMap::new(), ttl }
+        Self {
+            map: DashMap::new(),
+            ttl,
+        }
     }
 
     pub fn ttl(&self) -> Duration {
@@ -65,7 +68,10 @@ impl EimNatTable {
             return Ok(e.outbound.clone());
         }
         let sock = build()?;
-        let entry = EimEntry { outbound: sock.clone(), last_seen: Instant::now() };
+        let entry = EimEntry {
+            outbound: sock.clone(),
+            last_seen: Instant::now(),
+        };
         self.map.insert(key, entry);
         Ok(sock)
     }
@@ -97,7 +103,8 @@ impl EimNatTable {
         let now = Instant::now();
         let ttl = self.ttl;
         let before = self.map.len();
-        self.map.retain(|_, e| now.duration_since(e.last_seen) < ttl);
+        self.map
+            .retain(|_, e| now.duration_since(e.last_seen) < ttl);
         before - self.map.len()
     }
 }
@@ -107,7 +114,10 @@ mod tests {
     use super::*;
 
     fn key(s: &str) -> EimKey {
-        EimKey { network: "udp", inner_src: s.parse().unwrap() }
+        EimKey {
+            network: "udp",
+            inner_src: s.parse().unwrap(),
+        }
     }
 
     /// 同步 bind —— 避免在 build 闭包里使用 async（block_on 在 tokio 运行时里 panic）。

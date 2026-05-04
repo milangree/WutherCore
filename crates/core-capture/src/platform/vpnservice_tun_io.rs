@@ -28,7 +28,11 @@ impl VpnServiceTunIo {
             .map_err(|e| TunIoError::Open(format!("set O_NONBLOCK: {e}")))?;
         let async_fd = AsyncFd::with_interest(owned, Interest::READABLE | Interest::WRITABLE)
             .map_err(|e| TunIoError::Open(format!("AsyncFd: {e}")))?;
-        Ok(Self { name, mtu, fd: async_fd })
+        Ok(Self {
+            name,
+            mtu,
+            fd: async_fd,
+        })
     }
 }
 
@@ -54,9 +58,18 @@ impl TunIo for VpnServiceTunIo {
             }
         }
     }
-    fn name(&self) -> &str { &self.name }
-    fn mtu(&self) -> u32 { self.mtu }
-    async fn close(&self) -> Result<(), TunIoError> { Ok(()) }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn mtu(&self) -> u32 {
+        self.mtu
+    }
+    fn is_preconfigured(&self) -> bool {
+        true
+    }
+    async fn close(&self) -> Result<(), TunIoError> {
+        Ok(())
+    }
 }
 
 #[allow(unsafe_code)]

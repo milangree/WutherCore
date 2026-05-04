@@ -15,6 +15,7 @@ members = [
     "crates/core-capture",
     "crates/core-mesh",
     "crates/core-observe",
+    "crates/core-process",
     "crates/proxy-core",
     "tests-e2e",
 ]
@@ -24,8 +25,8 @@ version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
-authors = ["RPKernel Contributors"]
-repository = "https://example.com/rpkernel"
+authors = ["WutherCore Contributors"]
+repository = "https://example.com/wuthercore"
 
 [workspace.dependencies]
 # 异步运行时
@@ -46,6 +47,7 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
 
 # 网络通用
 bytes = "1"
@@ -127,6 +129,7 @@ core-api      = { path = "crates/core-api" }
 core-capture  = { path = "crates/core-capture" }
 core-mesh     = { path = "crates/core-mesh" }
 core-observe  = { path = "crates/core-observe" }
+core-process  = { path = "crates/core-process" }
 
 # ============================================================================
 # 编译时间 / 二进制大小 / 运行性能的权衡

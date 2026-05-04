@@ -4,8 +4,8 @@
 
 #![forbid(unsafe_code)]
 
-pub mod native;
 pub mod compat;
+pub mod native;
 pub mod server;
 
 pub use server::ApiServer;

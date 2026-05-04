@@ -1,6 +1,6 @@
 //! 策略组 —— 完整对齐 mihomo `adapter/outboundgroup/*.go` 的 7 种策略：
 //!
-//! | mihomo type           | RPKernel ChooseStrategy        | 行为                                                 |
+//! | mihomo type           | WutherCore ChooseStrategy        | 行为                                                 |
 //! |-----------------------|--------------------------------|------------------------------------------------------|
 //! | `select`              | `Manual`                       | 用户/API 选择；alive fallback                        |
 //! | `url-test`            | `Smart` / `Fast`               | URLTest 最低延迟 + tolerance + singledo              |
@@ -36,8 +36,8 @@ use tracing::debug;
 use crate::health::UrlTester;
 
 /* ============================================================
-   FlowMeta：策略组选点的输入上下文
-   ============================================================ */
+FlowMeta：策略组选点的输入上下文
+============================================================ */
 
 /// 一次 dial 的元数据 —— LoadBalance / Smart 等需要 host / src 用作 hash key。
 #[derive(Debug, Clone, Default)]
@@ -78,10 +78,7 @@ impl FlowMeta {
     /// 用于 sticky-sessions key —— mihomo `getKeyWithSrcAndDst`：src+dst。
     pub fn lb_key_sticky(&self) -> String {
         let dst = self.lb_key();
-        let src = self
-            .src_ip
-            .map(|i| i.to_string())
-            .unwrap_or_default();
+        let src = self.src_ip.map(|i| i.to_string()).unwrap_or_default();
         format!("{src}{dst}")
     }
 }
@@ -98,8 +95,8 @@ fn etld_plus_one(host: &str) -> String {
 }
 
 /* ============================================================
-   GroupOptions：扩展 GroupPlan 用不上的 mihomo 选项
-   ============================================================ */
+GroupOptions：扩展 GroupPlan 用不上的 mihomo 选项
+============================================================ */
 
 /// 与 mihomo `GroupCommonOption` 同语义的运行期选项。
 /// 从 `GroupPlan` 派生默认值；未来可由 YAML schema 注入。
@@ -175,8 +172,8 @@ impl LbStrategy {
 }
 
 /* ============================================================
-   GroupBase：成员过滤 + onDialFailed/Success + healthCheck 调度
-   ============================================================ */
+GroupBase：成员过滤 + onDialFailed/Success + healthCheck 调度
+============================================================ */
 
 #[derive(Debug, Default)]
 struct FailureWindow {
@@ -202,7 +199,11 @@ struct StickyLru {
 
 impl StickyLru {
     fn new(cap: usize, ttl: Duration) -> Self {
-        Self { cap, ttl, map: HashMap::new() }
+        Self {
+            cap,
+            ttl,
+            map: HashMap::new(),
+        }
     }
     fn get(&mut self, k: u64) -> Option<usize> {
         let now = Instant::now();
@@ -236,8 +237,8 @@ impl Default for LbState {
 }
 
 /* ============================================================
-   GroupSelector
-   ============================================================ */
+GroupSelector
+============================================================ */
 
 #[derive(Debug)]
 pub struct GroupSelector {
@@ -346,6 +347,10 @@ impl GroupSelector {
         out
     }
 
+    pub fn has_unresolved_feed_placeholders(&self) -> bool {
+        self.plan.members.iter().any(|m| is_feed_placeholder(m))
+    }
+
     pub fn set_manual(&self, node: impl Into<String>) {
         let n = node.into();
         *self.last_pick.write() = Some(n.clone());
@@ -359,8 +364,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       核心选点入口 —— 与 mihomo `Unwrap(metadata, touch)` 等价。
-       ==================================================================== */
+    核心选点入口 —— 与 mihomo `Unwrap(metadata, touch)` 等价。
+    ==================================================================== */
 
     /// 选出一个节点；策略全量分支。
     pub fn pick(
@@ -369,23 +374,45 @@ impl GroupSelector {
         smart: &Arc<SmartSelector>,
         tester: Option<&Arc<UrlTester>>,
     ) -> Option<String> {
-        let members = self.filtered_members(|_| "");
+        self.pick_eligible(meta, smart, tester, |_| true)
+    }
+
+    /// 选出一个满足额外能力约束的节点。
+    ///
+    /// TUN UDP 会用这个入口过滤不支持 UDP relay 的 outbound。这里不把
+    /// unsupported 节点留给后续 dial 再 fallback，避免 UDP 流量静默绕到 DIRECT。
+    pub fn pick_eligible(
+        &self,
+        meta: &FlowMeta,
+        smart: &Arc<SmartSelector>,
+        tester: Option<&Arc<UrlTester>>,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let mut members = self.filtered_members(|_| "");
+        let unresolved_feeds = members.iter().filter(|m| is_feed_placeholder(m)).count();
+        if unresolved_feeds > 0 {
+            members.retain(|m| !is_feed_placeholder(m));
+        }
+        let before_eligibility = members.len();
+        members.retain(|m| eligible(m));
         if members.is_empty() {
             tracing::warn!(
                 target: "group::pick",
                 group = %self.plan.name,
                 strategy = ?self.plan.choose,
                 host = %meta.host,
-                "no members after filter -> caller will fall back",
+                unresolved_feeds,
+                candidates_before_eligibility = before_eligibility,
+                network = meta.network,
+                "no selectable members after filter/provider expansion -> caller will fall back",
             );
             return None;
         }
-        let url = self
-            .opts
-            .read()
-            .url
-            .clone()
-            .unwrap_or_else(|| tester.map(|t| t.current_config().default_url).unwrap_or_default());
+        let url = self.opts.read().url.clone().unwrap_or_else(|| {
+            tester
+                .map(|t| t.current_config().default_url)
+                .unwrap_or_default()
+        });
         let started = std::time::Instant::now();
         let chosen = match self.plan.choose {
             ChooseStrategy::Manual => self.pick_manual(&members, &url, tester.map(|t| t.as_ref())),
@@ -434,8 +461,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       Selector / Manual —— mihomo selector.go
-       ==================================================================== */
+    Selector / Manual —— mihomo selector.go
+    ==================================================================== */
 
     fn pick_manual(
         &self,
@@ -456,8 +483,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       URLTest / Fast —— mihomo urltest.go fast(touch)
-       ==================================================================== */
+    URLTest / Fast —— mihomo urltest.go fast(touch)
+    ==================================================================== */
 
     fn pick_url_test(
         &self,
@@ -470,10 +497,7 @@ impl GroupSelector {
         // fixed selected：与 mihomo `selected` 完全一致 —— 只要 alive，就忠于它。
         if let Some(s) = self.manual_pick.read().clone() {
             if members.iter().any(|m| m == &s) {
-                if tester
-                    .map(|t| t.alive_for_url(&s, url))
-                    .unwrap_or(true)
-                {
+                if tester.map(|t| t.alive_for_url(&s, url)).unwrap_or(true) {
                     return Some(s);
                 }
             }
@@ -488,8 +512,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       Fallback / Stable —— mihomo fallback.go findAliveProxy
-       ==================================================================== */
+    Fallback / Stable —— mihomo fallback.go findAliveProxy
+    ==================================================================== */
 
     fn pick_fallback(
         &self,
@@ -505,10 +529,7 @@ impl GroupSelector {
         let manual_now: Option<String> = self.manual_pick.read().clone();
         if let Some(s) = manual_now {
             if members.iter().any(|m| m == &s) {
-                if tester
-                    .map(|t| t.alive_for_url(&s, url))
-                    .unwrap_or(true)
-                {
+                if tester.map(|t| t.alive_for_url(&s, url)).unwrap_or(true) {
                     return Some(s);
                 }
                 // dead → 释放 fixed（此时 read guard 已 drop，write 不会死锁）
@@ -525,8 +546,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       LoadBalance / Spread —— mihomo loadbalance.go
-       ==================================================================== */
+    LoadBalance / Spread —— mihomo loadbalance.go
+    ==================================================================== */
 
     fn pick_load_balance(
         &self,
@@ -634,8 +655,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       Smart —— 走 SmartSelector
-       ==================================================================== */
+    Smart —— 走 SmartSelector
+    ==================================================================== */
 
     fn pick_smart(
         &self,
@@ -653,8 +674,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       Chain / Relay
-       ==================================================================== */
+    Chain / Relay
+    ==================================================================== */
 
     fn pick_chain(&self, members: &[String]) -> Option<String> {
         // chain 第一跳 = path[0]；具体 outbound 拼接由 dispatcher / runtime.dial 完成。
@@ -666,8 +687,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       Health-check 反馈：与 mihomo onDialFailed/onDialSuccess 等价。
-       ==================================================================== */
+    Health-check 反馈：与 mihomo onDialFailed/onDialSuccess 等价。
+    ==================================================================== */
 
     /// 一次成功 dial —— 重置失败计数。
     pub fn on_dial_success(&self) {
@@ -728,8 +749,8 @@ impl GroupSelector {
     }
 
     /* ====================================================================
-       Dashboard JSON —— 对齐 Clash `/proxies/:name` 字段
-       ==================================================================== */
+    Dashboard JSON —— 对齐 Clash `/proxies/:name` 字段
+    ==================================================================== */
 
     pub fn to_clash_json(&self) -> serde_json::Value {
         let opts = self.opts.read();
@@ -764,7 +785,10 @@ impl GroupSelector {
         });
         if matches!(self.plan.choose, ChooseStrategy::Spread) {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("strategy".into(), serde_json::Value::String(opts.lb_strategy.as_str().into()));
+                obj.insert(
+                    "strategy".into(),
+                    serde_json::Value::String(opts.lb_strategy.as_str().into()),
+                );
             }
         }
         body
@@ -772,8 +796,8 @@ impl GroupSelector {
 }
 
 /* ============================================================
-   utils
-   ============================================================ */
+utils
+============================================================ */
 
 fn compile_regs_backtick(s: &str) -> Vec<Regex> {
     if s.is_empty() {
@@ -783,6 +807,12 @@ fn compile_regs_backtick(s: &str) -> Vec<Regex> {
         .filter(|p| !p.is_empty())
         .filter_map(|p| Regex::new(p).ok())
         .collect()
+}
+
+fn is_feed_placeholder(name: &str) -> bool {
+    name.strip_prefix("feed:")
+        .map(|rest| !rest.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -857,6 +887,23 @@ mod tests {
         let s = smart();
         g.set_manual("ghost");
         assert_eq!(g.pick(&meta("x"), &s, None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn unresolved_feed_placeholder_is_not_selectable() {
+        let g = GroupSelector::new(plan(ChooseStrategy::Manual, &["feed:primary", "node-a"]));
+        let s = smart();
+
+        assert_eq!(g.pick(&meta("x"), &s, None).as_deref(), Some("node-a"));
+        assert!(g.has_unresolved_feed_placeholders());
+    }
+
+    #[test]
+    fn all_unresolved_feed_placeholders_return_none() {
+        let g = GroupSelector::new(plan(ChooseStrategy::Manual, &["feed:primary"]));
+        let s = smart();
+
+        assert_eq!(g.pick(&meta("x"), &s, None), None);
     }
 
     #[test]
@@ -1034,9 +1081,13 @@ mod tests {
             ..GroupOptions::default()
         });
         let triggered = std::sync::atomic::AtomicUsize::new(0);
-        g.on_dial_failed("x", || { triggered.fetch_add(1, Ordering::SeqCst); });
+        g.on_dial_failed("x", || {
+            triggered.fetch_add(1, Ordering::SeqCst);
+        });
         g.on_dial_success();
-        g.on_dial_failed("x", || { triggered.fetch_add(1, Ordering::SeqCst); });
+        g.on_dial_failed("x", || {
+            triggered.fetch_add(1, Ordering::SeqCst);
+        });
         // 仍未触发：第一次失败窗口已被 success 重置。
         assert_eq!(triggered.load(Ordering::SeqCst), 0);
     }

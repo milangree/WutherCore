@@ -14,7 +14,10 @@ pub struct SystemUpstream {
 
 impl SystemUpstream {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), client_subnet: None }
+        Self {
+            name: name.into(),
+            client_subnet: None,
+        }
     }
     pub fn with_client_subnet(mut self, n: ipnet::IpNet) -> Self {
         self.client_subnet = Some(n);
@@ -24,9 +27,15 @@ impl SystemUpstream {
 
 #[async_trait]
 impl DnsUpstream for SystemUpstream {
-    fn name(&self) -> &str { &self.name }
-    fn kind(&self) -> &'static str { "system" }
-    fn default_client_subnet(&self) -> Option<ipnet::IpNet> { self.client_subnet }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn kind(&self) -> &'static str {
+        "system"
+    }
+    fn default_client_subnet(&self) -> Option<ipnet::IpNet> {
+        self.client_subnet
+    }
 
     async fn query_a(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         query_filtered(host, true).await

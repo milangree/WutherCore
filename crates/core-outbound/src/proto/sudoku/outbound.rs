@@ -86,10 +86,19 @@ impl SudokuOutbound {
 
 #[async_trait]
 impl OutboundAdapter for SudokuOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "sudoku" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "sudoku"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: true, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {

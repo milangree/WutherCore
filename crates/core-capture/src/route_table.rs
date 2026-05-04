@@ -28,6 +28,8 @@ pub struct ManagedRoute {
     pub gateway: Option<IpAddr>,
     pub interface: String,
     pub metric: u32,
+    /// Linux/Android policy routing table. `None` means main table / platform default.
+    pub table: Option<u32>,
 }
 
 /// 平台无关后端。tests 可注入 fake backend；prod 用 [`SystemBackend`]。
@@ -64,10 +66,10 @@ impl RouteTable {
     pub fn add(&self, r: ManagedRoute) -> Result<(), String> {
         match self.backend.add(&r) {
             Ok(()) => {
-                info!(target: "capture::route", dest = %r.dest, iface = %r.interface, gw = ?r.gateway, "route added");
+                info!(target: "capture::route", dest = %r.dest, iface = %r.interface, gw = ?r.gateway, table = ?r.table, metric = r.metric, "route added");
             }
             Err(e) => {
-                warn!(target: "capture::route", error = %e, dest = %r.dest, "route add failed (continuing)");
+                warn!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, metric = r.metric, "route add failed (continuing)");
             }
         }
         // 不论平台 add 是否成功都记录 —— 让 stop 时尝试撤销，避免遗留。
@@ -85,10 +87,14 @@ impl RouteTable {
         for r in g.drain(..) {
             match self.backend.del(&r) {
                 Ok(()) => {
-                    debug!(target: "capture::route", dest = %r.dest, iface = %r.interface, "route reverted");
+                    debug!(target: "capture::route", dest = %r.dest, iface = %r.interface, table = ?r.table, "route reverted");
                 }
                 Err(e) => {
-                    warn!(target: "capture::route", error = %e, dest = %r.dest, "route revert failed");
+                    if is_expected_route_delete_absence(&e) {
+                        debug!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, "route already absent");
+                    } else {
+                        warn!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, "route revert failed");
+                    }
                 }
             }
         }
@@ -121,14 +127,36 @@ fn platform_add(r: &ManagedRoute) -> Result<(), String> {
     let dest = r.dest.to_string();
     let metric = r.metric.to_string();
     let mut args: Vec<&str> = if r.dest.addr().is_ipv6() {
-        vec!["-6", "route", "add", &dest, "dev", &r.interface, "metric", &metric]
+        vec![
+            "-6",
+            "route",
+            "add",
+            &dest,
+            "dev",
+            &r.interface,
+            "metric",
+            &metric,
+        ]
     } else {
-        vec!["route", "add", &dest, "dev", &r.interface, "metric", &metric]
+        vec![
+            "route",
+            "add",
+            &dest,
+            "dev",
+            &r.interface,
+            "metric",
+            &metric,
+        ]
     };
     let gw_str;
     if let Some(gw) = r.gateway {
         gw_str = gw.to_string();
         args.extend_from_slice(&["via", &gw_str]);
+    }
+    let table_str;
+    if let Some(table) = r.table {
+        table_str = table.to_string();
+        args.extend_from_slice(&["table", &table_str]);
     }
     run_cmd("ip", &args)
 }
@@ -136,17 +164,26 @@ fn platform_add(r: &ManagedRoute) -> Result<(), String> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn platform_del(r: &ManagedRoute) -> Result<(), String> {
     let dest = r.dest.to_string();
-    let args: Vec<&str> = if r.dest.addr().is_ipv6() {
+    let mut args: Vec<&str> = if r.dest.addr().is_ipv6() {
         vec!["-6", "route", "del", &dest, "dev", &r.interface]
     } else {
         vec!["route", "del", &dest, "dev", &r.interface]
     };
+    let table_str;
+    if let Some(table) = r.table {
+        table_str = table.to_string();
+        args.extend_from_slice(&["table", &table_str]);
+    }
     run_cmd("ip", &args)
 }
 
 #[cfg(target_os = "macos")]
 fn platform_add(r: &ManagedRoute) -> Result<(), String> {
-    let family = if r.dest.addr().is_ipv6() { "-inet6" } else { "-inet" };
+    let family = if r.dest.addr().is_ipv6() {
+        "-inet6"
+    } else {
+        "-inet"
+    };
     let dest = r.dest.to_string();
     let mut args: Vec<&str> = vec!["-n", "add", family, "-net", &dest];
     let gw_str;
@@ -161,7 +198,11 @@ fn platform_add(r: &ManagedRoute) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn platform_del(r: &ManagedRoute) -> Result<(), String> {
-    let family = if r.dest.addr().is_ipv6() { "-inet6" } else { "-inet" };
+    let family = if r.dest.addr().is_ipv6() {
+        "-inet6"
+    } else {
+        "-inet"
+    };
     let dest = r.dest.to_string();
     let args: Vec<&str> = vec!["-n", "delete", family, "-net", &dest];
     run_cmd("route", &args)
@@ -233,7 +274,11 @@ fn platform_del(_r: &ManagedRoute) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn ipv4_mask(prefix: u8) -> String {
-    let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix.min(32)) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        (!0u32) << (32 - prefix.min(32))
+    };
     std::net::Ipv4Addr::from(mask).to_string()
 }
 
@@ -279,6 +324,22 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+fn is_expected_route_delete_absence(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if lower.starts_with("spawn ") {
+        return false;
+    }
+    [
+        "rtnetlink answers: no such process",
+        "rtnetlink answers: no such file or directory",
+        "no such process",
+        "not in table",
+        "element not found",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +372,7 @@ mod tests {
                 gateway: None,
                 interface: "rpktun0".into(),
                 metric: 1,
+                table: Some(2024),
             })
             .unwrap();
         table
@@ -319,6 +381,7 @@ mod tests {
                 gateway: None,
                 interface: "rpktun0".into(),
                 metric: 1,
+                table: Some(2024),
             })
             .unwrap();
         assert_eq!(table.len(), 2);
@@ -326,6 +389,19 @@ mod tests {
         table.revert_all();
         assert_eq!(table.len(), 0);
         assert_eq!(backend.deleted.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn managed_route_preserves_policy_table() {
+        let r = ManagedRoute {
+            dest: "0.0.0.0/1".parse().unwrap(),
+            gateway: None,
+            interface: "rpktun0".into(),
+            metric: 0,
+            table: Some(2024),
+        };
+
+        assert_eq!(r.table, Some(2024));
     }
 
     #[test]
@@ -347,9 +423,24 @@ mod tests {
                 gateway: None,
                 interface: "x".into(),
                 metric: 1,
+                table: None,
             })
             .unwrap();
         table.revert_all(); // best-effort，不能 panic
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn linux_route_delete_no_such_process_is_expected_absence() {
+        assert!(is_expected_route_delete_absence(
+            "ip failed (status=Some(2)): RTNETLINK answers: No such process",
+        ));
+    }
+
+    #[test]
+    fn missing_route_command_is_not_expected_absence() {
+        assert!(!is_expected_route_delete_absence(
+            "spawn ip: No such file or directory",
+        ));
     }
 }

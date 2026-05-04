@@ -18,6 +18,7 @@ parking_lot = { workspace = true }
 hex         = { workspace = true }
 futures     = { workspace = true }
 pin-project-lite = { workspace = true }
+if-addrs    = "0.15"
 
 # 协议层依赖
 aes-gcm           = { workspace = true }

@@ -1,4 +1,4 @@
-# RPKernel 多平台构建
+# WutherCore 多平台构建
 
 ## 一键构建（Windows 主机）
 

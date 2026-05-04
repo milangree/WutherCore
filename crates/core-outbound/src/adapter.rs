@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -56,23 +56,164 @@ pub fn next_dial_id() -> u64 {
 }
 
 /* ============================================================
-   Outbound fwmark —— 让代理出站套接字绕开 TUN 自身路由表。
+Outbound fwmark —— 让代理出站套接字绕开 TUN 自身路由表。
 
-   背景：TUN 抢了 default route 后，所有 connect 出去的 SYN 都进 TUN，
-   再被 routing 转发到某个 group → group 选某个节点 → connect 节点 IP →
-   又进 TUN → 死循环（用户视角：URLTest 全部 5s 超时）。
+背景：TUN 抢了 default route 后，所有 connect 出去的 SYN 都进 TUN，
+再被 routing 转发到某个 group → group 选某个节点 → connect 节点 IP →
+又进 TUN → 死循环（用户视角：URLTest 全部 5s 超时）。
 
-   解法（与 mihomo `routing-mark` 一致）：
-   * outbound socket 通过 `setsockopt(SOL_SOCKET, SO_MARK, mark)` 打标
-   * 配 `ip rule fwmark <mark> lookup main priority N` 让带标的包走主路由表
-     （主路由表的默认网关是物理 wlan0/eth0，不是 TUN）
+解法（与 mihomo `routing-mark` 一致）：
+* outbound socket 通过 `setsockopt(SOL_SOCKET, SO_MARK, mark)` 打标
+* root TUN 启动时探测系统默认网络所在路由表，并写
+  `ip rule fwmark <mark> lookup <default-table> priority N`，让带标的包
+  走真实默认网络而不是 TUN 表
 
-   capture 的 `install_auto_route` 会自动写这条 rule（见 platform/linux.rs）。
-   ============================================================ */
+capture 的 `install_auto_route` 会自动写这条 rule（见 platform/linux.rs）。
+============================================================ */
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static OUTBOUND_FWMARK: AtomicU32 = AtomicU32::new(0);
+static OUTBOUND_INTERFACE: RwLock<Option<String>> = RwLock::new(None);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectedSocket {
+    raw: i64,
+}
+
+impl ProtectedSocket {
+    pub fn raw(self) -> i64 {
+        self.raw
+    }
+}
+
+pub trait AsProtectedSocket {
+    fn protected_socket(&self) -> ProtectedSocket;
+}
+
+#[cfg(unix)]
+impl<T> AsProtectedSocket for T
+where
+    T: std::os::fd::AsRawFd + ?Sized,
+{
+    fn protected_socket(&self) -> ProtectedSocket {
+        ProtectedSocket {
+            raw: self.as_raw_fd() as i64,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<T> AsProtectedSocket for T
+where
+    T: std::os::windows::io::AsRawSocket + ?Sized,
+{
+    fn protected_socket(&self) -> ProtectedSocket {
+        ProtectedSocket {
+            raw: self.as_raw_socket() as i64,
+        }
+    }
+}
+
+/// Android VpnService socket protector hook.
+///
+/// In VpnService mode, every outbound socket created by the VPN process must be
+/// protected before connect/send, otherwise it is captured by the same VPN and
+/// loops back into TUN. Non-Android builds leave this unset.
+pub trait SocketProtector: Send + Sync + 'static {
+    fn protect(&self, socket: ProtectedSocket) -> std::io::Result<()>;
+}
+
+static SOCKET_PROTECTOR: RwLock<Option<Arc<dyn SocketProtector>>> = RwLock::new(None);
+
+pub fn set_socket_protector(protector: Option<Arc<dyn SocketProtector>>) {
+    let mut guard = SOCKET_PROTECTOR.write().unwrap_or_else(|e| e.into_inner());
+    *guard = protector;
+}
+
+pub fn has_socket_protector() -> bool {
+    SOCKET_PROTECTOR
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
+pub fn protect_socket<S>(socket: &S) -> std::io::Result<()>
+where
+    S: AsProtectedSocket + ?Sized,
+{
+    let protector = SOCKET_PROTECTOR
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(protector) = protector {
+        protector.protect(socket.protected_socket())?;
+    }
+    Ok(())
+}
+
+pub fn prepare_outbound_udp_socket(
+    socket: &std::net::UdpSocket,
+) -> std::io::Result<crate::loopback::LoopbackUdpGuard> {
+    prepare_outbound_udp_socket_with(socket, apply_outbound_mark)
+}
+
+pub fn prepare_outbound_udp_socket_for_addr(
+    socket: &std::net::UdpSocket,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<crate::loopback::LoopbackUdpGuard> {
+    prepare_outbound_udp_socket_with(socket, |sock| apply_outbound_mark_for_addr(sock, addr))
+}
+
+fn prepare_outbound_udp_socket_with(
+    socket: &std::net::UdpSocket,
+    apply_mark: impl FnOnce(&socket2::Socket) -> std::io::Result<()>,
+) -> std::io::Result<crate::loopback::LoopbackUdpGuard> {
+    protect_socket(socket)?;
+    let mark = outbound_fwmark();
+    let sock = socket2::SockRef::from(socket);
+    if let Err(e) = apply_mark(&sock) {
+        if mark != 0 {
+            tracing::warn!(
+                target: "dial::udp",
+                mark,
+                error = %e,
+                "apply SO_MARK failed; refusing unmarked outbound UDP socket",
+            );
+            return Err(e);
+        }
+        tracing::debug!(target: "dial::udp", error = %e, "apply SO_MARK failed (non-fatal)");
+    }
+    if let Err(e) = bind_to_device(&sock) {
+        tracing::debug!(target: "dial::udp", error = %e, "SO_BINDTODEVICE failed (non-fatal)");
+    }
+    let local = socket.local_addr()?;
+    Ok(crate::loopback::register_udp(local))
+}
+
+/// 统一 UDP 出站 socket 创建 —— 对标 mihomo `component/dialer` 的 control chain：
+/// `protect_socket → SO_MARK → SO_BINDTODEVICE → connect`。
+///
+/// 所有协议的 UDP 出站（DIRECT / SS / SOCKS5 / Hysteria / TUIC / WireGuard 等）
+/// 必须经此入口，确保 TUN auto_route 下的 fwmark bypass、Android VpnService
+/// protect、接口绑定一致生效。
+pub fn create_outbound_udp_socket(
+    peer: std::net::SocketAddr,
+) -> std::io::Result<(std::net::UdpSocket, crate::loopback::LoopbackUdpGuard)> {
+    let bind_addr: std::net::SocketAddr = if peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let sock = std::net::UdpSocket::bind(bind_addr)?;
+    let guard = prepare_outbound_udp_socket_for_addr(&sock, peer)?;
+    sock.connect(peer)?;
+    if let Ok(local) = sock.local_addr() {
+        guard.observe_local_addr(local);
+    }
+    sock.set_nonblocking(true)?;
+    Ok((sock, guard))
+}
 
 /// 设置全局 outbound fwmark；0 = 禁用。
 /// 与 mihomo `dialer.DefaultRoutingMark` 一致：默认禁用，只有显式 routing-mark
@@ -83,6 +224,37 @@ pub fn set_outbound_fwmark(mark: u32) {
 
 pub fn outbound_fwmark() -> u32 {
     OUTBOUND_FWMARK.load(Ordering::Acquire)
+}
+
+/// 设置全局出站接口名；对标 mihomo `DefaultInterface`。
+/// TUN 启动时由 route_probe 探测物理默认网卡写入。
+pub fn set_outbound_interface(iface: Option<String>) {
+    let mut guard = OUTBOUND_INTERFACE.write().unwrap_or_else(|e| e.into_inner());
+    *guard = iface;
+}
+
+pub fn outbound_interface() -> Option<String> {
+    OUTBOUND_INTERFACE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 把 socket 绑定到全局出站接口（SO_BINDTODEVICE）。
+/// 对标 mihomo `component/dialer/bind_linux.go:bindControl`。
+/// 非 Linux 平台或未配置接口时为 no-op。
+///
+/// 注意：不检查目标地址——所有出站 socket 都绑定到物理接口，
+/// 确保流量不被 TUN catch-all 截走。
+pub fn bind_to_device(_sock: &socket2::Socket) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let guard = OUTBOUND_INTERFACE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref iface) = *guard {
+            _sock.bind_device(Some(iface.as_bytes()))?;
+        }
+    }
+    Ok(())
 }
 
 /// 在 socket connect 之前打 SO_MARK；非 Linux/Android 平台为 no-op。
@@ -106,13 +278,23 @@ pub fn apply_outbound_mark_for_addr(
     sock: &socket2::Socket,
     addr: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    if !is_global_unicast(addr.ip()) {
+    let mark = outbound_fwmark();
+    if mark == 0 {
+        return Ok(());
+    }
+    if !should_mark_outbound_addr(addr.ip()) {
+        tracing::trace!(
+            target: "dial",
+            peer = %addr,
+            mark,
+            "skip SO_MARK for non-global direct target"
+        );
         return Ok(());
     }
     apply_outbound_mark(sock)
 }
 
-fn is_global_unicast(ip: std::net::IpAddr) -> bool {
+pub fn should_mark_outbound_addr(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
             let o = ip.octets();
@@ -149,9 +331,8 @@ pub type BoxedStream = Pin<Box<dyn ProxyStream>>;
 ///
 /// 各 OutboundAdapter 实现：
 /// * Direct：`tokio::net::UdpSocket::bind` 后系统直送。
-/// * SOCKS5：UDP ASSOCIATE。
-/// * VMess/Trojan/VLESS：协议级 UDP-over-TCP / UDP-over-WS。
-/// * Hysteria2 / TUIC：协议原生 UDP。
+/// * 代理协议：只有覆盖 [`OutboundAdapter::dial_udp`] 并返回真实 [`BoxedUdp`]
+///   的实现才能声明 `capabilities().udp = true`。
 /// * Block：直接返回 ConnectionRefused。
 ///
 /// `target` 是远端目标地址（域名或 IP）；recv_from 返回的 SocketAddr
@@ -161,7 +342,9 @@ pub trait UdpSocketLike: Send + Sync {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize>;
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize>;
     /// 关闭通道；某些协议需要发协议级断开。
-    async fn close(&self) -> std::io::Result<()> { Ok(()) }
+    async fn close(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub type BoxedUdp = Box<dyn UdpSocketLike>;
@@ -187,7 +370,11 @@ pub trait OutboundAdapter: Send + Sync {
     async fn dial_udp(&self, _ctx: DialContext) -> std::io::Result<BoxedUdp> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            format!("outbound `{}`/{} 暂未实现 UDP 通道", self.name(), self.protocol()),
+            format!(
+                "outbound `{}`/{} 暂未实现 UDP 通道",
+                self.name(),
+                self.protocol()
+            ),
         ))
     }
 }
@@ -203,7 +390,7 @@ pub type SharedOutbound = Arc<dyn OutboundAdapter>;
    系统 DNS 包又会进 TUN → user-stack → runtime.dial → 又要解析
    节点 host → 死循环 + 5s 超时。
 
-   解决：所有 transport 在 connect 之前先调本 trait 走 RPKernel
+   解决：所有 transport 在 connect 之前先调本 trait 走 WutherCore
    自己的 resolver（IP 直连 DoH，不经过 TUN），拿到 IP 字面再 connect。
 
    主进程（proxy-core/main.rs 或 core-runtime engine.rs）启动时调
@@ -211,41 +398,132 @@ pub type SharedOutbound = Arc<dyn OutboundAdapter>;
    未注入时 transport 退回 `TcpStream::connect((host, port))` 旧行为。
 */
 
-use std::sync::OnceLock;
-
 #[async_trait]
 pub trait DialResolver: Send + Sync + std::fmt::Debug {
-    /// 解析 host 为 IP 列表（IP 字面直接返回；hostname 走 RPKernel resolver）。
+    /// 解析 host 为 IP 列表（IP 字面直接返回；hostname 走 WutherCore resolver）。
+    /// 用于代理出站：节点 host 走 bootstrap，避开 TUN 自循环。
     async fn resolve(&self, host: &str) -> std::io::Result<Vec<std::net::IpAddr>>;
+
+    /// DIRECT 出站专用解析（mihomo `DirectHostResolver` 等价）。
+    ///
+    /// 直连流量的解析必须避开 fake-ip / 业务策略链，否则 fake IP 会被
+    /// 直接发到目标，造成不可路由的 198.18/15。默认实现回退到 [`Self::resolve`]，
+    /// 实现者应当 override 走 `direct-nameserver` group。
+    async fn resolve_for_direct(&self, host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+        self.resolve(host).await
+    }
+
+    /// 全局 IPv6 开关 —— 与 `Resolver.ipv6` 同源。`false` 时 [`resolve_host`]
+    /// 会丢掉所有 V6 IP（包括 host 是 V6 字面量的情况），让出站永远不连 V6。
+    ///
+    /// 默认 `true` 兼容老实现 / 测试 mock。生产 `ResolverAdapter` 透传 `Resolver`
+    /// 的 `ipv6_enabled()`；mihomo `ipv6: false` 等价行为靠这个 + TUN 端 drop
+    /// + DNS 端不返 AAAA 三层共同实现。
+    fn ipv6_enabled(&self) -> bool {
+        true
+    }
 }
 
-static DIAL_RESOLVER: OnceLock<Arc<dyn DialResolver>> = OnceLock::new();
+static DIAL_RESOLVER: RwLock<Option<Arc<dyn DialResolver>>> = RwLock::new(None);
 
 pub fn set_global_dial_resolver(r: Arc<dyn DialResolver>) {
-    let _ = DIAL_RESOLVER.set(r);
+    let mut guard = DIAL_RESOLVER.write().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(r);
 }
 
 pub fn global_dial_resolver() -> Option<Arc<dyn DialResolver>> {
-    DIAL_RESOLVER.get().cloned()
+    DIAL_RESOLVER
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+fn clear_global_dial_resolver() {
+    let mut guard = DIAL_RESOLVER.write().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 /// transport 通用辅助：解析 host 为 IP 列表。
 /// host 已经是 IP literal → 直接返回；否则走 global DialResolver；
 /// 没注入 resolver → 回退 tokio `lookup_host`（与旧行为兼容）。
 pub async fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    resolve_host_internal(host, port, false).await
+}
+
+/// DIRECT 出站专用解析（mihomo `DirectHostResolver` 等价）。
+///
+/// 与 [`resolve_host`] 区别：注入了 `direct-nameserver` 的环境会用
+/// `direct-nameserver` group 解析，避开 fake-ip / 业务策略链；未注入时
+/// 行为等价。
+pub async fn resolve_host_for_direct(
+    host: &str,
+    port: u16,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    resolve_host_internal(host, port, true).await
+}
+
+async fn resolve_host_internal(
+    host: &str,
+    port: u16,
+    for_direct: bool,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
     let started = std::time::Instant::now();
+    // 全局 IPv6 开关：取自 DialResolver（代理 Resolver.ipv6）。本函数三处需要
+    // 用到——literal v6 host 拒绝、resolver 返 v6 IP 过滤、空结果判定。
+    let ipv6_enabled = global_dial_resolver()
+        .as_ref()
+        .map(|r| r.ipv6_enabled())
+        .unwrap_or(true);
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        tracing::debug!(target: "dial::resolve", %host, port, "literal IP, no resolution");
+        if !ipv6_enabled && ip.is_ipv6() {
+            tracing::debug!(
+                target: "dial::resolve",
+                %host, port, for_direct,
+                "literal IPv6 host rejected (ipv6 disabled)"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("ipv6 disabled, refusing to dial v6 literal {host}"),
+            ));
+        }
+        tracing::debug!(target: "dial::resolve", %host, port, for_direct, "literal IP, no resolution");
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
     if let Some(r) = global_dial_resolver() {
-        tracing::debug!(target: "dial::resolve", %host, port, source = "rpkernel-resolver", "begin");
-        match r.resolve(host).await {
-            Ok(ips) => {
+        let source = if for_direct {
+            "wuthercore-resolver-direct"
+        } else {
+            "wuthercore-resolver"
+        };
+        tracing::debug!(target: "dial::resolve", %host, port, source, "begin");
+        let res = if for_direct {
+            r.resolve_for_direct(host).await
+        } else {
+            r.resolve(host).await
+        };
+        match res {
+            Ok(mut ips) => {
+                // ipv6 关闭时 strip V6 —— 同时覆盖以下三个来源：
+                //   (a) 上游 resolver 没有遵守 ipv6_enabled
+                //   (b) 自定义 DialResolver 返 v6（系统 DNS 等）
+                //   (c) Hosts 表 / fake-ip pool 返 v6
+                if !ipv6_enabled {
+                    let before = ips.len();
+                    ips.retain(|ip| ip.is_ipv4());
+                    if ips.len() != before {
+                        tracing::debug!(
+                            target: "dial::resolve",
+                            %host, port, for_direct,
+                            stripped = before - ips.len(),
+                            "filtered out IPv6 results (ipv6 disabled)"
+                        );
+                    }
+                }
                 if ips.is_empty() {
                     tracing::warn!(
                         target: "dial::resolve",
-                        %host, port,
+                        %host, port, for_direct,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "resolver returned 0 IP",
                     );
@@ -257,7 +535,7 @@ pub async fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<std::net
                 let ips_str: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
                 tracing::info!(
                     target: "dial::resolve",
-                    %host, port,
+                    %host, port, for_direct,
                     count = ips.len(),
                     ips = %ips_str.join(","),
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -271,24 +549,427 @@ pub async fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<std::net
             Err(e) => {
                 tracing::warn!(
                     target: "dial::resolve",
-                    %host, port,
+                    %host, port, for_direct,
                     error = %e,
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "rpkernel-resolver failed",
+                    "wuthercore-resolver failed",
                 );
                 return Err(e);
             }
         }
     }
-    tracing::debug!(target: "dial::resolve", %host, port, source = "system-getaddrinfo", "begin");
+    tracing::debug!(target: "dial::resolve", %host, port, for_direct, source = "system-getaddrinfo", "begin");
     let addrs = tokio::net::lookup_host((host, port)).await?;
     let collected: Vec<_> = addrs.collect();
     tracing::info!(
         target: "dial::resolve",
-        %host, port,
+        %host, port, for_direct,
         count = collected.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "resolved (system)",
     );
     Ok(collected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::direct::DirectOutbound;
+    use crate::transport::tcp::marked_connect;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    static TEST_PROTECTOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_test_protector() -> std::sync::MutexGuard<'static, ()> {
+        TEST_PROTECTOR_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    struct CountingProtector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SocketProtector for CountingProtector {
+        fn protect(&self, socket: ProtectedSocket) -> std::io::Result<()> {
+            assert!(socket.raw() != 0);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticDialResolver;
+
+    #[async_trait]
+    impl DialResolver for StaticDialResolver {
+        async fn resolve(&self, _host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Mock resolver returning a fixed mixed v4+v6 list, with toggleable ipv6.
+    #[derive(Debug)]
+    struct MixedFamilyResolver {
+        ipv6: bool,
+    }
+
+    #[async_trait]
+    impl DialResolver for MixedFamilyResolver {
+        async fn resolve(&self, _host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec![
+                "1.2.3.4".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+                "5.6.7.8".parse().unwrap(),
+                "2001:db8::2".parse().unwrap(),
+            ])
+        }
+        fn ipv6_enabled(&self) -> bool {
+            self.ipv6
+        }
+    }
+
+    #[test]
+    fn global_dial_resolver_can_be_replaced_on_runtime_reload() {
+        let _guard = lock_test_protector();
+        clear_global_dial_resolver();
+
+        let first: Arc<dyn DialResolver> = Arc::new(StaticDialResolver);
+        let second: Arc<dyn DialResolver> = Arc::new(StaticDialResolver);
+
+        set_global_dial_resolver(first.clone());
+        assert!(Arc::ptr_eq(&first, &global_dial_resolver().unwrap()));
+
+        set_global_dial_resolver(second.clone());
+        assert!(Arc::ptr_eq(&second, &global_dial_resolver().unwrap()));
+
+        clear_global_dial_resolver();
+    }
+
+    /// `ipv6_enabled = false` 时混合解析结果里所有 V6 IP 应被剥离，只保留 V4。
+    /// 与 mihomo `ipv6: false` 行为对齐：DNS 层即便漏放了 AAAA，dial 层也兜住。
+    #[tokio::test]
+    async fn resolve_host_filters_v6_when_ipv6_disabled() {
+        let _guard = lock_test_protector();
+        clear_global_dial_resolver();
+        set_global_dial_resolver(Arc::new(MixedFamilyResolver { ipv6: false }));
+
+        let result = resolve_host("example.com", 443).await.unwrap();
+        let ips: Vec<std::net::IpAddr> = result.into_iter().map(|s| s.ip()).collect();
+        assert!(ips.iter().all(|i| i.is_ipv4()), "left v6 IPs: {ips:?}");
+        assert_eq!(ips.len(), 2, "should keep both v4 IPs");
+
+        clear_global_dial_resolver();
+    }
+
+    /// `ipv6_enabled = true` 时混合结果原样透传，不应丢任何 IP。
+    #[tokio::test]
+    async fn resolve_host_keeps_v6_when_ipv6_enabled() {
+        let _guard = lock_test_protector();
+        clear_global_dial_resolver();
+        set_global_dial_resolver(Arc::new(MixedFamilyResolver { ipv6: true }));
+
+        let result = resolve_host("example.com", 443).await.unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.iter().filter(|s| s.is_ipv6()).count(), 2);
+
+        clear_global_dial_resolver();
+    }
+
+    /// `ipv6_enabled = false` 且 host 是 V6 字面量时直接拒绝（AddrNotAvailable），
+    /// 不能默默落到 dial 后再炸——proxy 节点配错 v6 IP 应该报错可见。
+    /// 注意 `[..]` 形式 `IpAddr::parse` 不识别（属于 SocketAddr 语法），所以
+    /// 真实场景下 v6 字面量 host 不应带括号。
+    #[tokio::test]
+    async fn resolve_host_rejects_v6_literal_when_ipv6_disabled() {
+        let _guard = lock_test_protector();
+        clear_global_dial_resolver();
+        set_global_dial_resolver(Arc::new(MixedFamilyResolver { ipv6: false }));
+
+        let err = resolve_host("2001:db8::1", 443).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert!(err.to_string().contains("ipv6 disabled"));
+
+        clear_global_dial_resolver();
+    }
+
+    /// V4 字面量 host 不受 ipv6 开关影响。
+    #[tokio::test]
+    async fn resolve_host_passes_v4_literal_when_ipv6_disabled() {
+        let _guard = lock_test_protector();
+        clear_global_dial_resolver();
+        set_global_dial_resolver(Arc::new(MixedFamilyResolver { ipv6: false }));
+
+        let result = resolve_host("1.2.3.4", 443).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_ipv4());
+
+        clear_global_dial_resolver();
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_invokes_socket_protector_before_dial() {
+        let _guard = lock_test_protector();
+        let calls = Arc::new(AtomicUsize::new(0));
+        set_socket_protector(Some(Arc::new(CountingProtector {
+            calls: calls.clone(),
+        })));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_accept, wait_release) = tokio::sync::oneshot::channel::<()>();
+        let accept = tokio::spawn(async move {
+            let Ok((_stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let _ = wait_release.await;
+        });
+
+        let stream = marked_connect(addr, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        drop(stream);
+        let _ = release_accept.send(());
+        let _ = accept.await;
+
+        set_socket_protector(None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn marked_tcp_connect_tracks_local_endpoint_until_stream_drops() {
+        let _guard = lock_test_protector();
+        set_socket_protector(None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_accept, wait_release) = tokio::sync::oneshot::channel::<()>();
+        let accept = tokio::spawn(async move {
+            let Ok((_stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let _ = wait_release.await;
+        });
+
+        let stream = marked_connect(addr, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let local = stream.local_addr().unwrap();
+
+        assert!(crate::loopback::is_loopback_tcp_source(local));
+
+        drop(stream);
+        let _ = release_accept.send(());
+        let _ = accept.await;
+        assert!(!crate::loopback::is_loopback_tcp_source(local));
+    }
+
+    #[tokio::test]
+    async fn direct_udp_invokes_socket_protector_when_channel_is_created() {
+        let _guard = lock_test_protector();
+        let calls = Arc::new(AtomicUsize::new(0));
+        set_socket_protector(Some(Arc::new(CountingProtector {
+            calls: calls.clone(),
+        })));
+
+        let outbound = DirectOutbound::new();
+        let udp = outbound
+            .dial_udp(DialContext::udp("1.1.1.1", 53))
+            .await
+            .unwrap();
+        drop(udp);
+
+        set_socket_protector(None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_udp_send_and_recv_use_connected_socket_after_first_peer() {
+        let _guard = lock_test_protector();
+        set_socket_protector(None);
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            server.send_to(b"pong", peer).await.unwrap();
+        });
+
+        let outbound = DirectOutbound::new();
+        let udp = outbound
+            .dial_udp(DialContext::udp("127.0.0.1", server_addr.port()))
+            .await
+            .unwrap();
+        udp.send_to(b"ping", "127.0.0.1", server_addr.port())
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = udp.recv_from(&mut buf).await.unwrap();
+
+        assert_eq!(&buf[..n], b"pong");
+        let _ = echo.await;
+    }
+
+    #[tokio::test]
+    async fn direct_udp_supports_ipv6_targets() {
+        let _guard = lock_test_protector();
+        set_socket_protector(None);
+
+        let Ok(server) = tokio::net::UdpSocket::bind("[::1]:0").await else {
+            return;
+        };
+        let server_addr = server.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ping6");
+            server.send_to(b"pong6", peer).await.unwrap();
+        });
+
+        let outbound = DirectOutbound::new();
+        let udp = outbound
+            .dial_udp(DialContext::udp("::1", server_addr.port()))
+            .await
+            .unwrap();
+        udp.send_to(b"ping6", "::1", server_addr.port())
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = udp.recv_from(&mut buf).await.unwrap();
+
+        assert_eq!(&buf[..n], b"pong6");
+        let _ = echo.await;
+    }
+
+    #[test]
+    fn prepare_udp_socket_tracks_local_port_until_guard_drops() {
+        let _guard = lock_test_protector();
+        set_socket_protector(None);
+        set_outbound_fwmark(0);
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let guard = prepare_outbound_udp_socket(&socket).unwrap();
+        let source = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            local.port(),
+        );
+
+        assert!(crate::loopback::is_loopback_udp_source(source));
+
+        drop(guard);
+        assert!(!crate::loopback::is_loopback_udp_source(source));
+    }
+
+    #[test]
+    fn prepare_udp_socket_requires_configured_mark_to_succeed() {
+        let _guard = lock_test_protector();
+        set_socket_protector(None);
+        set_outbound_fwmark(0x2024);
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let source = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            local.port(),
+        );
+
+        let err = prepare_outbound_udp_socket_with(&socket, |_sock| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mock SO_MARK failure",
+            ))
+        })
+        .unwrap_err();
+
+        set_outbound_fwmark(0);
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!crate::loopback::is_loopback_udp_source(source));
+    }
+
+    #[test]
+    fn outbound_mark_policy_skips_local_and_lan_targets() {
+        assert!(!should_mark_outbound_addr("127.0.0.1".parse().unwrap()));
+        assert!(!should_mark_outbound_addr("192.168.1.1".parse().unwrap()));
+        assert!(!should_mark_outbound_addr("10.0.0.1".parse().unwrap()));
+        assert!(!should_mark_outbound_addr("fd00::1".parse().unwrap()));
+        assert!(!should_mark_outbound_addr("::1".parse().unwrap()));
+        assert!(should_mark_outbound_addr("8.8.8.8".parse().unwrap()));
+        assert!(should_mark_outbound_addr(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn loopback_detector_rejects_tracked_tcp_source_until_guard_drops() {
+        let source: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let guard = crate::loopback::register_tcp(source);
+
+        assert!(crate::loopback::is_loopback_tcp_source(source));
+
+        drop(guard);
+        assert!(!crate::loopback::is_loopback_tcp_source(source));
+    }
+
+    #[test]
+    fn loopback_detector_rejects_tracked_udp_local_port_only_for_local_source() {
+        let local: std::net::SocketAddr = "0.0.0.0:42000".parse().unwrap();
+        let guard = crate::loopback::register_udp(local);
+
+        assert!(crate::loopback::is_loopback_udp_source(
+            "127.0.0.1:42000".parse().unwrap()
+        ));
+        assert!(!crate::loopback::is_loopback_udp_source(
+            "8.8.8.8:42000".parse().unwrap()
+        ));
+
+        drop(guard);
+        assert!(!crate::loopback::is_loopback_udp_source(
+            "127.0.0.1:42000".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn loopback_detector_does_not_flag_non_loopback_local_ip_without_observed_addr() {
+        // ROOT TUN 触发场景：
+        // - 出站 socket 绑定 0.0.0.0:port，未 connect 时 udp_local_addrs 还没有记录；
+        // - 同时设备上某个本地进程发包，内核选 TUN gateway 作 source IP，
+        //   端口正好跟我们出站 socket 撞了。
+        // 期望：不把这种合法上行流量误判为 self-capture，否则整条 ROOT TUN 链路
+        // 99% 的 UDP 会被 listener 直接拒掉。
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let _guard = crate::loopback::register_udp(local);
+        let Some(ip) = if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .map(|iface| iface.ip())
+            .find(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        else {
+            return;
+        };
+        let source = std::net::SocketAddr::new(ip, local.port());
+
+        assert!(!crate::loopback::is_loopback_udp_source(source));
+    }
+
+    #[test]
+    fn loopback_detector_flags_observed_local_addr_after_connect() {
+        // connect 之后 local_addr 拿到具体出口 IP；observe_local_addr 把
+        // (egress_ip, port) 写进 udp_local_addrs。该精确组合再次进站才算自抓。
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let guard = crate::loopback::register_udp(local);
+        guard.observe_local_addr(local);
+
+        assert!(crate::loopback::is_loopback_udp_source(local));
+
+        drop(guard);
+        assert!(!crate::loopback::is_loopback_udp_source(local));
+    }
 }

@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::packet::{parse_ip_packet, L4};
+use crate::packet::{parse_tun_frame, L4};
 use crate::platform::windows_tun_io;
 use crate::route_table::{ManagedRoute, RouteTable};
 use crate::tun_io::TunIo;
@@ -41,9 +41,9 @@ pub fn list_interfaces() -> Vec<String> {
 pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, CaptureError> {
     match plan.kind {
         EngineKind::Tun => Ok(Arc::new(WindowsTun::new(plan))),
-        EngineKind::Tproxy | EngineKind::Redirect => {
-            Err(CaptureError::Unsupported("Windows 不支持 tproxy/redirect".into()))
-        }
+        EngineKind::Tproxy | EngineKind::Redirect => Err(CaptureError::Unsupported(
+            "Windows 不支持 tproxy/redirect".into(),
+        )),
         EngineKind::None => Err(CaptureError::Unsupported("kind=None".into())),
     }
 }
@@ -112,7 +112,11 @@ impl WindowsTun {
 }
 
 fn v4mask(prefix: u8) -> std::net::Ipv4Addr {
-    let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        (!0u32) << (32 - prefix)
+    };
     std::net::Ipv4Addr::from(mask)
 }
 
@@ -151,20 +155,18 @@ impl CaptureEngine for WindowsTun {
                 gateway: None,
                 interface: self.plan.interface_name.clone(),
                 metric: 0,
+                table: None,
             });
         }
-        // 用户态栈模式（mixed/smoltcp/gvisor）下由 TunDispatcher 独占 Wintun，
-        // 不再启动事件级 packet_loop（否则两个 reader 抢同一 device 句柄）。
-        let user_stack_active = matches!(
-            self.plan.stack,
-            core_config::model::CaptureStack::Gvisor
-                | core_config::model::CaptureStack::Mixed
-                | core_config::model::CaptureStack::Smoltcp
-        );
-        match windows_tun_io::open(&self.plan) {
+        // Wintun 的事件级 packet_loop 只发现流，不能转发 payload。
+        // virtual_nic 始终由 CaptureSupervisor 的 TunDispatcher 独占读写。
+        let dispatcher_owns_tun = true;
+        match crate::platform::tunrs_io::open(&self.plan)
+            .map(|d| d as std::sync::Arc<dyn crate::tun_io::TunIo>)
+        {
             Ok(device) => {
                 let (stop_tx, stop_rx) = oneshot::channel();
-                if !user_stack_active {
+                if !dispatcher_owns_tun {
                     let dev_for_loop = device.clone();
                     let mtu = self.plan.mtu as usize;
                     let handle = tokio::spawn(async move {
@@ -269,7 +271,16 @@ fn apply_dns_to_all_interfaces(server: &str) {
     let snap = snapshot_system_dns();
     for (iface, _) in snap {
         let _ = std::process::Command::new("netsh")
-            .args(["interface", "ip", "set", "dnsservers", &iface, "static", server, "primary"])
+            .args([
+                "interface",
+                "ip",
+                "set",
+                "dnsservers",
+                &iface,
+                "static",
+                server,
+                "primary",
+            ])
             .status();
     }
 }
@@ -283,7 +294,13 @@ fn restore_dns_for_interface(iface: &str, servers: &[String]) {
         let idx = (i + 1).to_string();
         let _ = std::process::Command::new("netsh")
             .args([
-                "interface", "ip", "add", "dnsservers", iface, s, &format!("index={idx}"),
+                "interface",
+                "ip",
+                "add",
+                "dnsservers",
+                iface,
+                s,
+                &format!("index={idx}"),
             ])
             .status();
     }
@@ -310,8 +327,8 @@ async fn packet_loop(
                         break;
                     }
                 };
-                let parsed = match parse_ip_packet(&buf[..n]) {
-                    Ok(p) => p,
+                let parsed = match parse_tun_frame(&buf[..n]) {
+                    Ok(p) => p.packet,
                     Err(_) => continue,
                 };
                 let net = match parsed.l4 {

@@ -120,6 +120,7 @@ mod tests {
     use core_resolver::fake_ip::{AddressFamily, FakeIpConfig};
     use ipnet::{Ipv4Net, Ipv6Net};
     use std::str::FromStr;
+    use std::time::Duration;
 
     fn fresh_pool() -> FakeIpPool {
         FakeIpPool::new(FakeIpConfig {
@@ -159,6 +160,22 @@ mod tests {
         let t = build_dial_target(&p, sa("198.18.0.5:443"), None);
         assert_eq!(t.dns_mode, DnsMode::FakeIp);
         assert!(t.fake_ip_missing);
+    }
+
+    #[test]
+    fn real_ip_with_dns_mapping_returns_domain() {
+        let p = fresh_pool();
+        p.insert_mapping(
+            "1.1.1.1".parse().unwrap(),
+            "cloudflare-dns.com",
+            Duration::from_secs(60),
+        );
+
+        let t = build_dial_target(&p, sa("1.1.1.1:443"), None);
+
+        assert_eq!(t.host, "cloudflare-dns.com");
+        assert_eq!(t.dns_mode, DnsMode::DnsMapping);
+        assert!(!t.fake_ip_missing);
     }
 
     #[test]

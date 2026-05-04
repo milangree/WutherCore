@@ -135,7 +135,11 @@ pub fn current_rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(pages) = s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+            if let Some(pages) = s
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+            {
                 let page = page_size();
                 return pages.saturating_mul(page);
             }

@@ -4,7 +4,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{
+    NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts,
+};
+use hickory_resolver::proto::rr::{Record, RecordType};
 use hickory_resolver::TokioAsyncResolver;
 
 use super::{DnsError, DnsUpstream};
@@ -62,7 +65,7 @@ impl HickoryUpstream {
     ) -> Result<Self, DnsError> {
         let mut nsg = NameServerConfigGroup::new();
         let mut ns = NameServerConfig::new(addr, kind.proto());
-        if let Some(sni) = sni.clone() {
+        if let Some(sni) = sni.clone().filter(|s| !s.is_empty()) {
             ns.tls_dns_name = Some(sni);
         }
         ns.trust_negative_responses = true;
@@ -89,19 +92,30 @@ impl HickoryUpstream {
         self
     }
 
-    /// 便捷构造：DoH URL（仅取 host:port，按 https 默认 443）。
-    pub fn doh(name: impl Into<String>, host: &str, port: u16, sni: Option<String>) -> Result<Self, DnsError> {
-        let ip: std::net::IpAddr = host
-            .parse()
-            .map_err(|_| DnsError::Failed(format!("DoH host 必须是 IP（避免循环）：{host}")))?;
-        Self::build(name, HickoryKind::DoH, SocketAddr::new(ip, port), sni)
+    /// 便捷构造：DoH URL。
+    ///
+    /// - `host` 可为 IP literal 或域名。
+    /// - 域名会通过系统 DNS 同步解析一次（mihomo `default-nameserver` bootstrap
+    ///   行为等价；用户应保证 default-nameserver 是 IP literal 以保证启动可达）。
+    /// - SNI 默认就是 `host`（IP 时 rustls 走 IP-SAN 验证）。
+    pub fn doh(
+        name: impl Into<String>,
+        host: &str,
+        port: u16,
+        sni: Option<String>,
+    ) -> Result<Self, DnsError> {
+        let addr = resolve_host_for_upstream(host, port, "DoH")?;
+        Self::build(name, HickoryKind::DoH, addr, sni)
     }
 
-    pub fn dot(name: impl Into<String>, host: &str, port: u16, sni: Option<String>) -> Result<Self, DnsError> {
-        let ip: std::net::IpAddr = host
-            .parse()
-            .map_err(|_| DnsError::Failed(format!("DoT host 必须是 IP：{host}")))?;
-        Self::build(name, HickoryKind::DoT, SocketAddr::new(ip, port), sni)
+    pub fn dot(
+        name: impl Into<String>,
+        host: &str,
+        port: u16,
+        sni: Option<String>,
+    ) -> Result<Self, DnsError> {
+        let addr = resolve_host_for_upstream(host, port, "DoT")?;
+        Self::build(name, HickoryKind::DoT, addr, sni)
     }
 
     pub fn udp(name: impl Into<String>, addr: SocketAddr) -> Result<Self, DnsError> {
@@ -109,11 +123,39 @@ impl HickoryUpstream {
     }
 }
 
+/// 把 `host:port` 解析为 SocketAddr。host 是 IP literal 直接组装；
+/// host 是域名时走 std `to_socket_addrs`（getaddrinfo / Windows DNS API），
+/// 等价于 mihomo bootstrap 用 system resolver 解析 default-nameserver 域名。
+///
+/// `kind_label` 仅用于错误信息（"DoH" / "DoT"）。
+fn resolve_host_for_upstream(
+    host: &str,
+    port: u16,
+    kind_label: &'static str,
+) -> Result<SocketAddr, DnsError> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let target = format!("{host}:{port}");
+    target
+        .to_socket_addrs()
+        .map_err(|e| DnsError::Failed(format!("{kind_label} host {host} 解析失败: {e}")))?
+        .next()
+        .ok_or_else(|| DnsError::Failed(format!("{kind_label} host {host} 解析为空")))
+}
+
 #[async_trait]
 impl DnsUpstream for HickoryUpstream {
-    fn name(&self) -> &str { &self.name }
-    fn kind(&self) -> &'static str { self.kind.label() }
-    fn default_client_subnet(&self) -> Option<ipnet::IpNet> { self.client_subnet }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn kind(&self) -> &'static str {
+        self.kind.label()
+    }
+    fn default_client_subnet(&self) -> Option<ipnet::IpNet> {
+        self.client_subnet
+    }
 
     async fn query_a(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -125,7 +167,11 @@ impl DnsUpstream for HickoryUpstream {
             .await
             .map_err(|e| DnsError::Failed(e.to_string()))?;
         let v: Vec<IpAddr> = r.iter().map(|a| IpAddr::V4(a.0)).collect();
-        if v.is_empty() { Err(DnsError::Empty) } else { Ok(v) }
+        if v.is_empty() {
+            Err(DnsError::Empty)
+        } else {
+            Ok(v)
+        }
     }
     async fn query_aaaa(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -137,6 +183,55 @@ impl DnsUpstream for HickoryUpstream {
             .await
             .map_err(|e| DnsError::Failed(e.to_string()))?;
         let v: Vec<IpAddr> = r.iter().map(|a| IpAddr::V6(a.0)).collect();
-        if v.is_empty() { Err(DnsError::Empty) } else { Ok(v) }
+        if v.is_empty() {
+            Err(DnsError::Empty)
+        } else {
+            Ok(v)
+        }
+    }
+
+    async fn query_records(
+        &self,
+        host: &str,
+        record_type: RecordType,
+    ) -> Result<Vec<Record>, DnsError> {
+        let r = self
+            .inner
+            .lookup(host.trim_end_matches('.'), record_type)
+            .await
+            .map_err(|e| DnsError::Failed(e.to_string()))?;
+        let records = r.records().to_vec();
+        if records.is_empty() {
+            Err(DnsError::Empty)
+        } else {
+            Ok(records)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doh_accepts_ip_literal_host() {
+        let up = HickoryUpstream::doh("ali", "223.5.5.5", 443, None);
+        assert!(up.is_ok(), "DoH IP host should construct: {:?}", up.err());
+    }
+
+    #[test]
+    fn doh_accepts_ipv6_literal_host() {
+        let up = HickoryUpstream::doh("v6", "2606:4700:4700::1111", 443, None);
+        assert!(
+            up.is_ok(),
+            "DoH IPv6 host should construct: {:?}",
+            up.err()
+        );
+    }
+
+    #[test]
+    fn dot_accepts_ip_literal_host() {
+        let up = HickoryUpstream::dot("ali-dot", "223.5.5.5", 853, None);
+        assert!(up.is_ok());
     }
 }

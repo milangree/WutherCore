@@ -156,17 +156,31 @@ impl FeedManager {
             let me = self.clone();
             let name_owned = name.clone();
             let detail_owned = detail.clone();
-            let notify = self
-                .notifies
-                .read()
-                .get(&name)
-                .cloned()
-                .unwrap_or_default();
+            let notify = self.notifies.read().get(&name).cloned().unwrap_or_default();
             let handle = tokio::spawn(async move {
                 me.run_one(name_owned, detail_owned, notify).await;
             });
             self.handles.lock().push(handle);
         }
+    }
+
+    /// 启动前同步发布磁盘快照，让 Runtime 在 capture/listener 启动前先拿到
+    /// 上次成功的 provider 节点。在线刷新仍由 `start()` 的后台任务继续执行。
+    pub async fn bootstrap_cache(self: &Arc<Self>) -> usize {
+        let Some(cache) = self.cache.clone() else {
+            return 0;
+        };
+        let mut published = 0usize;
+        for (name, detail) in self.feeds.clone() {
+            let every = clamp_interval(detail.every);
+            if self
+                .publish_cache_snapshot_if_valid(&cache, &name, &detail, every, "bootstrap")
+                .await
+            {
+                published += 1;
+            }
+        }
+        published
     }
 
     pub fn stop(&self) {
@@ -184,38 +198,28 @@ impl FeedManager {
         let mut initial_wait = Duration::from_secs(0);
         if let Some(cache) = self.cache.as_ref() {
             if let Some(meta) = cache.load_meta(&name) {
-                let url_changed = meta.url_hash.as_deref() != Some(&url_digest(&detail.url));
+                let url_changed = meta
+                    .url_hash
+                    .as_deref()
+                    .map(|hash| hash != url_digest(&detail.url))
+                    .unwrap_or(false);
                 if url_changed {
                     info!(target: "feeds", name = %name, "url changed since last cache; forgetting");
                     cache.forget(&name);
                 } else if let Some(elapsed) = meta.elapsed() {
                     if elapsed < every {
                         initial_wait = every - elapsed;
-                        // 把 cache 当作启动快照立刻发出，让 Runtime 不必等首拉。
-                        if let Some(raw) = cache.load(&name) {
-                            let nodes = self.parse_with_filter(&detail, &raw);
-                            self.publish_update(
-                                &name,
-                                FeedUpdate {
-                                    name: name.clone(),
-                                    nodes: nodes.clone(),
-                                    from_cache: true,
-                                    raw_bytes: raw.len(),
-                                },
-                                Some(meta.last_refreshed_ms),
-                                every,
-                            )
-                            .await;
-                            info!(
-                                target: "feeds",
-                                name = %name,
-                                cached_nodes = nodes.len(),
-                                wait_secs = initial_wait.as_secs(),
-                                "loaded snapshot from cache; deferring fetch"
-                            );
-                        }
                     }
                 }
+                if self.snapshot(&name).is_none() {
+                    let _ = self
+                        .publish_cache_snapshot_if_valid(cache, &name, &detail, every, "start")
+                        .await;
+                }
+            } else if self.snapshot(&name).is_none() {
+                let _ = self
+                    .publish_cache_snapshot_if_valid(cache, &name, &detail, every, "start")
+                    .await;
             }
         }
 
@@ -242,7 +246,8 @@ impl FeedManager {
                         "feed refreshed"
                     );
                     let now_ms = now_ms();
-                    self.publish_update(&name, update, Some(now_ms), every).await;
+                    self.publish_update(&name, update, Some(now_ms), every)
+                        .await;
                 }
                 Err(e) => {
                     warn!(target: "feeds", name = %name, error = %e, "feed refresh failed");
@@ -285,6 +290,62 @@ impl FeedManager {
         if let Some(sink) = sink {
             sink.on_update(update).await;
         }
+    }
+
+    async fn publish_cache_snapshot_if_valid(
+        self: &Arc<Self>,
+        cache: &FeedDiskCache,
+        name: &str,
+        detail: &FeedDetail,
+        every: Duration,
+        phase: &'static str,
+    ) -> bool {
+        let meta = cache.load_meta(name);
+        if meta
+            .as_ref()
+            .and_then(|m| m.url_hash.as_deref())
+            .map(|hash| hash != url_digest(&detail.url))
+            .unwrap_or(false)
+        {
+            info!(target: "feeds", name = %name, phase, "url changed since last cache; forgetting");
+            cache.forget(name);
+            return false;
+        }
+
+        let Some(raw) = cache.load(name) else {
+            return false;
+        };
+        let nodes = self.parse_with_filter(detail, &raw);
+        let last_refreshed_ms = meta
+            .as_ref()
+            .map(|m| m.last_refreshed_ms)
+            .filter(|ms| *ms != 0);
+        let stale = meta
+            .as_ref()
+            .and_then(|m| m.elapsed())
+            .map(|elapsed| elapsed >= every)
+            .unwrap_or(true);
+        self.publish_update(
+            name,
+            FeedUpdate {
+                name: name.to_string(),
+                nodes: nodes.clone(),
+                from_cache: true,
+                raw_bytes: raw.len(),
+            },
+            last_refreshed_ms,
+            every,
+        )
+        .await;
+        info!(
+            target: "feeds",
+            name = %name,
+            phase,
+            cached_nodes = nodes.len(),
+            stale,
+            "loaded snapshot from cache"
+        );
+        true
     }
 
     fn update_next_due(&self, name: &str, last_ms: u64, every: Duration) {
@@ -350,7 +411,13 @@ impl FeedManager {
 fn clamp_interval(d: Duration) -> Duration {
     let min = Duration::from_secs(5 * 60);
     let max = Duration::from_secs(30 * 24 * 3600);
-    if d < min { min } else if d > max { max } else { d }
+    if d < min {
+        min
+    } else if d > max {
+        max
+    } else {
+        d
+    }
 }
 
 fn now_ms() -> u64 {
@@ -378,7 +445,7 @@ mod tests {
 
     fn tmp_root() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "rpkernel-feeds-mgr-test-{}",
+            "wuthercore-feeds-mgr-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -494,6 +561,36 @@ mod tests {
         assert!(s.last_node_count == 1);
         assert!(s.next_due_ms > s.last_refreshed_ms);
         mgr.stop();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cache_publishes_stale_snapshot_before_start() {
+        let dir = tmp_root();
+        let cache = FeedDiskCache::new(&dir).unwrap();
+        let url = "https://example.com/sub-stale";
+        let raw = b"ss://YWVzLTI1Ni1nY206cGFzcw==@1.1.1.1:8388#StaleCached";
+        let meta = FeedMeta {
+            last_refreshed_ms: now_ms().saturating_sub(2 * 60 * 60 * 1000),
+            raw_size: raw.len() as u64,
+            etag: None,
+            content_type: None,
+            url_hash: Some(url_digest(url)),
+        };
+        cache.save_with_meta("p", raw, &meta);
+
+        let mut feeds = BTreeMap::new();
+        feeds.insert("p".to_string(), detail(url, 3600));
+        let mgr = FeedManager::new(feeds, Some(cache));
+
+        let published = mgr.bootstrap_cache().await;
+
+        assert_eq!(published, 1);
+        let snapshot = mgr.snapshot("p").unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].name, "StaleCached");
+        let status = mgr.status("p").unwrap();
+        assert_eq!(status.last_node_count, 1);
+        assert!(status.last_from_cache);
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<WindowsTunIo>, TunIoError> {
         )
     })?;
     let adapter = wintun
-        .create_adapter(&plan.interface_name, "RPKernel")
+        .create_adapter(&plan.interface_name, "WutherCore")
         .ok_or_else(|| TunIoError::Open("WintunCreateAdapter 返回 NULL".into()))?;
     // capacity 0x400000（4MiB）；wintun 推荐 0x20000 .. 0x4000000。
     let session = Arc::new(adapter)
@@ -107,8 +107,7 @@ impl TunIo for WindowsTunIo {
                 return Ok(pkt.len());
             }
             if attempt < WRITE_RETRY {
-                tokio::time::sleep(std::time::Duration::from_micros(WRITE_RETRY_BACKOFF_US))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_micros(WRITE_RETRY_BACKOFF_US)).await;
             }
         }
         warn!(target: "capture::windows", retries = WRITE_RETRY, "wintun send ring full after backoff");
@@ -118,7 +117,54 @@ impl TunIo for WindowsTunIo {
         )))
     }
 
-    fn name(&self) -> &str { &self.name }
-    fn mtu(&self) -> u32 { self.mtu }
-    async fn close(&self) -> Result<(), TunIoError> { Ok(()) }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn mtu(&self) -> u32 {
+        self.mtu
+    }
+    async fn close(&self) -> Result<(), TunIoError> {
+        Ok(())
+    }
+
+    /// Windows wintun batch read —— 一次 lock 内：先 `recv().await` 等第一包，
+    /// 再 `try_recv()` drain 已入队的包，直到 channel 空或 bufs 满。
+    /// 摊销 mpsc + Mutex lock 开销；channel 容量 `RECV_QUEUE=2048` 足够。
+    async fn read_batch(
+        &self,
+        bufs: &mut [&mut [u8]],
+        sizes: &mut [usize],
+    ) -> Result<usize, TunIoError> {
+        let max = bufs.len().min(sizes.len());
+        if max == 0 {
+            return Ok(0);
+        }
+        let mut rx = self.rx.lock().await;
+
+        // 第一包：阻塞 await（与 read_packet 一致）
+        let first = rx.recv().await.ok_or_else(|| {
+            TunIoError::Read(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "wintun recv channel closed",
+            ))
+        })?;
+        let n0 = first.len().min(bufs[0].len());
+        bufs[0][..n0].copy_from_slice(&first[..n0]);
+        sizes[0] = n0;
+        let mut count = 1usize;
+
+        // 后续：try_recv drain
+        while count < max {
+            match rx.try_recv() {
+                Ok(pkt) => {
+                    let n = pkt.len().min(bufs[count].len());
+                    bufs[count][..n].copy_from_slice(&pkt[..n]);
+                    sizes[count] = n;
+                    count += 1;
+                }
+                Err(_) => break, // Empty 或 Disconnected
+            }
+        }
+        Ok(count)
+    }
 }

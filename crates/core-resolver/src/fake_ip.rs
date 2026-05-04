@@ -139,7 +139,7 @@ impl FakeIpPool {
         Some(ip)
     }
 
-    /// 反查：从 Fake IP 还原域名。仅返回未过期记录。
+    /// 反查：从 Fake IP 或 redir-host DNS mapping 还原域名。仅返回未过期记录。
     pub fn lookup(&self, ip: IpAddr) -> Option<String> {
         let entry = self.reverse.get(&ip)?;
         if entry.1 > Instant::now() {
@@ -147,6 +147,16 @@ impl FakeIpPool {
         } else {
             None
         }
+    }
+
+    /// 记录真实 DNS 应答的 IP → 域名映射，用于 redir-host/DNSMapping。
+    ///
+    /// 与 fake-ip 分配不同，这里不会写 forward 表，因此不会占用 fake 地址池；
+    /// 只提供后续 TUN/TPROXY 连接进来时的反查能力。
+    pub fn insert_mapping(&self, ip: IpAddr, host: &str, ttl: Duration) {
+        let ttl = ttl.max(Duration::from_secs(1));
+        self.reverse
+            .insert(ip, (host.to_lowercase(), Instant::now() + ttl));
     }
 
     /// 给定 IP 是否落在 Fake 池范围内（可用于 capture 判断走 fake 路径）。
@@ -182,6 +192,10 @@ impl FakeIpPool {
         self.forward.clear();
         self.reverse.clear();
         n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.forward.is_empty()
     }
 
     fn allocate_new(&self, family: AddressFamily) -> Option<IpAddr> {
@@ -243,6 +257,80 @@ impl FakeIpPool {
             return false;
         }
         !self.cfg.avoid.iter().any(|n| n.contains(&ip))
+    }
+}
+
+/* ---------- Fake-IP Filter (Skipper) ---------- */
+
+use core_config::model::FakeIpFilterMode;
+
+/// Domain-based filter to skip fake-IP for certain domains.
+///
+/// In blacklist mode (default), matched domains bypass fake-IP and get real resolution.
+/// In whitelist mode, only matched domains get fake-IP; all others use real resolution.
+#[derive(Debug)]
+pub struct FakeIpFilter {
+    matchers: Vec<FilterMatcher>,
+    mode: FakeIpFilterMode,
+}
+
+#[derive(Debug)]
+enum FilterMatcher {
+    Suffix(String),
+    Keyword(String),
+    Full(String),
+    Wildcard(String),
+}
+
+impl FakeIpFilter {
+    pub fn new(patterns: Vec<String>, mode: FakeIpFilterMode) -> Self {
+        let matchers = patterns.into_iter().map(|p| parse_filter_pattern(&p)).collect();
+        Self { matchers, mode }
+    }
+
+    pub fn should_skip(&self, domain: &str) -> bool {
+        let domain_lc = domain.to_lowercase();
+        let matched = self.matchers.iter().any(|m| match m {
+            FilterMatcher::Full(d) => domain_lc == *d,
+            FilterMatcher::Suffix(suffix) => {
+                domain_lc == *suffix || domain_lc.ends_with(&format!(".{suffix}"))
+            }
+            FilterMatcher::Keyword(kw) => domain_lc.contains(kw.as_str()),
+            FilterMatcher::Wildcard(base) => {
+                domain_lc.ends_with(base.as_str())
+            }
+        });
+        match self.mode {
+            FakeIpFilterMode::Blacklist => matched,
+            FakeIpFilterMode::Whitelist => !matched,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.matchers.is_empty()
+    }
+}
+
+fn parse_filter_pattern(p: &str) -> FilterMatcher {
+    let p = p.trim().to_lowercase();
+    if p.starts_with('+') || p.starts_with("*.") {
+        // +.example.com or *.example.com -> suffix match
+        let base = p.trim_start_matches('+').trim_start_matches('*').trim_start_matches('.');
+        FilterMatcher::Suffix(base.to_string())
+    } else if p.starts_with("keyword:") {
+        FilterMatcher::Keyword(p.trim_start_matches("keyword:").to_string())
+    } else if p.starts_with("full:") {
+        FilterMatcher::Full(p.trim_start_matches("full:").to_string())
+    } else if p.starts_with("domain:") || p.starts_with("suffix:") {
+        let base = p.split_once(':').map(|(_, v)| v).unwrap_or(&p);
+        FilterMatcher::Suffix(base.to_string())
+    } else if p.contains('*') {
+        // Wildcard like *.msftconnecttest.com -> treat as suffix for the non-star part
+        let base = p.trim_start_matches('*').trim_start_matches('.');
+        FilterMatcher::Wildcard(base.to_string())
+    } else {
+        // Plain domain treated as suffix match (mihomo semantics)
+        FilterMatcher::Suffix(p)
     }
 }
 
@@ -312,5 +400,47 @@ mod tests {
         };
         let pool = FakeIpPool::new(cfg);
         assert!(pool.alloc("a.com", AddressFamily::V4).is_none());
+    }
+
+    #[test]
+    fn filter_blacklist_basic() {
+        let filter = FakeIpFilter::new(
+            vec![
+                "dns.msftncsi.com".into(),
+                "+.msftconnecttest.com".into(),
+                "keyword:ntp".into(),
+            ],
+            FakeIpFilterMode::Blacklist,
+        );
+        assert!(filter.should_skip("dns.msftncsi.com"));
+        assert!(filter.should_skip("www.msftconnecttest.com"));
+        assert!(filter.should_skip("msftconnecttest.com"));
+        assert!(filter.should_skip("pool.ntp.org"));
+        assert!(!filter.should_skip("google.com"));
+    }
+
+    #[test]
+    fn filter_whitelist_basic() {
+        let filter = FakeIpFilter::new(
+            vec!["google.com".into(), "+.googleapis.com".into()],
+            FakeIpFilterMode::Whitelist,
+        );
+        // Whitelist: only matched domains should NOT be skipped
+        assert!(!filter.should_skip("google.com"));
+        assert!(!filter.should_skip("api.googleapis.com"));
+        // Non-matched: should be skipped (no fake-ip)
+        assert!(filter.should_skip("example.org"));
+    }
+
+    #[test]
+    fn filter_full_and_domain_prefix() {
+        let filter = FakeIpFilter::new(
+            vec!["full:exact.com".into(), "domain:suffix.io".into()],
+            FakeIpFilterMode::Blacklist,
+        );
+        assert!(filter.should_skip("exact.com"));
+        assert!(!filter.should_skip("sub.exact.com"));
+        assert!(filter.should_skip("suffix.io"));
+        assert!(filter.should_skip("sub.suffix.io"));
     }
 }

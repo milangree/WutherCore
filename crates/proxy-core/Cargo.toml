@@ -3,7 +3,7 @@ name = "proxy-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RPKernel CLI 入口 —— Friendly YAML 代理内核"
+description = "WutherCore CLI 入口 —— Friendly YAML 代理内核"
 
 [[bin]]
 name = "proxy-core"

@@ -124,7 +124,9 @@ fn append_common_headers(buf: &mut Vec<u8>, host: &str, rng: &mut impl Rng) {
     buf.extend_from_slice(lang.as_bytes());
     buf.extend_from_slice(b"\r\nAccept-Encoding: ");
     buf.extend_from_slice(enc.as_bytes());
-    buf.extend_from_slice(b"\r\nConnection: keep-alive\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n");
+    buf.extend_from_slice(
+        b"\r\nConnection: keep-alive\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n",
+    );
 }
 
 fn strip_port(host: &str) -> String {

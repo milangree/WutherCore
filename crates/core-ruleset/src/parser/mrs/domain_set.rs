@@ -24,9 +24,7 @@
 
 use std::io::Read;
 
-use super::bitmap::{
-    get_bit, index_select32_r64, rank64, select32_r64,
-};
+use super::bitmap::{get_bit, index_select32_r64, rank64, select32_r64};
 use crate::parser::ParseError;
 
 const COMPLEX_WILDCARD: u8 = b'+';
@@ -77,7 +75,13 @@ impl MrsDomainSet {
         read_full(r, &mut labels)?;
 
         let (selects, ranks) = index_select32_r64(&label_bitmap);
-        Ok(Self { leaves, label_bitmap, labels, ranks, selects })
+        Ok(Self {
+            leaves,
+            label_bitmap,
+            labels,
+            ranks,
+            selects,
+        })
     }
 
     /// 查询某个域名是否被规则集命中。等价于 mihomo `domain_set.go::Has`（L74）。
@@ -109,7 +113,8 @@ impl MrsDomainSet {
                     // 此位为 1 —— node 边界结束，没找到与 c 匹配的子节点。
                     if let Some(cursor) = stack.pop() {
                         // 回退到 wildcard 锚点：跳到下一个 node 后，找含 '.' 的边
-                        let next_node_id = count_zeros(&self.label_bitmap, &self.ranks, cursor.bm_idx + 1);
+                        let next_node_id =
+                            count_zeros(&self.label_bitmap, &self.ranks, cursor.bm_idx + 1);
                         let mut next_bm_idx = select_ith_one(
                             &self.label_bitmap,
                             &self.ranks,
@@ -162,7 +167,8 @@ impl MrsDomainSet {
             }
             // 跳到子节点
             node_id = count_zeros(&self.label_bitmap, &self.ranks, bm_idx + 1);
-            bm_idx = select_ith_one(&self.label_bitmap, &self.ranks, &self.selects, node_id - 1) + 1;
+            bm_idx =
+                select_ith_one(&self.label_bitmap, &self.ranks, &self.selects, node_id - 1) + 1;
             i += 1;
         }
         get_bit(&self.leaves, node_id as usize) != 0
@@ -205,9 +211,8 @@ fn select_ith_one(bm: &[u64], ranks: &[i32], selects: &[i32], i: i32) -> i32 {
 }
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), ParseError> {
-    r.read_exact(buf).map_err(|e| {
-        ParseError::Other(format!("MRS read_exact failed ({} bytes): {e}", buf.len()))
-    })
+    r.read_exact(buf)
+        .map_err(|e| ParseError::Other(format!("MRS read_exact failed ({} bytes): {e}", buf.len())))
 }
 
 fn read_i64_be<R: Read>(r: &mut R) -> Result<i64, ParseError> {

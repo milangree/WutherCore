@@ -10,9 +10,9 @@ fn user_stack_can_be_polled_with_listener() {
     let mut stack = UserSpaceStack::new(
         1500,
         Ipv4Address::new(198, 18, 0, 1),
-        Ipv6Address::new(0xfc00, 0, 1, 0, 0, 0, 0, 1),
+        Some(Ipv6Address::new(0xfc00, 0, 1, 0, 0, 0, 0, 1)),
     );
-    let _h = stack.add_tcp_listener(80);
+    stack.ensure_listener_for(80, 1);
     for _ in 0..3 {
         let _ = stack.poll();
     }

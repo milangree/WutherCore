@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::packet::{parse_ip_packet, L4};
+use crate::packet::{parse_tun_frame, L4};
 use crate::platform::macos_tun_io;
 use crate::route_table::{ManagedRoute, RouteTable};
 use crate::tun_io::TunIo;
@@ -34,9 +34,9 @@ pub fn list_interfaces() -> Vec<String> {
 pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, CaptureError> {
     match plan.kind {
         EngineKind::Tun => Ok(Arc::new(MacUtun::new(plan))),
-        EngineKind::Tproxy | EngineKind::Redirect => {
-            Err(CaptureError::Unsupported("macOS 不支持 tproxy/redirect".into()))
-        }
+        EngineKind::Tproxy | EngineKind::Redirect => Err(CaptureError::Unsupported(
+            "macOS 不支持 tproxy/redirect".into(),
+        )),
         EngineKind::None => Err(CaptureError::Unsupported("kind=None".into())),
     }
 }
@@ -108,8 +108,26 @@ impl CaptureEngine for MacUtun {
         if g.started {
             return Ok(());
         }
-        let device = macos_tun_io::open(&self.plan)
-            .map_err(|e| CaptureError::DeviceFailed(format!("open utun: {e}")))?;
+        let device: std::sync::Arc<dyn crate::tun_io::TunIo> = {
+            #[cfg(target_os = "ios")]
+            if let Some(fd) = crate::platform::ios_bridge::take_injected_fd() {
+                crate::platform::tunrs_io::from_fd(
+                    fd,
+                    self.plan.interface_name.clone(),
+                    self.plan.mtu,
+                )
+                .map(|d| d as std::sync::Arc<dyn crate::tun_io::TunIo>)
+                .map_err(|e| CaptureError::DeviceFailed(format!("tun-rs from fd: {e}")))?
+            } else {
+                crate::platform::tunrs_io::open(&self.plan)
+                    .map(|d| d as std::sync::Arc<dyn crate::tun_io::TunIo>)
+                    .map_err(|e| CaptureError::DeviceFailed(format!("tun-rs open: {e}")))?
+            }
+            #[cfg(not(target_os = "ios"))]
+            crate::platform::tunrs_io::open(&self.plan)
+                .map(|d| d as std::sync::Arc<dyn crate::tun_io::TunIo>)
+                .map_err(|e| CaptureError::DeviceFailed(format!("tun-rs open: {e}")))?
+        };
         let real_name = device.name().to_string();
         Self::configure(&self.plan, &real_name)?;
 
@@ -120,18 +138,15 @@ impl CaptureEngine for MacUtun {
                 gateway: None,
                 interface: real_name.clone(),
                 metric: 0,
+                table: None,
             });
         }
 
-        // 用户态栈模式下让 TunDispatcher 独占 TUN，避免与 packet_loop 抢读。
-        let user_stack_active = matches!(
-            self.plan.stack,
-            core_config::model::CaptureStack::Gvisor
-                | core_config::model::CaptureStack::Mixed
-                | core_config::model::CaptureStack::Smoltcp
-        );
+        // utun 的事件级 packet_loop 只发现流，不能转发 payload。
+        // virtual_nic 始终由 CaptureSupervisor 的 TunDispatcher 独占读写。
+        let dispatcher_owns_tun = true;
         let (stop_tx, stop_rx) = oneshot::channel();
-        if !user_stack_active {
+        if !dispatcher_owns_tun {
             let dev_for_loop = device.clone();
             let mtu = self.plan.mtu as usize;
             let handle = tokio::spawn(async move {
@@ -149,7 +164,7 @@ impl CaptureEngine for MacUtun {
             target: "capture",
             iface = %real_name,
             mtu = self.plan.mtu,
-            user_stack_active,
+            dispatcher_owns_tun,
             "macos utun started"
         );
         Ok(())
@@ -201,8 +216,8 @@ async fn packet_loop(
                         break;
                     }
                 };
-                let parsed = match parse_ip_packet(&buf[..n]) {
-                    Ok(p) => p,
+                let parsed = match parse_tun_frame(&buf[..n]) {
+                    Ok(p) => p.packet,
                     Err(_) => continue,
                 };
                 let net = match parsed.l4 {

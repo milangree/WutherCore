@@ -19,17 +19,41 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use core_observe::{copy_bidirectional_tracked, ConnectionMeta};
+use core_observe::ConnectionGuard;
+use core_outbound::adapter::BoxedUdp;
+use core_runtime::{InboundMetadata, ListenerHandler};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::engine::{CaptureError, CaptureEvent};
+use crate::udp_session::UdpFlowKey;
 
 const SO_ORIGINAL_DST: libc::c_int = 80;
+
+type TproxyUdpSessionTable = Arc<DashMap<UdpFlowKey, Arc<TproxyUdpSession>>>;
+
+struct TproxyUdpSession {
+    socket: BoxedUdp,
+    guard: ConnectionGuard,
+    return_socket: Arc<UdpSocket>,
+    target_host: String,
+    target_port: u16,
+    peer: SocketAddr,
+    last_seen: Mutex<Instant>,
+}
+
+impl TproxyUdpSession {
+    fn touch(&self) {
+        *self.last_seen.lock() = Instant::now();
+    }
+}
 
 /// 启动一个 TPROXY TCP listener；accept 后立即 dial 出站并双向 splice，
 /// 同时推一条事件给 supervisor 用于 NAT / 调试日志。
@@ -78,57 +102,22 @@ pub async fn run_tcp_tproxy(
         tokio::spawn(async move {
             let host = original_dst.ip().to_string();
             let port = original_dst.port();
-            match runtime
-                .dial(&host, port, core_route::NetworkKind::Tcp)
-                .await
-            {
-                Ok(mut res) => {
-                    // 注册 ConnectionTable —— 让 dashboard 看见 TPROXY 连接，
-                    // 并把 DELETE /connections/:id 路由到 cancel.notify_waiters()。
-                    let meta = ConnectionMeta {
-                        network: "tcp".into(),
-                        kind: "TPROXY".into(),
-                        source_ip: peer.ip().to_string(),
-                        source_port: peer.port().to_string(),
-                        destination_ip: original_dst.ip().to_string(),
-                        destination_port: original_dst.port().to_string(),
-                        inbound_ip: bind_local.ip().to_string(),
-                        inbound_port: bind_local.port().to_string(),
-                        inbound_name: "tproxy".into(),
-                        host: original_dst.ip().to_string(),
-                        dns_mode: "normal".into(),
-                        remote_destination: res.remote_destination.clone(),
-                        smart_target: res.smart_target.clone(),
-                        chains: res.chain.clone(),
-                        provider_chains: res.provider_chains.clone(),
-                        rule: res.rule.clone(),
-                        rule_payload: res.rule_payload.clone(),
-                        ..ConnectionMeta::default()
-                    };
-                    let guard = runtime.connections.open(meta);
-                    let conn_id = guard.id;
-                    let accounting = guard.accounting();
-                    let metrics = runtime.metrics.clone();
-                    metrics.inc_connection();
-                    let mut inbound = stream;
-                    let result = copy_bidirectional_tracked(
-                        &mut inbound,
-                        &mut res.stream,
-                        accounting,
-                        Some(metrics.clone()),
-                    )
-                    .await;
-                    metrics.dec_connection();
-                    if let Err(e) = result {
+            let handler = ListenerHandler::new(runtime);
+            let metadata =
+                InboundMetadata::tcp("tproxy", "TPROXY", peer, bind_local, host.clone(), port)
+                    .with_destination_ip(Some(original_dst.ip()))
+                    .with_route_ip(Some(original_dst.ip()));
+            match handler.prepare_tcp(metadata).await {
+                Ok(prepared) => {
+                    let outbound = prepared.result.outbound.clone();
+                    if let Err(e) = handler.relay_prepared_tcp(stream, prepared).await {
                         debug!(
                             target: "capture::tproxy",
-                            conn_id,
-                            %host, port, outbound = %res.outbound,
+                            %host, port, outbound = %outbound,
                             error = %e,
                             "splice ended (inbound/outbound EOF or error)"
                         );
                     }
-                    drop(guard); // 显式 drop，确保 ConnectionTable 立刻清理
                 }
                 Err(e) => {
                     warn!(
@@ -148,6 +137,7 @@ pub async fn run_tcp_tproxy(
 pub async fn run_udp_tproxy(
     bind: SocketAddr,
     events: mpsc::Sender<CaptureEvent>,
+    runtime: Arc<core_runtime::Runtime>,
 ) -> Result<(), CaptureError> {
     let std_sock = std::net::UdpSocket::bind(bind)
         .map_err(|e| CaptureError::DeviceFailed(format!("bind udp {bind}: {e}")))?;
@@ -161,38 +151,313 @@ pub async fn run_udp_tproxy(
     }
     std_sock.set_nonblocking(true)?;
     let sock = Arc::new(UdpSocket::from_std(std_sock)?);
-    info!(target: "capture::tproxy", addr = %bind, "udp tproxy listening");
+    info!(target: "capture::tproxy", addr = %bind, "udp tproxy listening (handler.NewPacket)");
 
+    let handler = ListenerHandler::new(runtime);
+    let sessions: TproxyUdpSessionTable = Arc::new(DashMap::new());
+    let mut gc = tokio::time::interval(Duration::from_secs(30));
+    gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = vec![0u8; 65535];
     loop {
-        // 异步等可读，然后调原始 recvmsg 把 cmsg 一并拿出来。
-        sock.readable().await?;
-        let r = sock.try_io(tokio::io::Interest::READABLE, || {
-            recvmsg_with_origdst(sock.as_raw_fd(), &mut buf)
-        });
-        let (n, peer, original_dst) = match r {
-            Ok((n, peer, dst)) => (n, peer, dst),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => {
-                warn!(target: "capture::tproxy", error = %e, "recvmsg failed");
-                continue;
+        tokio::select! {
+            _ = gc.tick() => {
+                let removed = purge_tproxy_udp_sessions(&sessions, Duration::from_secs(90));
+                if removed > 0 {
+                    debug!(target: "capture::tproxy", removed, remaining = sessions.len(), "udp session gc");
+                }
             }
-        };
-        let _ = &buf[..n]; // payload —— 由 supervisor.dial 之外的 forwarder 处理
-        let evt = CaptureEvent {
-            original_dst: original_dst.unwrap_or(peer),
-            source: peer,
-            network: "udp",
-            fake_host: None,
-        };
-        if events.send(evt).await.is_err() {
-            break;
+            ready = sock.readable() => {
+                ready?;
+                let r = sock.try_io(tokio::io::Interest::READABLE, || {
+                    recvmsg_with_origdst(sock.as_raw_fd(), &mut buf)
+                });
+                let (n, peer, original_dst) = match r {
+                    Ok((n, peer, dst)) => (n, peer, dst.unwrap_or(peer)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => {
+                        warn!(target: "capture::tproxy", error = %e, "recvmsg failed");
+                        continue;
+                    }
+                };
+                if n == 0 {
+                    continue;
+                }
+                let payload = buf[..n].to_vec();
+                let evt = CaptureEvent {
+                    original_dst,
+                    source: peer,
+                    network: "udp",
+                    fake_host: None,
+                };
+                let _ = events.try_send(evt);
+
+                let key = UdpFlowKey { src: peer, dst: original_dst };
+                if let Some(session) = sessions.get(&key).map(|s| s.value().clone()) {
+                    match session
+                        .socket
+                        .send_to(&payload, &session.target_host, session.target_port)
+                        .await
+                    {
+                        Ok(_) => {
+                            handler.record_upload(&session.guard, n as u64);
+                            session.touch();
+                        }
+                        Err(e) => {
+                            debug!(target: "capture::tproxy", error = %e, "udp reuse send failed; remove session");
+                            remove_tproxy_udp_session(&sessions, &key);
+                        }
+                    }
+                    continue;
+                }
+
+                let target_host = original_dst.ip().to_string();
+                let target_port = original_dst.port();
+                let metadata = InboundMetadata::udp(
+                    "tproxy",
+                    "TPROXY",
+                    peer,
+                    Some(bind),
+                    target_host.clone(),
+                    target_port,
+                )
+                .with_destination_ip(Some(original_dst.ip()))
+                .with_route_ip(Some(original_dst.ip()));
+                let prepared = match handler.new_packet(metadata).await {
+                    Ok(prepared) => prepared,
+                    Err(e) => {
+                        debug!(
+                            target: "capture::tproxy",
+                            %target_host,
+                            target_port,
+                            error = %e,
+                            "udp dial failed"
+                        );
+                        continue;
+                    }
+                };
+                let return_socket = match bind_transparent_udp(original_dst) {
+                    Ok(sock) => Arc::new(sock),
+                    Err(e) => {
+                        warn!(
+                            target: "capture::tproxy",
+                            %original_dst,
+                            error = %e,
+                            "udp transparent return socket bind failed"
+                        );
+                        continue;
+                    }
+                };
+                let session = Arc::new(TproxyUdpSession {
+                    socket: prepared.socket,
+                    guard: prepared.guard,
+                    return_socket,
+                    target_host: prepared.target_host,
+                    target_port: prepared.target_port,
+                    peer,
+                    last_seen: Mutex::new(Instant::now()),
+                });
+                sessions.insert(key, session.clone());
+                spawn_tproxy_udp_return_loop(key, sessions.clone(), session.clone(), handler.runtime().metrics.clone());
+                match session
+                    .socket
+                    .send_to(&payload, &session.target_host, session.target_port)
+                    .await
+                {
+                    Ok(_) => {
+                        handler.record_upload(&session.guard, n as u64);
+                        session.touch();
+                    }
+                    Err(e) => {
+                        debug!(
+                            target: "capture::tproxy",
+                            host = %session.target_host,
+                            port = session.target_port,
+                            error = %e,
+                            "udp first send failed"
+                        );
+                        remove_tproxy_udp_session(&sessions, &key);
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
+fn spawn_tproxy_udp_return_loop(
+    key: UdpFlowKey,
+    sessions: TproxyUdpSessionTable,
+    session: Arc<TproxyUdpSession>,
+    metrics: Arc<core_observe::Metrics>,
+) {
+    tokio::spawn(async move {
+        metrics.inc_connection();
+        let cancel = session.guard.cancel.clone();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                _ = cancel.notified() => break,
+                r = session.socket.recv_from(&mut buf) => {
+                    let n = match r {
+                        Ok(n) => n,
+                        Err(e) => {
+                            debug!(target: "capture::tproxy", error = %e, "udp outbound recv ended");
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    if let Err(e) = session.return_socket.send_to(&buf[..n], session.peer).await {
+                        warn!(
+                            target: "capture::tproxy",
+                            peer = %session.peer,
+                            error = %e,
+                            "udp transparent return failed"
+                        );
+                        break;
+                    }
+                    session.guard.record_download(n as u64);
+                    metrics.add_down(n as u64);
+                    session.touch();
+                }
+            }
+        }
+        remove_tproxy_udp_session(&sessions, &key);
+        metrics.dec_connection();
+    });
+}
+
+fn remove_tproxy_udp_session(sessions: &TproxyUdpSessionTable, key: &UdpFlowKey) {
+    if let Some((_, session)) = sessions.remove(key) {
+        session.guard.cancel.notify_waiters();
+    }
+}
+
+fn purge_tproxy_udp_sessions(sessions: &TproxyUdpSessionTable, idle: Duration) -> usize {
+    let cutoff = Instant::now() - idle;
+    let keys: Vec<UdpFlowKey> = sessions
+        .iter()
+        .filter_map(|entry| {
+            let last_seen = *entry.value().last_seen.lock();
+            if last_seen < cutoff {
+                Some(*entry.key())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let removed = keys.len();
+    for key in keys {
+        remove_tproxy_udp_session(sessions, &key);
+    }
+    removed
+}
+
 /* ---------------- unsafe 区 ---------------- */
+
+#[allow(unsafe_code)]
+fn bind_transparent_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        set_reuse_addr_port(fd)?;
+        set_ip_transparent(fd)?;
+        bind_udp_fd(fd, addr)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if let Err(e) = result {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(e);
+    }
+    let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    std_sock.set_nonblocking(true)?;
+    UdpSocket::from_std(std_sock)
+}
+
+#[allow(unsafe_code)]
+fn set_reuse_addr_port(fd: RawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn bind_udp_fd(fd: RawFd, addr: SocketAddr) -> std::io::Result<()> {
+    let rc = match addr {
+        SocketAddr::V4(v4) => {
+            let raw = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &raw as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            let raw = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &raw as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 #[allow(unsafe_code)]
 fn set_ip_transparent(fd: RawFd) -> std::io::Result<()> {
@@ -319,7 +584,10 @@ fn sockaddr_storage_to_socket_addr(s: &libc::sockaddr_storage) -> Option<SocketA
         // SAFETY: 当 ss_family=AF_INET 时 layout 是 sockaddr_in。
         let v4: &libc::sockaddr_in = unsafe { &*(s as *const _ as *const libc::sockaddr_in) };
         let ip = Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr));
-        Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(v4.sin_port))))
+        Some(SocketAddr::V4(SocketAddrV4::new(
+            ip,
+            u16::from_be(v4.sin_port),
+        )))
     } else if family == libc::AF_INET6 {
         // SAFETY: 同理。
         let v6: &libc::sockaddr_in6 = unsafe { &*(s as *const _ as *const libc::sockaddr_in6) };

@@ -19,8 +19,7 @@ pub const VALIDATION_TOLERANCE: i32 = 2;
 /// HPACK base62 字符集 Huffman 平均比例（实测约 0.8 字节/字符）
 const AVG_HUFFMAN_BYTES_PER_CHAR_BASE62: f64 = 0.8;
 
-const CHARSET_BASE62: &[u8] =
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const CHARSET_BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaddingMethod {

@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::adapter::{resolve_host, BoxedStream};
+use crate::loopback::TrackedTcpStream;
 use crate::transport::{tcp::marked_connect, TlsOptions, Transport};
 
 #[derive(Debug, Clone)]
@@ -23,20 +24,18 @@ impl TlsTransport {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         // 显式指定 ring provider，避免 0.23 多 feature 引入时全局默认歧义导致 panic。
-        let mut cfg = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("rustls ring default protocols")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let mut cfg =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("rustls ring default protocols")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         if !options.alpn.is_empty() {
             cfg.alpn_protocols = options.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
         }
         if options.insecure {
-            cfg.dangerous()
-                .set_certificate_verifier(Arc::new(NoVerify));
+            cfg.dangerous().set_certificate_verifier(Arc::new(NoVerify));
         }
         Self {
             options,
@@ -49,11 +48,21 @@ impl TlsTransport {
 impl Transport for TlsTransport {
     async fn connect(&self, host: &str, port: u16) -> std::io::Result<BoxedStream> {
         let started = std::time::Instant::now();
+        // SNI 优先级：配置的 sni > host（仅当 host 是域名时）。
+        // host 是 IP 时不能作为 SNI（rustls 拒绝 IP 字符串作为 ServerName）。
+        // 对标 mihomo：IP 目标 + 无 sni 配置 → 用 insecure 模式（不发 SNI）。
         let sni_str: String = self
             .options
             .sni
             .clone()
-            .unwrap_or_else(|| host.to_string());
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if host.parse::<std::net::IpAddr>().is_ok() {
+                    String::new()
+                } else {
+                    host.to_string()
+                }
+            });
         tracing::debug!(
             target: "dial::tls",
             %host, port,
@@ -62,19 +71,27 @@ impl Transport for TlsTransport {
             alpn = ?self.options.alpn,
             "begin",
         );
-        let dns: ServerName<'static> = ServerName::try_from(sni_str.clone()).map_err(|e| {
-            tracing::warn!(target: "dial::tls", sni = %sni_str, error = %e, "invalid SNI");
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("非法 SNI: {sni_str} ({e})"),
-            )
-        })?;
-        // 同 TcpTransport：先 resolve 走 RPKernel resolver，避免 TUN 死循环。
+        let dns: ServerName<'static> = if sni_str.is_empty() {
+            // 无 SNI：用 IP 直连（需要 insecure 或服务器不验证 SNI）
+            ServerName::try_from(host.to_string()).unwrap_or_else(|_| {
+                // IP 地址无法作为 ServerName，用 "localhost" 占位 + insecure
+                ServerName::try_from("localhost".to_string()).unwrap()
+            })
+        } else {
+            ServerName::try_from(sni_str.clone()).map_err(|e| {
+                tracing::warn!(target: "dial::tls", sni = %sni_str, error = %e, "invalid SNI");
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("非法 SNI: {sni_str} ({e})"),
+                )
+            })?
+        };
+        // 同 TcpTransport：先 resolve 走 WutherCore resolver，避免 TUN 死循环。
         let addrs = resolve_host(host, port).await?;
         let mut last_err: Option<std::io::Error> = None;
         let mut tried = 0usize;
         let tcp = {
-            let mut chosen: Option<TcpStream> = None;
+            let mut chosen: Option<TrackedTcpStream<TcpStream>> = None;
             let mut chosen_peer: Option<std::net::SocketAddr> = None;
             for addr in addrs {
                 tried += 1;

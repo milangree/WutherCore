@@ -44,9 +44,15 @@ pub struct RulesetSpec {
     pub via: String,
 }
 
-fn default_type() -> RulesetType { RulesetType::Domain }
-fn default_every() -> Duration { Duration::from_secs(24 * 3600) }
-fn default_via() -> String { "direct".into() }
+fn default_type() -> RulesetType {
+    RulesetType::Domain
+}
+fn default_every() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+fn default_via() -> String {
+    "direct".into()
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

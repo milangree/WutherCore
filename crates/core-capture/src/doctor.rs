@@ -46,18 +46,22 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
     if let Some(ts) = mesh.tailscale.as_ref() {
         if ts.on && !ts.keep_tailnet_direct {
             warnings.push(
-                "Tailscale 已启用但 keep_tailnet_direct=false，可能导致 Tailnet 被代理"
-                    .into(),
+                "Tailscale 已启用但 keep_tailnet_direct=false，可能导致 Tailnet 被代理".into(),
             );
         }
     }
-    if interfaces.iter().any(|n| n.starts_with("tailscale") || n == "ts0" || n == "Tailscale") {
+    if interfaces
+        .iter()
+        .any(|n| n.starts_with("tailscale") || n == "ts0" || n == "Tailscale")
+    {
         if !plan
             .exclude_cidrs
             .iter()
             .any(|n| n.to_string() == "100.64.0.0/10")
         {
-            blockers.push("检测到 tailscale0 接口，但 capture.exclude.cidr 未包含 100.64.0.0/10".into());
+            blockers.push(
+                "检测到 tailscale0 接口，但 capture.exclude.cidr 未包含 100.64.0.0/10".into(),
+            );
         }
     }
 
@@ -80,9 +84,8 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
         }
     }
     if !plan.route_addresses.is_empty() && plan.strict_route {
-        warnings.push(
-            "route_address 白名单 + strict_route 同时启用：白名单外的目标全部被 drop".into(),
-        );
+        warnings
+            .push("route_address 白名单 + strict_route 同时启用：白名单外的目标全部被 drop".into());
     }
     if !c.tun.include_uid.is_empty() && !cfg!(any(target_os = "linux", target_os = "android")) {
         warnings.push("include_uid / exclude_uid 仅在 Linux/Android 生效".into());

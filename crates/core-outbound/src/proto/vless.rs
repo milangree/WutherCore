@@ -79,12 +79,7 @@ pub struct VlessOutbound {
 }
 
 impl VlessOutbound {
-    pub fn new(
-        name: impl Into<String>,
-        host: impl Into<String>,
-        port: u16,
-        uuid: Uuid,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, host: impl Into<String>, port: u16, uuid: Uuid) -> Self {
         Self {
             name: name.into(),
             host: host.into(),
@@ -116,16 +111,15 @@ impl VlessOutbound {
                 }
             }
             VlessNetwork::Ws => {
-                let ws = self
-                    .ws
-                    .clone()
-                    .unwrap_or_else(|| WsOptions {
-                        enabled: true,
-                        path: "/".into(),
-                        host: None,
-                        headers: vec![],
-                    });
-                WsTransport::new(ws, self.tls).connect(&self.host, self.port).await
+                let ws = self.ws.clone().unwrap_or_else(|| WsOptions {
+                    enabled: true,
+                    path: "/".into(),
+                    host: None,
+                    headers: vec![],
+                });
+                WsTransport::new(ws, self.tls)
+                    .connect(&self.host, self.port)
+                    .await
             }
             VlessNetwork::Http => {
                 let opts = self.http.clone().unwrap_or_default();
@@ -157,10 +151,19 @@ impl VlessOutbound {
 
 #[async_trait]
 impl OutboundAdapter for VlessOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "vless" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "vless"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: false, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {

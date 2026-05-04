@@ -12,7 +12,10 @@ pub struct DomainBest {
 
 impl DomainBest {
     pub fn new(ttl: Duration) -> Self {
-        Self { map: DashMap::new(), ttl }
+        Self {
+            map: DashMap::new(),
+            ttl,
+        }
     }
 
     pub fn key(group: &str, etld: &str) -> String {
@@ -28,7 +31,8 @@ impl DomainBest {
     }
 
     pub fn put(&self, key: &str, node: &str) {
-        self.map.insert(key.to_string(), (node.to_string(), Instant::now()));
+        self.map
+            .insert(key.to_string(), (node.to_string(), Instant::now()));
     }
 }
 
@@ -40,7 +44,9 @@ pub struct NegativeCache {
 
 impl Default for NegativeCache {
     fn default() -> Self {
-        Self { map: DashMap::new() }
+        Self {
+            map: DashMap::new(),
+        }
     }
 }
 

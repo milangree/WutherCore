@@ -21,15 +21,13 @@ use crate::parser::{mrs, ParseError};
 pub fn parse_mrs(body: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
     let payload = mrs::parse(body)?;
     match payload {
-        mrs::MrsPayload::Domain { count, .. } => {
-            Err(ParseError::UnsupportedBinary(Box::leak(
-                format!(
-                    "MRS domain set 含 {count} 条域名，无法无损展开成 ClassicalEntry；\
+        mrs::MrsPayload::Domain { count, .. } => Err(ParseError::UnsupportedBinary(Box::leak(
+            format!(
+                "MRS domain set 含 {count} 条域名，无法无损展开成 ClassicalEntry；\
                      请通过 manager 的 `parse_ruleset_compiled` 路径加载（自动走 succinct trie）。"
-                )
-                .into_boxed_str(),
-            )))
-        }
+            )
+            .into_boxed_str(),
+        ))),
         mrs::MrsPayload::IpCidr { set, .. } => {
             // 把 IpRange 转成 CIDR 列表 —— 仅在罕见的"老 API 直接读 mrs"路径用到，
             // 性能不是关键。
@@ -70,7 +68,11 @@ fn v4_range_to_cidrs(mut from: u32, to: u32) -> Vec<ipnet::Ipv4Net> {
     let mut out = Vec::new();
     while from <= to {
         // 当前 from 能对齐的最大块 = 2^trailing_zeros(from)；同时不能越过 to。
-        let max_size = if from == 0 { 32 } else { from.trailing_zeros().min(32) };
+        let max_size = if from == 0 {
+            32
+        } else {
+            from.trailing_zeros().min(32)
+        };
         // 简化版：取 max_size，再循环把 prefix 抬到不溢出 to 为止
         let mut prefix = 32 - max_size;
         // 校正：保证当前 CIDR 末尾 <= to
@@ -108,7 +110,11 @@ fn v4_range_to_cidrs(mut from: u32, to: u32) -> Vec<ipnet::Ipv4Net> {
 fn v6_range_to_cidrs(mut from: u128, to: u128) -> Vec<ipnet::Ipv6Net> {
     let mut out = Vec::new();
     while from <= to {
-        let max_size = if from == 0 { 128 } else { from.trailing_zeros().min(128) };
+        let max_size = if from == 0 {
+            128
+        } else {
+            from.trailing_zeros().min(128)
+        };
         let mut prefix: u32 = 128 - max_size;
         loop {
             let block: u128 = if 128 - prefix >= 128 {
@@ -172,10 +178,7 @@ mod tests {
         let to = u32::from(std::net::Ipv4Addr::new(192, 168, 1, 20));
         let nets = v4_range_to_cidrs(from, to);
         // 应覆盖整个范围
-        let covered: u64 = nets
-            .iter()
-            .map(|n| 1u64 << (32 - n.prefix_len()))
-            .sum();
+        let covered: u64 = nets.iter().map(|n| 1u64 << (32 - n.prefix_len())).sum();
         assert_eq!(covered, (to - from + 1) as u64);
     }
 }

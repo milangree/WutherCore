@@ -3,7 +3,7 @@ name = "core-ruleset"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RPKernel 外部规则集 —— mihomo / sing-box / 自定义格式"
+description = "WutherCore 外部规则集 —— mihomo / sing-box / 自定义格式"
 
 [dependencies]
 serde       = { workspace = true }

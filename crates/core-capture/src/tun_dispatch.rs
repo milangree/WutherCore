@@ -4,7 +4,7 @@
 //! * 平台 engine 仅做"看到流就 emit CaptureEvent"（轻量探测）；
 //! * 本模块负责 *接管* TUN：读包 → 解析 → 按协议路由：
 //!   - TCP → 注入 [`UserSpaceStack`]，由其终结后通过 [`SpliceManager`] 与
-//!     `runtime.dial` 的 outbound stream 双向 splice；
+//!     `ListenerHandler` 的 outbound stream 双向 splice；
 //!   - UDP → 调 [`udp_send_one`] 发出，并 spawn [`run_return_loop`] 处理回包；
 //!   - 其它协议（ICMP）默认丢弃（M4 后续可选回环）。
 //!
@@ -12,20 +12,28 @@
 //! 时启用本派发，并把平台 engine 自带的轻量 emit loop 关掉避免重复。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use core_runtime::Runtime;
+use core_runtime::{ListenerHandler, Runtime};
 use parking_lot::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
-use tracing::{debug, warn};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, info, trace, warn};
 
 use crate::eim_nat::EimNatTable;
 use crate::engine::CapturePlan;
-use crate::nat::{NatEntry, NatTable};
-use crate::packet::{parse_ip_packet, L4};
+use crate::frame_cache::{write_ip_packets_to_tun_batch, TunFrameFormatCache};
+use crate::nat::NatTable;
+use crate::packet::parse_tun_frame;
 use crate::stack::{AcceptedTcp, SharedStack, SpliceManager, UserSpaceStack};
+use crate::tun_inbound::{build_inbound_metadata, TunDropReason, TunInbound, TunPacket};
 use crate::tun_io::TunIo;
-use crate::udp_forwarder::{run_return_loop, send_one as udp_send_one, UdpForwarderConfig};
+
+use crate::tun_pump::{
+    TrafficLog as TunTrafficLogState, PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES,
+    TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL, TUN_TRAFFIC_SUMMARY_INTERVAL,
+};
 
 pub struct TunDispatcher {
     pub plan: CapturePlan,
@@ -37,9 +45,13 @@ pub struct TunDispatcher {
     /// supervisor 持有的 fake-IP 池 —— TUN 内 DNS hijack 直接用，避免
     /// 把 53 流量再经 127.0.0.1:5454 中转（中转包根本不会到达）。
     pub fake_pool: Arc<core_resolver::FakeIpPool>,
+    /// DNS hijack 的统一处理链。它内部对接 resolver policy/cache/fake-ip。
+    pub dns_service: Arc<core_resolver::DnsService>,
+    pub inbound: Arc<TunInbound>,
     /// 5-tuple → outbound socket 复用表 —— 同一 QUIC/STUN session 的所有包
     /// 走同一个 outbound socket，与 mihomo `endpoint_independent_nat` 行为对齐。
     pub udp_sessions: Arc<crate::udp_session::UdpSessionTable>,
+    frame_formats: Arc<TunFrameFormatCache>,
 }
 
 impl TunDispatcher {
@@ -48,13 +60,19 @@ impl TunDispatcher {
         nat: Arc<NatTable>,
         eim: Arc<EimNatTable>,
         fake_pool: Arc<core_resolver::FakeIpPool>,
+        dns_service: Arc<core_resolver::DnsService>,
+        ipset: Arc<dyn crate::ipset::IpSetProvider>,
     ) -> Self {
+        let v6_addr = plan
+            .tun_v6_cidr
+            .map(|c| smoltcp::wire::Ipv6Address(c.addr().octets()));
         let stack = Arc::new(Mutex::new(UserSpaceStack::new(
             plan.mtu as usize,
             smoltcp::wire::Ipv4Address(plan.tun_v4_cidr.addr().octets()),
-            smoltcp::wire::Ipv6Address(plan.tun_v6_cidr.addr().octets()),
+            v6_addr,
         )));
         let idle = plan.udp_timeout;
+        let inbound = Arc::new(TunInbound::new(plan.clone(), fake_pool.clone(), ipset));
         Self {
             plan,
             stack,
@@ -63,13 +81,19 @@ impl TunDispatcher {
             nat,
             eim,
             fake_pool,
+            dns_service,
+            inbound,
             udp_sessions: Arc::new(crate::udp_session::UdpSessionTable::new(idle)),
+            frame_formats: Arc::new(TunFrameFormatCache::new(
+                TUN_FRAME_FORMAT_TTL,
+                TUN_FRAME_FORMAT_MAX_ENTRIES,
+            )),
         }
     }
 
     /// 启动派发循环 —— spawn 多个 task：
     /// 1. **stack driver**：从 TUN 读包 → user_stack.inject + poll；
-    /// 2. **accept consumer**：处理 ESTABLISHED TCP，触发 runtime.dial + splice；
+    /// 2. **accept consumer**：处理 ESTABLISHED TCP，触发 ListenerHandler + splice；
     /// 3. **udp tap**：另一条 TUN 读路径专门处理 UDP（与 stack 共享 TUN 设备时
     ///    必须使用复用方案 —— 本实现采用单 reader + 协议分发，见 `pump_loop`）。
     pub fn start(
@@ -77,6 +101,21 @@ impl TunDispatcher {
         device: Arc<dyn TunIo>,
         runtime: Arc<Runtime>,
     ) -> TunDispatcherHandles {
+        let summary = crate::tun_logging::root_tun_summary(&self.plan);
+        info!(
+            target: "capture::tun",
+            iface = %device.name(),
+            stack = %summary.stack,
+            mtu = summary.mtu,
+            hijack_dns = summary.hijack_dns,
+            route_mode = summary.route_mode,
+            route_address_count = summary.route_address_count,
+            route_address_set_count = summary.route_address_set_count,
+            route_exclude_count = summary.route_exclude_count,
+            route_exclude_set_count = summary.route_exclude_set_count,
+            udp_timeout_ms = self.plan.udp_timeout.as_millis() as u64,
+            "tun dispatcher starting"
+        );
         let (stop_tx_pump, stop_rx_pump) = oneshot::channel();
         let (stop_tx_accept, stop_rx_accept) = oneshot::channel();
         let (stop_tx_stack, stop_rx_stack) = oneshot::channel();
@@ -92,11 +131,13 @@ impl TunDispatcher {
         let stack_dev = device.clone();
         let stack_for_driver = self.stack.clone();
         let notify_for_driver = self.notify.clone();
+        let frame_formats_for_driver = self.frame_formats.clone();
         let stack_handle = tokio::spawn(async move {
             run_stack_driver(
                 stack_dev,
                 stack_for_driver,
                 notify_for_driver,
+                frame_formats_for_driver,
                 tcp_in_rx,
                 accept_tx,
                 stop_rx_stack,
@@ -104,20 +145,24 @@ impl TunDispatcher {
             .await;
         });
 
-        // Accept consumer：fake-IP 反查 + dial outbound + spawn splice。
-        let runtime_for_accept = runtime.clone();
+        let handler = Arc::new(ListenerHandler::new(runtime.clone()));
+
+        // Accept consumer：fake-IP 反查 + handler.NewConnection + spawn splice。
         let stack_for_accept = self.stack.clone();
         let notify_for_accept = self.notify.clone();
         let splices = self.splices.clone();
-        let fake_pool_for_accept = self.fake_pool.clone();
+        let inbound_for_accept = self.inbound.clone();
+        let dns_service_for_accept = self.dns_service.clone();
+        let handler_for_accept = handler.clone();
         let accept_handle = tokio::spawn(async move {
             run_accept_consumer(
                 accept_rx,
                 stack_for_accept,
                 notify_for_accept,
                 splices,
-                runtime_for_accept,
-                fake_pool_for_accept,
+                handler_for_accept,
+                inbound_for_accept,
+                dns_service_for_accept,
                 stop_rx_accept,
             )
             .await;
@@ -125,243 +170,256 @@ impl TunDispatcher {
 
         // pump_loop：TUN reader + 协议分发。
         let me = self.clone();
-        let runtime_for_pump = runtime.clone();
+        let handler_for_pump = handler.clone();
         let pump_handle = tokio::spawn(async move {
-            me.pump_loop(device, runtime_for_pump, tcp_in_tx, stop_rx_pump).await;
+            me.pump_loop(device, handler_for_pump, tcp_in_tx, stop_rx_pump)
+                .await;
         });
+
+        // 周期 GC：清理过期 UDP session。TCP 由 smoltcp 自治。
+        let (gc_handle, stop_tx_gc) =
+            crate::gc::spawn_tun_gc(self.udp_sessions.clone(), self.plan.udp_timeout);
 
         TunDispatcherHandles {
             pump_handle,
             stack_handle,
             accept_handle,
+            gc_handle,
             stop_pump: Some(stop_tx_pump),
             stop_stack: Some(stop_tx_stack),
             stop_accept: Some(stop_tx_accept),
+            stop_gc: Some(stop_tx_gc),
         }
     }
 
     async fn pump_loop(
         self: Arc<Self>,
         device: Arc<dyn TunIo>,
-        runtime: Arc<Runtime>,
+        handler: Arc<ListenerHandler>,
         tcp_in_tx: mpsc::Sender<(Vec<u8>, u16)>,
         mut stop_rx: oneshot::Receiver<()>,
     ) {
         let mtu = self.plan.mtu as usize;
-        let mut buf = vec![0u8; mtu + 64];
-        let cfg = UdpForwarderConfig {
-            endpoint_independent_nat: self.plan.endpoint_independent_nat,
-            udp_timeout: self.plan.udp_timeout,
-        };
+        let buf_cap = mtu + 64;
+        let mut storage: Vec<Vec<u8>> = (0..PUMP_BATCH_N).map(|_| vec![0u8; buf_cap]).collect();
+        let mut sizes = [0usize; PUMP_BATCH_N];
+        let iface = device.name().to_string();
+        let summary = crate::tun_logging::root_tun_summary(&self.plan);
+        let mut traffic = TunTrafficLogState::new(Instant::now());
+        let mut log_tick = tokio::time::interval(TUN_IDLE_LOG_INTERVAL);
+        log_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        info!(
+            target: "capture::tun",
+            iface = %iface,
+            mtu,
+            batch = PUMP_BATCH_N,
+            stack = %summary.stack,
+            auto_route = summary.auto_route,
+            auto_redirect = summary.auto_redirect,
+            strict_route = summary.strict_route,
+            route_mode = summary.route_mode,
+            "tun pump loop started"
+        );
         loop {
-            tokio::select! {
+            let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+            let count = tokio::select! {
                 _ = &mut stop_rx => break,
-                r = device.read_packet(&mut buf) => {
-                    let n = match r {
+                _ = log_tick.tick() => {
+                    drop(bufs);
+                    let now = Instant::now();
+                    if traffic.idle_warning_due(now, TUN_IDLE_LOG_INTERVAL) {
+                        warn!(
+                            target: "capture::tun",
+                            iface = %iface,
+                            elapsed_ms = now.duration_since(traffic.started_at).as_millis() as u64,
+                            auto_route = summary.auto_route,
+                            auto_redirect = summary.auto_redirect,
+                            strict_route = summary.strict_route,
+                            route_mode = summary.route_mode,
+                            table = summary.table,
+                            rule_priority = summary.rule_priority,
+                            "tun dispatcher has not read any packet"
+                        );
+                    } else if traffic.summary_due(now, TUN_TRAFFIC_SUMMARY_INTERVAL) {
+                        info!(
+                            target: "capture::traffic",
+                            "{}",
+                            traffic.format_summary(&iface)
+                        );
+                    }
+                    continue;
+                }
+                r = device.read_batch(&mut bufs, &mut sizes) => {
+                    match r {
                         Ok(n) => n,
                         Err(e) => {
                             warn!(target: "capture::dispatch", error = %e, "tun read failed");
                             break;
                         }
-                    };
-                    let pkt_bytes = buf[..n].to_vec();
-                    let parsed = match parse_ip_packet(&pkt_bytes) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    // loopback 排除 / route_address 过滤 —— supervisor 已经在 dispatch
-                    // 层做过；这里再守一层避免 user-stack 接管不该接管的流量。
-                    let dst_ip = parsed.ip.dst;
-                    if self.plan.loopback_addresses.contains(&dst_ip)
-                        || self.plan.route_exclude_addresses.iter().any(|n| n.contains(&dst_ip))
-                    {
-                        continue;
-                    }
-                    if !self.plan.route_addresses.is_empty()
-                        && !self.plan.route_addresses.iter().any(|n| n.contains(&dst_ip))
-                    {
-                        continue;
-                    }
-                    match parsed.l4 {
-                        L4::Tcp(t) => {
-                            // 把整包 + 真实目标端口丢给 user stack；
-                            // stack driver 据此动态创建 listener。
-                            let _ = tcp_in_tx.send((pkt_bytes, t.dst_port)).await;
-                            self.notify.notify_one();
-                        }
-                        L4::Udp(u) => {
-                            let payload_off = parsed.l4_payload_offset(&parsed.l4);
-                            let payload_len = parsed.l4_payload_len(&parsed.l4);
-                            let payload = pkt_bytes[payload_off..payload_off + payload_len].to_vec();
-                            let inner_src = std::net::SocketAddr::new(parsed.ip.src, u.src_port);
-                            let outer_dst = std::net::SocketAddr::new(parsed.ip.dst, u.dst_port);
-                            self.handle_udp(&cfg, &device, &runtime, inner_src, outer_dst, payload).await;
-                        }
-                        L4::Other(_) => continue, // ICMP / ICMPv6 暂不处理
                     }
                 }
+            };
+            drop(bufs);
+
+            for i in 0..count {
+                let raw_frame = &storage[i][..sizes[i]];
+                self.process_one_ip_packet(
+                    raw_frame,
+                    &device,
+                    &handler,
+                    &tcp_in_tx,
+                    &iface,
+                    &mut traffic,
+                )
+                .await;
+            }
+        }
+        info!(
+            target: "capture::tun",
+            iface = %iface,
+            packets = traffic.read_packets,
+            bytes = traffic.read_bytes,
+            tcp_packets = traffic.tcp_packets,
+            udp_packets = traffic.udp_packets,
+            other_packets = traffic.other_packets,
+            dns_packets = traffic.dns_packets,
+            dropped_packets = traffic.dropped_packets,
+            unparsable_packets = traffic.unparsable_packets,
+            "tun pump loop stopped"
+        );
+    }
+
+    /// 处理 1 个 IP 包 —— 从 pump_loop 抽出，方便 batch 路径循环调用。
+    /// smoltcp 路径不在原地改写，所以 raw_frame 是 `&[u8]`。
+    async fn process_one_ip_packet(
+        &self,
+        raw_frame: &[u8],
+        device: &Arc<dyn TunIo>,
+        handler: &ListenerHandler,
+        tcp_in_tx: &mpsc::Sender<(Vec<u8>, u16)>,
+        iface: &str,
+        traffic: &mut TunTrafficLogState,
+    ) {
+        let n = raw_frame.len();
+        if traffic.record_read(n) {
+            info!(
+                target: "capture::traffic",
+                iface = %iface,
+                bytes = n,
+                "first tun packet read"
+            );
+        }
+        let parsed_frame = match parse_tun_frame(raw_frame) {
+            Ok(p) => p,
+            Err(e) => {
+                traffic.record_unparsable();
+                if traffic.should_log_unparsable_detail() {
+                    debug!(
+                        target: "capture::traffic",
+                        bytes = n,
+                        error = %e,
+                        head = %hex_head(raw_frame, 24),
+                        "drop unparsable tun frame"
+                    );
+                }
+                return;
+            }
+        };
+        let parsed = parsed_frame.packet;
+        self.frame_formats.observe(&parsed, parsed_frame.format);
+        let pkt_bytes = parsed_frame.ip_packet(raw_frame).to_vec();
+        debug!(
+            target: "capture::traffic",
+            bytes = n,
+            ip_bytes = pkt_bytes.len(),
+            frame = ?parsed_frame.format,
+            ip_offset = parsed_frame.ip_offset,
+            src = %parsed.ip.src,
+            dst = %parsed.ip.dst,
+            "tun packet read"
+        );
+        let packet = match self.inbound.classify_packet(&parsed) {
+            Ok(packet) => packet,
+            Err(reason) => {
+                traffic.record_drop();
+                debug!(
+                    target: "capture::tun",
+                    src = %parsed.ip.src,
+                    dst = %parsed.ip.dst,
+                    ?reason,
+                    "packet skipped by TUN inbound policy"
+                );
+                return;
+            }
+        };
+        match packet {
+            TunPacket::Tcp { dst_port, .. } => {
+                traffic.record_tcp();
+                debug!(
+                    target: "capture::traffic",
+                    dst_port,
+                    bytes = n,
+                    "dispatch tcp packet to user stack"
+                );
+                let _ = tcp_in_tx.send((pkt_bytes, dst_port)).await;
+                self.notify.notify_one();
+            }
+            TunPacket::Udp {
+                source,
+                destination,
+                payload_offset,
+                payload_len,
+                ..
+            } => {
+                traffic.record_udp();
+                if self.inbound.should_hijack_dns(destination) {
+                    traffic.record_dns();
+                }
+                let payload_off = payload_offset;
+                let payload = pkt_bytes[payload_off..payload_off + payload_len].to_vec();
+                debug!(
+                    target: "capture::traffic",
+                    network = "udp",
+                    src = %source,
+                    dst = %destination,
+                    payload_len,
+                    "dispatch udp packet"
+                );
+                self.handle_udp(device, handler, source, destination, payload)
+                    .await;
+            }
+            TunPacket::Other => {
+                traffic.record_other();
+                traffic.record_drop();
+                debug!(
+                    target: "capture::traffic",
+                    src = %parsed.ip.src,
+                    dst = %parsed.ip.dst,
+                    "drop unsupported non-tcp-udp packet"
+                );
             }
         }
     }
 
+    /// UDP 派发委托给 [`udp_handle::handle_udp_packet`]，与 SystemDispatcher 共用同一实现。
     async fn handle_udp(
         &self,
-        _cfg: &UdpForwarderConfig,
         device: &Arc<dyn TunIo>,
-        runtime: &Arc<Runtime>,
+        handler: &ListenerHandler,
         inner_src: std::net::SocketAddr,
         outer_dst: std::net::SocketAddr,
         payload: Vec<u8>,
     ) {
-        // NAT 表登记（仅记账；session 复用走 udp_sessions）
-        let now = std::time::Instant::now();
-        let _ = self.nat.insert(NatEntry {
-            source: inner_src,
-            original_dst: outer_dst,
-            fake_host: None,
-            network: "udp",
-            created_at: now,
-            last_seen: now,
-        });
-
-        // [1] 53 + hijack_dns → 内联拼 fake-IP 应答，写回 TUN，不出网。
-        if outer_dst.port() == 53 && self.plan.hijack_dns {
-            let resp = crate::fakeip_dns::synthesize(&payload, &self.fake_pool);
-            if !resp.is_empty() {
-                if let Some(pkt) =
-                    crate::udp_forwarder::build_udp_ip_packet(outer_dst, inner_src, &resp)
-                {
-                    if let Err(e) = device.write_packet(&pkt).await {
-                        warn!(target: "capture::dns", error = %e, "fake-dns write back failed");
-                    }
-                }
-            }
-            return;
-        }
-
-        // [2] 5-tuple 命中既有 session → 复用 socket，仅 send + 续 last_seen。
-        let key = crate::udp_session::UdpFlowKey { src: inner_src, dst: outer_dst };
-        if let Some(session) = self.udp_sessions.lookup(&key) {
-            let n = payload.len();
-            match session
-                .socket
-                .send_to(&payload, &session.target_host, session.target_port)
-                .await
-            {
-                Ok(_) => {
-                    session
-                        .guard
-                        .up
-                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                    runtime.metrics.add_up(n as u64);
-                    session.touch();
-                }
-                Err(e) => {
-                    debug!(target: "capture::udp", error = %e, "reuse send failed; remove session");
-                    self.udp_sessions.remove(&key);
-                }
-            }
-            return;
-        }
-
-        // [3] 首包：先 fake-IP 反查再 dial outbound → 注册 session → spawn reverse loop（仅 1 次）。
-        let target = crate::dial_meta::build_dial_target(&self.fake_pool, outer_dst, None);
-        if target.fake_ip_missing {
-            warn!(
-                target: "capture::udp",
-                ip = %outer_dst.ip(),
-                port = outer_dst.port(),
-                "udp fake DNS record missing; drop (与 mihomo 一致)"
-            );
-            return;
-        }
-        let host = target.host.clone();
-        let port = target.original_dst_port;
-        let res = match runtime.dial_udp(&host, port).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(target: "capture::udp", %host, port, error = %e, "udp dial failed");
-                return;
-            }
+        let ctx = crate::udp_handle::UdpDispatchCtx {
+            nat: self.nat.clone(),
+            udp_sessions: self.udp_sessions.clone(),
+            inbound: self.inbound.clone(),
+            dns_service: self.dns_service.clone(),
+            frame_formats: self.frame_formats.clone(),
         };
-        let meta = core_observe::ConnectionMeta {
-            network: "udp".into(),
-            kind: "Tun".into(),
-            source_ip: inner_src.ip().to_string(),
-            source_port: inner_src.port().to_string(),
-            destination_ip: outer_dst.ip().to_string(), // 保留原始 fake-IP
-            destination_port: outer_dst.port().to_string(),
-            inbound_name: "tun".into(),
-            host: target.host.clone(),               // 真实 domain
-            dns_mode: target.dns_mode.as_str().into(), // "fake-ip" / "normal"
-            remote_destination: res.remote_destination.clone(),
-            smart_target: res.smart_target.clone(),
-            chains: res.chain.clone(),
-            provider_chains: res.provider_chains.clone(),
-            rule: res.rule.clone(),
-            rule_payload: res.rule_payload.clone(),
-            ..core_observe::ConnectionMeta::default()
-        };
-        let guard = runtime.connections.open(meta);
-        let session = Arc::new(crate::udp_session::UdpSession {
-            socket: res.socket,
-            guard,
-            target_host: host.clone(),
-            target_port: port,
-            last_seen: parking_lot::Mutex::new(std::time::Instant::now()),
-        });
-        // 首包发送（先 insert 再 send，避免回包先到时找不到 session 把响应丢掉）
-        self.udp_sessions.insert(key, session.clone());
-        let n = payload.len();
-        if let Err(e) = session
-            .socket
-            .send_to(&payload, &session.target_host, session.target_port)
-            .await
-        {
-            debug!(target: "capture::udp", %host, port, error = %e, "first send failed");
-            self.udp_sessions.remove(&key);
-            return;
-        }
-        session.guard.record_upload(n as u64);
-        runtime.metrics.add_up(n as u64);
-
-        // reverse loop：1 个 session 对应 1 条
-        let dev = device.clone();
-        let metrics = runtime.metrics.clone();
-        let sessions = self.udp_sessions.clone();
-        let session_for_loop = session.clone();
-        tokio::spawn(async move {
-            metrics.inc_connection();
-            let cancel = session_for_loop.guard.cancel.clone();
-            let mut buf = vec![0u8; 65535];
-            loop {
-                tokio::select! {
-                    _ = cancel.notified() => break,
-                    r = session_for_loop.socket.recv_from(&mut buf) => {
-                        let n = match r { Ok(n) => n, Err(_) => break };
-                        if n == 0 { break }
-                        // src=outer_dst（让 app 端 socket 接收），dst=inner_src
-                        let pkt = match crate::udp_forwarder::build_udp_ip_packet(
-                            outer_dst, inner_src, &buf[..n],
-                        ) {
-                            Some(b) => b,
-                            None => continue,
-                        };
-                        if let Err(e) = dev.write_packet(&pkt).await {
-                            warn!(target: "capture::udp", error = %e, "tun write failed");
-                            break;
-                        }
-                        session_for_loop.guard.record_download(n as u64);
-                        metrics.add_down(n as u64);
-                        session_for_loop.touch();
-                    }
-                }
-            }
-            sessions.remove(&key);
-            metrics.dec_connection();
-            // session_for_loop 退出作用域 → Arc 引用减 1；若表里也已移除，
-            // ConnectionGuard drop → /connections 同步消失。
-        });
+        crate::udp_handle::handle_udp_packet(&ctx, device, handler, inner_src, outer_dst, payload)
+            .await;
     }
 }
 
@@ -369,9 +427,11 @@ pub struct TunDispatcherHandles {
     pump_handle: tokio::task::JoinHandle<()>,
     stack_handle: tokio::task::JoinHandle<()>,
     accept_handle: tokio::task::JoinHandle<()>,
+    gc_handle: tokio::task::JoinHandle<()>,
     stop_pump: Option<oneshot::Sender<()>>,
     stop_stack: Option<oneshot::Sender<()>>,
     stop_accept: Option<oneshot::Sender<()>>,
+    stop_gc: Option<oneshot::Sender<()>>,
 }
 
 impl TunDispatcherHandles {
@@ -385,9 +445,13 @@ impl TunDispatcherHandles {
         if let Some(tx) = self.stop_accept.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.stop_gc.take() {
+            let _ = tx.send(());
+        }
         self.pump_handle.abort();
         self.stack_handle.abort();
         self.accept_handle.abort();
+        self.gc_handle.abort();
     }
 }
 
@@ -397,6 +461,7 @@ async fn run_stack_driver(
     device: Arc<dyn TunIo>,
     stack: SharedStack,
     notify: Arc<Notify>,
+    frame_formats: Arc<TunFrameFormatCache>,
     mut tcp_in_rx: mpsc::Receiver<(Vec<u8>, u16)>,
     accept_tx: mpsc::Sender<AcceptedTcp>,
     mut stop_rx: oneshot::Receiver<()>,
@@ -423,10 +488,11 @@ async fn run_stack_driver(
                 for evt in accepted {
                     let _ = accept_tx.try_send(evt);
                 }
-                for pkt in outs {
-                    if let Err(e) = device.write_packet(&pkt).await {
-                        warn!(target: "capture::stack", error = %e, "tun write failed");
-                    }
+                if let Err(e) =
+                    write_ip_packets_to_tun_batch(&device, &frame_formats, outs, "capture::stack")
+                        .await
+                {
+                    warn!(target: "capture::stack", error = %e, "tun write batch failed");
                 }
             }
             _ = notify.notified() => {
@@ -436,10 +502,11 @@ async fn run_stack_driver(
                     let _ = s.poll();
                     outs = s.drain_outbound();
                 }
-                for pkt in outs {
-                    if let Err(e) = device.write_packet(&pkt).await {
-                        warn!(target: "capture::stack", error = %e, "tun write failed (notify)");
-                    }
+                if let Err(e) =
+                    write_ip_packets_to_tun_batch(&device, &frame_formats, outs, "capture::stack")
+                        .await
+                {
+                    warn!(target: "capture::stack", error = %e, "tun write batch failed (notify)");
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(20)) => {
@@ -449,9 +516,13 @@ async fn run_stack_driver(
                     let _ = s.poll();
                     outs = s.drain_outbound();
                 }
-                for pkt in outs {
-                    let _ = device.write_packet(&pkt).await;
-                }
+                let _ = write_ip_packets_to_tun_batch(
+                    &device,
+                    &frame_formats,
+                    outs,
+                    "capture::stack",
+                )
+                .await;
             }
         }
     }
@@ -459,13 +530,49 @@ async fn run_stack_driver(
     let _ = device;
 }
 
+async fn read_initial_payload_for_sniff(
+    handle: smoltcp::iface::SocketHandle,
+    stack: SharedStack,
+    notify: Arc<Notify>,
+) -> Vec<u8> {
+    let mut stream = crate::stack::SmolStream::new(handle, stack, notify);
+    let mut buf = vec![0u8; 8192];
+    match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            buf.truncate(n);
+            buf
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn sniff_host_from_payload(payload: &[u8]) -> Option<String> {
+    match core_route::sniff_tcp(payload) {
+        core_route::L7Proto::Sni(host) if !host.is_empty() => Some(host),
+        _ => None,
+    }
+}
+
+fn hex_head(buf: &[u8], max: usize) -> String {
+    let mut out = String::new();
+    for (idx, b) in buf.iter().take(max).enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
 async fn run_accept_consumer(
     mut accept_rx: mpsc::Receiver<AcceptedTcp>,
     stack: SharedStack,
     notify: Arc<Notify>,
     splices: Arc<SpliceManager>,
-    runtime: Arc<Runtime>,
-    fake_pool: Arc<core_resolver::FakeIpPool>,
+    handler: Arc<ListenerHandler>,
+    inbound: Arc<TunInbound>,
+    dns_service: Arc<core_resolver::DnsService>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
     loop {
@@ -475,74 +582,164 @@ async fn run_accept_consumer(
                 let Some(ev) = ev else { break };
                 // ★ Fake-IP 反查（mihomo `tunnel.preHandleMetadata` 等价）：
                 //   把 198.18.x.y 反查回 "www.bilibili.com"，再喂给 outbound。
-                //   不反查会让 trojan/vmess 等代理服务器尝试连内部 fake-IP，
-                //   表象就是用户报告的"代理可联通但无法出站"。
-                let target = crate::dial_meta::build_dial_target(
-                    &fake_pool,
-                    ev.original_dst,
-                    None,
+                //   若 fake-IP 记录缺失，按 mihomo 的 TCP sniff fallback 尝试从
+                //   首段 TLS ClientHello 提取 SNI，避免缓存过期时直接断流。
+                let mut initial_payload = Vec::new();
+                let mut sniff_host = None;
+                let target_session = match inbound.resolve_session("tcp", ev.remote, ev.original_dst, None) {
+                    Ok(session) => session,
+                    Err(TunDropReason::FakeDnsMissing) => {
+                        initial_payload = read_initial_payload_for_sniff(
+                            ev.handle,
+                            stack.clone(),
+                            notify.clone(),
+                        ).await;
+                        sniff_host = sniff_host_from_payload(&initial_payload);
+                        match inbound.resolve_session(
+                            "tcp",
+                            ev.remote,
+                            ev.original_dst,
+                            sniff_host.as_deref(),
+                        ) {
+                            Ok(session) => session,
+                            Err(_) => {
+                                warn!(
+                                    target: "capture::accept",
+                                    ip = %ev.original_dst.ip(),
+                                    port = ev.original_dst.port(),
+                                    "fake DNS record missing and sniff failed; abort dial (与 mihomo 一致)"
+                                );
+                                let mut s = stack.lock();
+                                s.close_socket(ev.handle);
+                                notify.notify_one();
+                                continue;
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        debug!(
+                            target: "capture::accept",
+                            ?reason,
+                            dst = %ev.original_dst,
+                            "tcp session rejected"
+                        );
+                        let mut s = stack.lock();
+                        s.close_socket(ev.handle);
+                        notify.notify_one();
+                        continue;
+                    }
+                };
+                debug!(
+                    target: "capture::traffic",
+                    network = "tcp",
+                    src = %ev.remote,
+                    dst = %ev.original_dst,
+                    host = %target_session.target.host,
+                    port = target_session.target.original_dst_port,
+                    dns_mode = target_session.target.dns_mode.as_str(),
+                    bypass = ?target_session.bypass,
+                    handle = ?ev.handle,
+                    "tcp accepted -> ListenerHandler.NewConnection"
                 );
-                if target.fake_ip_missing {
-                    warn!(
-                        target: "capture::accept",
-                        ip = %ev.original_dst.ip(),
-                        port = ev.original_dst.port(),
-                        "fake DNS record missing; abort dial (与 mihomo 一致)"
+                if inbound.should_hijack_dns(target_session.original_dst) {
+                    info!(
+                        target: "capture::dns",
+                        network = "tcp",
+                        src = %ev.remote,
+                        dst = %ev.original_dst,
+                        host = %target_session.target.host,
+                        "dns tcp hijack handled in tun"
                     );
-                    let mut s = stack.lock();
-                    s.close_socket(ev.handle);
-                    notify.notify_one();
+                    handler.runtime().metrics.inc_dns();
+                    let stream = crate::stack::SmolStream::new(
+                        ev.handle,
+                        stack.clone(),
+                        notify.clone(),
+                    );
+                    if let Err(e) =
+                        crate::fakeip_dns::serve_tcp_stream(stream, dns_service.clone()).await
+                    {
+                        warn!(
+                            target: "capture::dns",
+                            error = %e,
+                            src = %ev.remote,
+                            dst = %ev.original_dst,
+                            "dns tcp hijack failed"
+                        );
+                    }
                     continue;
                 }
-                debug!(
-                    target: "capture::accept",
-                    host = %target.host,
-                    port = target.original_dst_port,
-                    dns_mode = target.dns_mode.as_str(),
-                    handle = ?ev.handle,
-                    "accept TCP -> dial outbound"
-                );
-                let dial_res = runtime
-                    .dial(&target.host, target.original_dst_port, core_route::NetworkKind::Tcp)
+                let inner = inbound.is_inner_source(ev.remote.ip());
+                let prepared = handler
+                    .prepare_tcp(build_inbound_metadata(&target_session, Some(ev.local), inner))
                     .await;
-                match dial_res {
-                    Ok(res) => {
-                        let meta = core_observe::ConnectionMeta {
-                            network: "tcp".into(),
-                            kind: "Tun".into(),
-                            source_ip: ev.remote.ip().to_string(),
-                            source_port: ev.remote.port().to_string(),
-                            destination_ip: ev.original_dst.ip().to_string(),
-                            destination_port: ev.original_dst.port().to_string(),
-                            inbound_ip: ev.local.ip().to_string(),
-                            inbound_port: ev.local.port().to_string(),
-                            inbound_name: "tun".into(),
-                            host: target.host.clone(),               // 真实 domain
-                            dns_mode: target.dns_mode.as_str().into(), // "fake-ip"/"normal"/...
-                            remote_destination: res.remote_destination.clone(),
-                            smart_target: res.smart_target.clone(),
-                            chains: res.chain.clone(),
-                            provider_chains: res.provider_chains.clone(),
-                            rule: res.rule.clone(),
-                            rule_payload: res.rule_payload.clone(),
-                            ..core_observe::ConnectionMeta::default()
-                        };
-                        let guard = runtime.connections.open(meta);
+                match prepared {
+                    Ok(prepared) => {
+                        let core_runtime::PreparedTcp { result, guard } = prepared;
+                        {
+                            let id = guard.id;
+                            let src = if inner { "WutherCore" } else { &ev.remote.to_string() };
+                            let host = &target_session.target.host;
+                            let port = target_session.target.original_dst_port;
+                            let proxy = if result.chain.len() > 1 {
+                                result.chain.join(" >> ")
+                            } else {
+                                result.outbound.clone()
+                            };
+                            if result.rule.is_empty() {
+                                info!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} using {proxy}");
+                            } else if result.rule_payload.is_empty() {
+                                info!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} match {} using {proxy}", result.rule);
+                            } else {
+                                info!(target: "capture::traffic", "[TCP] #{id} {src} --> {host}:{port} match {}({}) using {proxy}", result.rule, result.rule_payload);
+                            }
+                        }
+                        let mut stream = result.stream;
+                        if !initial_payload.is_empty() {
+                            if let Err(e) = stream.write_all(&initial_payload).await {
+                                warn!(
+                                    target: "capture::accept",
+                                    error = %e,
+                                    host = %target_session.target.host,
+                                    port = target_session.target.original_dst_port,
+                                    "write sniffed initial payload failed"
+                                );
+                                let mut s = stack.lock();
+                                s.close_socket(ev.handle);
+                                notify.notify_one();
+                                continue;
+                            }
+                            handler.record_upload(&guard, initial_payload.len() as u64);
+                            trace!(
+                                target: "capture::traffic",
+                                conn_id = guard.id,
+                                network = "tcp",
+                                upload = initial_payload.len(),
+                                "tcp sniffed initial payload replayed"
+                            );
+                        }
+                        if let Some(host) = sniff_host.as_deref() {
+                            debug!(
+                                target: "capture::accept",
+                                sniff_host = %host,
+                                "fake-ip missing recovered by TCP SNI sniff"
+                            );
+                        }
                         splices.spawn_splice(
                             ev.handle,
                             stack.clone(),
                             notify.clone(),
-                            res.stream,
+                            stream,
                             Some(guard),
-                            Some(runtime.metrics.clone()),
+                            Some(handler.runtime().metrics.clone()),
                         );
                     }
                     Err(e) => {
                         warn!(
                             target: "capture::accept",
                             error = %e,
-                            host = %target.host,
-                            port = target.original_dst_port,
+                            host = %target_session.target.host,
+                            port = target_session.target.original_dst_port,
                             "outbound dial failed"
                         );
                         let mut s = stack.lock();
@@ -553,4 +750,64 @@ async fn run_accept_consumer(
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tun_traffic_state_reports_idle_until_first_packet() {
+        let start = Instant::now();
+        let mut state = TunTrafficLogState::new(start);
+
+        assert!(!state.idle_warning_due(
+            start + TUN_IDLE_LOG_INTERVAL - Duration::from_millis(1),
+            TUN_IDLE_LOG_INTERVAL
+        ));
+        assert!(state.idle_warning_due(start + TUN_IDLE_LOG_INTERVAL, TUN_IDLE_LOG_INTERVAL));
+        assert!(!state.idle_warning_due(
+            start + TUN_IDLE_LOG_INTERVAL + Duration::from_millis(1),
+            TUN_IDLE_LOG_INTERVAL
+        ));
+
+        assert!(state.record_read(128));
+        assert!(!state.idle_warning_due(start + TUN_IDLE_LOG_INTERVAL * 2, TUN_IDLE_LOG_INTERVAL));
+    }
+
+    #[test]
+    fn tun_traffic_state_summarizes_only_new_packets_after_interval() {
+        let start = Instant::now();
+        let mut state = TunTrafficLogState::new(start);
+
+        assert!(state.record_read(64));
+        state.record_tcp();
+        assert!(!state.summary_due(
+            start + TUN_TRAFFIC_SUMMARY_INTERVAL - Duration::from_millis(1),
+            TUN_TRAFFIC_SUMMARY_INTERVAL
+        ));
+        assert!(state.summary_due(
+            start + TUN_TRAFFIC_SUMMARY_INTERVAL,
+            TUN_TRAFFIC_SUMMARY_INTERVAL
+        ));
+        assert!(!state.summary_due(
+            start + TUN_TRAFFIC_SUMMARY_INTERVAL * 2,
+            TUN_TRAFFIC_SUMMARY_INTERVAL
+        ));
+
+        assert!(!state.record_read(96));
+        state.record_udp();
+        state.record_dns();
+        assert!(state.summary_due(
+            start + TUN_TRAFFIC_SUMMARY_INTERVAL * 2,
+            TUN_TRAFFIC_SUMMARY_INTERVAL
+        ));
+        assert_eq!(state.read_packets, 2);
+        assert_eq!(state.read_bytes, 160);
+        assert_eq!(state.tcp_packets, 1);
+        assert_eq!(state.udp_packets, 1);
+        assert_eq!(state.dns_packets, 1);
+    }
+
+    // frame_format_cache 相关测试已迁移到 `frame_cache::tests`。
 }

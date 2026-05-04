@@ -17,7 +17,7 @@
 //! * 自动 keep-alive（每 25 秒 cookie reply 时刷新）
 //! * 多个 dial 共享同一 WG session
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,7 +35,10 @@ use parking_lot::Mutex as PlMutex;
 use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
+use crate::adapter::{
+    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    OutboundAdapter,
+};
 
 /* ---------------- 协议常量 ---------------- */
 
@@ -117,10 +120,19 @@ impl WireGuardOutbound {
 
 #[async_trait]
 impl OutboundAdapter for WireGuardOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "wireguard" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "wireguard"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -184,7 +196,9 @@ fn perform_handshake_initiator(
     ck = new_ck;
 
     // 8) timestamp (TAI64N) 加密
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let mut tai64n = [0u8; 12];
     tai64n[..8].copy_from_slice(&(now.as_secs() + 0x4000000000000000u64).to_be_bytes());
     tai64n[8..12].copy_from_slice(&(now.subsec_nanos()).to_be_bytes());
@@ -274,6 +288,7 @@ struct WgSession {
     /// 入站计数器（防重放）
     recv_counter: AtomicU64,
     udp: Arc<tokio::net::UdpSocket>,
+    _loopback_guard: crate::loopback::LoopbackUdpGuard,
     server_addr: SocketAddr,
     closed: std::sync::atomic::AtomicBool,
     /// smoltcp 接口（用于 IP 包路由到上层 TCP/UDP）
@@ -293,6 +308,7 @@ impl WgSession {
             "0.0.0.0:0".parse().unwrap()
         };
         let std_socket = std::net::UdpSocket::bind(bind)?;
+        let _loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
         std_socket.connect(server_addr)?;
         std_socket.set_nonblocking(false)?;
 
@@ -526,7 +542,13 @@ fn chacha20_seal(
     let mut nonce = [0u8; 12];
     nonce[4..12].copy_from_slice(&counter.to_le_bytes());
     cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| io_err("aead seal"))
 }
 
@@ -541,13 +563,23 @@ fn chacha20_open(
     let mut nonce = [0u8; 12];
     nonce[4..12].copy_from_slice(&counter.to_le_bytes());
     cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| io_err("aead open"))
 }
 
 /* ---------------- IO 辅助 ---------------- */
 
-fn udp_send_all(_socket: &tokio::net::UdpSocket, _buf: &[u8], _dst: SocketAddr) -> std::io::Result<()> {
+fn udp_send_all(
+    _socket: &tokio::net::UdpSocket,
+    _buf: &[u8],
+    _dst: SocketAddr,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -560,17 +592,8 @@ fn udp_recv_until_match(
 }
 
 async fn resolve_first(host: &str, port: u16) -> std::io::Result<SocketAddr> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    if let Ok(ip) = host.parse::<Ipv6Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| io_err(format!("dns lookup: {e}")))?
-        .collect();
-    addrs
+    resolve_host(host, port)
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| io_err("no addr resolved"))

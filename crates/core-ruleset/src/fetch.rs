@@ -1,9 +1,31 @@
 //! 规则集抓取 —— 与 core-feeds 同构（HTTP/HTTPS/file/本地路径）。
 
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// 注入带 SO_MARK + resolve_host 的 reqwest Client（从 core-runtime 调用）。
+pub fn set_shared_http_client(client: reqwest::Client) {
+    let _ = SHARED_CLIENT.set(client);
+}
+
+fn get_or_build_client(timeout: Duration) -> Result<reqwest::Client, FetchError> {
+    if let Some(c) = SHARED_CLIENT.get() {
+        return Ok(c.clone());
+    }
+    reqwest::Client::builder()
+        .user_agent(concat!("WutherCore-ruleset/", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .gzip(true)
+        .brotli(true)
+        .build()
+        .map_err(|e| FetchError::Http(e.to_string()))
+}
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -43,14 +65,7 @@ pub async fn fetch_ruleset(src: &str, timeout: Duration) -> Result<Vec<u8>, Fetc
         }
         return Err(FetchError::BadUrl(src.into()));
     }
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("RPKernel-ruleset/", env!("CARGO_PKG_VERSION")))
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(10))
-        .gzip(true)
-        .brotli(true)
-        .build()
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+    let client = get_or_build_client(timeout)?;
     info!(target: "ruleset::fetch", url = src, timeout_ms = timeout.as_millis() as u64, "begin");
     let resp = match client.get(src).send().await {
         Ok(r) => r,

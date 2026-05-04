@@ -66,7 +66,10 @@ pub fn sniff_udp(buf: &[u8]) -> L7Proto {
     // DTLS: RFC 6347 record layer
     //   byte0 ContentType: 20-25 (CCS/Alert/Handshake/AppData/Heartbeat)
     //   byte1-2 Version: 0xfeff (DTLS 1.0) / 0xfefd (DTLS 1.2) / 0xfefc (DTLS 1.3)
-    if (buf[0] >= 0x14 && buf[0] <= 0x19) && buf[1] == 0xfe && (buf[2] == 0xff || buf[2] == 0xfd || buf[2] == 0xfc) {
+    if (buf[0] >= 0x14 && buf[0] <= 0x19)
+        && buf[1] == 0xfe
+        && (buf[2] == 0xff || buf[2] == 0xfd || buf[2] == 0xfc)
+    {
         return L7Proto::Dtls;
     }
     // QUIC long header: byte0 bit7 = 1，version 4 字节非 0（draft & v1）
@@ -94,8 +97,15 @@ pub fn sniff_tcp(buf: &[u8]) -> L7Proto {
     }
     // HTTP 方法
     let prefixes: &[&[u8]] = &[
-        b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"CONNECT ",
-        b"OPTIONS ", b"PATCH ", b"TRACE ",
+        b"GET ",
+        b"POST ",
+        b"HEAD ",
+        b"PUT ",
+        b"DELETE ",
+        b"CONNECT ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"TRACE ",
     ];
     for p in prefixes {
         if buf.starts_with(p) {
@@ -124,19 +134,27 @@ fn parse_tls_sni(buf: &[u8]) -> Option<String> {
         return None;
     }
     let mut i: usize = 5 + 4 + 2 + 32; // skip handshake header + version + random
-    if i >= buf.len() { return None; }
+    if i >= buf.len() {
+        return None;
+    }
     // Session ID
     let sid_len = buf[i] as usize;
     i += 1 + sid_len;
-    if i + 2 > buf.len() { return None; }
+    if i + 2 > buf.len() {
+        return None;
+    }
     // Cipher Suites
     let cs_len = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
     i += 2 + cs_len;
-    if i + 1 > buf.len() { return None; }
+    if i + 1 > buf.len() {
+        return None;
+    }
     // Compression Methods
     let cm_len = buf[i] as usize;
     i += 1 + cm_len;
-    if i + 2 > buf.len() { return None; }
+    if i + 2 > buf.len() {
+        return None;
+    }
     // Extensions
     let ext_total = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
     i += 2;
@@ -154,12 +172,18 @@ fn parse_tls_sni(buf: &[u8]) -> Option<String> {
             //   1B name type (0=host_name)
             //   2B name length
             //   N  name bytes
-            if ext_len < 5 { return None; }
+            if ext_len < 5 {
+                return None;
+            }
             let _list_len = u16::from_be_bytes([buf[i], buf[i + 1]]);
             let name_type = buf[i + 2];
-            if name_type != 0 { return None; }
+            if name_type != 0 {
+                return None;
+            }
             let name_len = u16::from_be_bytes([buf[i + 3], buf[i + 4]]) as usize;
-            if i + 5 + name_len > buf.len() { return None; }
+            if i + 5 + name_len > buf.len() {
+                return None;
+            }
             let name = &buf[i + 5..i + 5 + name_len];
             return std::str::from_utf8(name).ok().map(String::from);
         }
@@ -192,10 +216,10 @@ mod tests {
     /// 真实 STUN binding request 头部（RFC 5389）
     fn stun_binding() -> Vec<u8> {
         let mut v = Vec::new();
-        v.extend_from_slice(&[0x00, 0x01, 0x00, 0x08]);     // type=Binding Request, len=8
-        v.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);     // magic cookie
-        v.extend_from_slice(&[0u8; 12]);                     // transaction id
-        v.extend_from_slice(&[0x00, 0x06, 0x00, 0x04]);     // attr USERNAME
+        v.extend_from_slice(&[0x00, 0x01, 0x00, 0x08]); // type=Binding Request, len=8
+        v.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
+        v.extend_from_slice(&[0u8; 12]); // transaction id
+        v.extend_from_slice(&[0x00, 0x06, 0x00, 0x04]); // attr USERNAME
         v.extend_from_slice(b"abcd");
         v
     }
@@ -204,15 +228,15 @@ mod tests {
     fn dtls_handshake() -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&[0x16, 0xfe, 0xfd, 0x00, 0x00]); // ContentType=22, ver=DTLS1.2, epoch=0
-        v.extend_from_slice(&[0u8; 16]);                       // seq + length placeholder
+        v.extend_from_slice(&[0u8; 16]); // seq + length placeholder
         v
     }
 
     /// QUIC v1 long header
     fn quic_initial() -> Vec<u8> {
         let mut v = Vec::new();
-        v.push(0xc0);                                           // long header, type=Initial
-        v.extend_from_slice(&0x00000001u32.to_be_bytes());      // version=1
+        v.push(0xc0); // long header, type=Initial
+        v.extend_from_slice(&0x00000001u32.to_be_bytes()); // version=1
         v.extend_from_slice(&[0u8; 8]);
         v
     }
@@ -243,8 +267,8 @@ mod tests {
         v.extend_from_slice(&[0x00, 0x00]); // type
         let inner_off = v.len();
         v.extend_from_slice(&[0, 0]); // length placeholder
-        // server_name list:
-        //   list_length(2)  name_type(1)  name_length(2)  name
+                                      // server_name list:
+                                      //   list_length(2)  name_type(1)  name_length(2)  name
         let list_payload_len = 1 + 2 + h.len();
         v.extend_from_slice(&(list_payload_len as u16).to_be_bytes());
         v.push(0x00); // host_name
@@ -285,7 +309,11 @@ mod tests {
 
     #[test]
     fn sniffs_http_methods() {
-        for m in ["GET / HTTP/1.1\r\n", "POST /a HTTP/1.1\r\n", "CONNECT host:443 HTTP/1.1\r\n"] {
+        for m in [
+            "GET / HTTP/1.1\r\n",
+            "POST /a HTTP/1.1\r\n",
+            "CONNECT host:443 HTTP/1.1\r\n",
+        ] {
             assert_eq!(sniff_tcp(m.as_bytes()), L7Proto::Http);
         }
     }

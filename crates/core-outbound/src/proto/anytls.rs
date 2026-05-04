@@ -141,12 +141,8 @@ impl AnyTlsOutbound {
         })
         .connect(&self.host, self.port)
         .await?;
-        let session = AnyTlsSession::new(
-            stream,
-            &self.password,
-            self.padding_scheme.clone(),
-        )
-        .await?;
+        let session =
+            AnyTlsSession::new(stream, &self.password, self.padding_scheme.clone()).await?;
         *guard = Some(session.clone());
         Ok(session)
     }
@@ -154,10 +150,19 @@ impl AnyTlsOutbound {
 
 #[async_trait]
 impl OutboundAdapter for AnyTlsOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "anytls" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "anytls"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: false, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {

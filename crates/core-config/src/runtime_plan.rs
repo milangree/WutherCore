@@ -22,6 +22,7 @@ pub struct RuntimePlan {
     pub version: u32,
     pub profile: Profile,
     pub name: String,
+    pub log: Option<Log>,
     pub listen: ListenPlan,
     pub feeds: BTreeMap<String, FeedDetail>,
     pub nodes: Vec<ParsedNode>,
@@ -32,6 +33,7 @@ pub struct RuntimePlan {
     pub smart: Smart,
     pub ui: Ui,
     pub mesh: Mesh,
+    pub find_process_mode: crate::model::FindProcessMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,14 +126,24 @@ pub enum RouteMatcher {
     Service(String),
     Domain(String),
     Suffix(String),
+    /// mihomo `DOMAIN-KEYWORD` —— 子串匹配（大小写不敏感）。
+    Keyword(String),
     Cidr(String),
     Port(u16),
+    /// `DST-PORT,LOW-HIGH` —— 闭区间端口范围。
+    PortRange(u16, u16),
     Network(String),
     Process(String),
     /// 外部规则集（route.sets.<name>）。
     Set(String),
     /// L7 协议指纹（stun/dtls/quic/tls/sni/http/webrtc）。
     Proto(String),
+    /// AND 组合 —— 所有子 matcher 都命中才算命中（短路求值）。
+    /// 由 typed-key object 形式中多个具名字段联合产生。
+    And(Vec<RouteMatcher>),
+    /// OR 组合 —— 任一子 matcher 命中即算命中（短路求值）。
+    /// 由具名字段的列表值产生（如 `port: [53, 5353]`）。
+    Or(Vec<RouteMatcher>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,10 +171,12 @@ pub fn compile(cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     let smart = cfg.smart.unwrap_or_default();
     let ui = cfg.ui.unwrap_or_default();
     let mesh = cfg.mesh.unwrap_or_default();
+    let find_process_mode = cfg.find_process_mode;
     Ok(RuntimePlan {
         version: cfg.version,
         profile: cfg.profile,
-        name: cfg.name.unwrap_or_else(|| "rpkernel".into()),
+        name: cfg.name.unwrap_or_else(|| "wuthercore".into()),
+        log: cfg.log,
         listen,
         feeds,
         nodes,
@@ -173,6 +187,7 @@ pub fn compile(cfg: UserConfig) -> ConfigResult<RuntimePlan> {
         smart,
         ui,
         mesh,
+        find_process_mode,
     })
 }
 
@@ -199,7 +214,11 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
             udp: true,
         },
         ListenLocal::Detail(d) => MixedListen {
-            host: if d.host.is_empty() { host_for(share).into() } else { d.host },
+            host: if d.host.is_empty() {
+                host_for(share).into()
+            } else {
+                d.host
+            },
             port: d.port,
             udp: d.udp,
         },
@@ -233,7 +252,12 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
     let auth = listen
         .auth
         .iter()
-        .filter_map(|s| s.split_once(':').map(|(u, p)| UserPass { user: u.into(), pass: p.into() }))
+        .filter_map(|s| {
+            s.split_once(':').map(|(u, p)| UserPass {
+                user: u.into(),
+                pass: p.into(),
+            })
+        })
         .collect();
 
     Ok(ListenPlan {
@@ -310,7 +334,12 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
     let port: u16 = port
         .parse()
         .map_err(|_| ConfigError::bad_node(format!("node {} 端口非法: {}", d.name, port)))?;
-    let mut node = ParsedNode::new(d.name.clone(), proto, host.trim_matches(|c| c == '[' || c == ']'), port);
+    let mut node = ParsedNode::new(
+        d.name.clone(),
+        proto,
+        host.trim_matches(|c| c == '[' || c == ']'),
+        port,
+    );
     if let Some(login) = &d.login {
         node.user = login.user.clone();
         node.password = login.password.clone();
@@ -329,9 +358,13 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
     Ok(node)
 }
 
-fn compile_groups(cfg: &UserConfig, nodes: &[ParsedNode]) -> ConfigResult<BTreeMap<String, GroupPlan>> {
+fn compile_groups(
+    cfg: &UserConfig,
+    nodes: &[ParsedNode],
+) -> ConfigResult<BTreeMap<String, GroupPlan>> {
     let mut out = BTreeMap::new();
-    let valid_feeds: std::collections::HashSet<&str> = cfg.feeds.keys().map(|s| s.as_str()).collect();
+    let valid_feeds: std::collections::HashSet<&str> =
+        cfg.feeds.keys().map(|s| s.as_str()).collect();
     for (name, g) in &cfg.groups {
         let mut members = Vec::new();
         for src in &g.r#use {
@@ -356,14 +389,14 @@ fn compile_groups(cfg: &UserConfig, nodes: &[ParsedNode]) -> ConfigResult<BTreeM
                 .map(|s| s.to_string())
                 .chain(std::iter::once("nodes".into()))
                 .collect();
-            return Err(ConfigError::unknown_ref(format!(
-                "groups.{name}.use 引用了 \"{src}\""
-            ))
-            .at(format!("groups.{name}"))
-            .hint(format!(
-                "可用来源只有 {} 或具体的 node 名",
-                valid.join("、")
-            )));
+            return Err(
+                ConfigError::unknown_ref(format!("groups.{name}.use 引用了 \"{src}\""))
+                    .at(format!("groups.{name}"))
+                    .hint(format!(
+                        "可用来源只有 {} 或具体的 node 名",
+                        valid.join("、")
+                    )),
+            );
         }
         out.insert(
             name.clone(),
@@ -387,7 +420,11 @@ fn compile_route(
     groups: &BTreeMap<String, GroupPlan>,
     sets: BTreeMap<String, RuleSetSpec>,
 ) -> ConfigResult<RoutePlan> {
-    let preset = if route.preset.is_empty() { "cn_smart".to_string() } else { route.preset };
+    let preset = if route.preset.is_empty() {
+        "cn_smart".to_string()
+    } else {
+        route.preset
+    };
     let mut steps = Vec::new();
 
     let final_target = route.r#final.clone();
@@ -398,52 +435,76 @@ fn compile_route(
         .hint("把 final 改为已有分组名，或新增 groups.<name>"));
     }
 
-    match preset.as_str() {
+    let fallback = match preset.as_str() {
         "cn_smart" => {
-            steps.push(rs(RouteMatcher::Home, RouteAction::Direct, "preset:cn_smart home"));
-            steps.push(rs(RouteMatcher::Cn, RouteAction::Direct, "preset:cn_smart cn"));
             steps.push(rs(
+                RouteMatcher::Home,
+                RouteAction::Direct,
+                "preset:cn_smart home",
+            ));
+            steps.push(rs(
+                RouteMatcher::Cn,
+                RouteAction::Direct,
+                "preset:cn_smart cn",
+            ));
+            Some(rs(
                 RouteMatcher::Any,
                 RouteAction::Group(final_target.clone()),
                 "preset:cn_smart any",
-            ));
+            ))
         }
         "global" => {
-            steps.push(rs(RouteMatcher::Home, RouteAction::Direct, "preset:global home"));
             steps.push(rs(
+                RouteMatcher::Home,
+                RouteAction::Direct,
+                "preset:global home",
+            ));
+            Some(rs(
                 RouteMatcher::Any,
                 RouteAction::Group(final_target.clone()),
                 "preset:global any",
-            ));
+            ))
         }
-        "direct" => {
-            steps.push(rs(RouteMatcher::Any, RouteAction::Direct, "preset:direct any"));
-        }
+        "direct" => Some(rs(
+            RouteMatcher::Any,
+            RouteAction::Direct,
+            "preset:direct any",
+        )),
         "privacy" => {
-            steps.push(rs(RouteMatcher::Home, RouteAction::Direct, "preset:privacy home"));
             steps.push(rs(
+                RouteMatcher::Home,
+                RouteAction::Direct,
+                "preset:privacy home",
+            ));
+            Some(rs(
                 RouteMatcher::Any,
                 RouteAction::Group(final_target.clone()),
                 "preset:privacy any",
-            ));
+            ))
         }
-        "custom" => {}
+        "custom" => None,
         other => {
             return Err(ConfigError::bad_route(format!("未知 preset: {other}"))
                 .hint("可选 preset: cn_smart / global / direct / privacy / custom"));
         }
     };
 
-    for line in &route.steps {
-        steps.push(parse_step_line(line, groups, &final_target)?);
+    for entry in &route.steps {
+        let entry_steps = match entry {
+            RouteStepEntry::Line(s) => parse_step_line(s, groups, &final_target)?,
+            RouteStepEntry::Object(obj) => compile_object(obj, groups, &final_target)?,
+        };
+        steps.extend(entry_steps);
     }
 
     if !steps.iter().any(|s| matches!(s.matcher, RouteMatcher::Any)) {
-        steps.push(rs(
-            RouteMatcher::Any,
-            RouteAction::Group(final_target.clone()),
-            "auto-fallback",
-        ));
+        steps.push(fallback.unwrap_or_else(|| {
+            rs(
+                RouteMatcher::Any,
+                RouteAction::Group(final_target.clone()),
+                "auto-fallback",
+            )
+        }));
     }
 
     Ok(RoutePlan {
@@ -466,58 +527,409 @@ fn parse_step_line(
     line: &str,
     groups: &BTreeMap<String, GroupPlan>,
     final_target: &str,
-) -> ConfigResult<RouteStep> {
+) -> ConfigResult<Vec<RouteStep>> {
+    // mihomo classical 字符串：`TYPE,VALUE[,POLICY[,no-resolve]]`，policy 内嵌而非
+    // 用 `->` 显式分隔。这里在调用 `split_once("->")` 之前先尝试识别：若整行不含
+    // `->` 且首段是已知的 classical TYPE，把它就地改写成 `TYPE,VALUE -> POLICY` 形式
+    // 复用统一的左/右两段拆分逻辑。
+    if !line.contains("->") {
+        if let Some(rewritten) = try_classical_to_dsl(line) {
+            return parse_step_line(&rewritten, groups, final_target);
+        }
+        return Err(ConfigError::bad_route(format!("规则缺少 -> : {line}"))
+            .hint("使用 `<左侧> -> <分组|direct|block>`，或 mihomo classical `TYPE,VALUE,POLICY`"));
+    }
+
     let (lhs, rhs) = line
         .split_once("->")
         .ok_or_else(|| ConfigError::bad_route(format!("规则缺少 -> : {line}")))?;
     let lhs = lhs.trim();
     let rhs = rhs.trim();
 
-    let matcher = match lhs {
-        "home" => RouteMatcher::Home,
-        "cn" => RouteMatcher::Cn,
-        "ads" => RouteMatcher::Ads,
-        "any" | "*" | "final" => RouteMatcher::Any,
-        s if s.starts_with("domain:") => RouteMatcher::Domain(s[7..].into()),
-        s if s.starts_with("suffix:") => RouteMatcher::Suffix(s[7..].into()),
-        s if s.starts_with("ip:") => RouteMatcher::Cidr(s[3..].into()),
-        s if s.starts_with("port:") => RouteMatcher::Port(
-            s[5..]
-                .parse()
-                .map_err(|_| ConfigError::bad_route(format!("非法端口: {s}")))?,
-        ),
-        s if s.starts_with("network:") => RouteMatcher::Network(s[8..].into()),
-        s if s.starts_with("process:") => RouteMatcher::Process(s[8..].into()),
-        s if s.starts_with("set:") => RouteMatcher::Set(s[4..].into()),
-        s if s.starts_with("proto:") => RouteMatcher::Proto(s[6..].into()),
-        // sing-box 风格别名：sni:foo.com → 等价 suffix:foo.com 但只在 SNI 命中
-        s if s.starts_with("sni:") => RouteMatcher::Suffix(s[4..].into()),
-        // 内置服务别名
-        "telegram" | "youtube" | "netflix" | "github" | "apple" | "google" => {
-            RouteMatcher::Service(lhs.into())
-        }
-        other => RouteMatcher::Service(other.into()),
-    };
+    // 共享 LHS 解析（DSL `port:53` / classical `DST-PORT,53` / 别名 `sni:foo`...）。
+    // 与 `compile_object` 的 `match` 字段同源，避免两套语法漂移。
+    let matchers = parse_match_lhs(lhs)?;
 
-    let action = match rhs {
-        "direct" => RouteAction::Direct,
-        "block" => RouteAction::Block,
+    let action = resolve_action(rhs, groups, final_target)
+        .map_err(|e| e.at(format!("steps: {line}")))?;
+
+    Ok(matchers
+        .into_iter()
+        .map(|matcher| RouteStep {
+            matcher,
+            action: action.clone(),
+            source: line.into(),
+        })
+        .collect())
+}
+
+fn split_values(raw: &str) -> Vec<&str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 把 `direct` / `block` / `<group_name>` 等 RHS 字符串解析成 [`RouteAction`]。
+/// 抽出来给 `parse_step_line` 与 `compile_object` 共享。
+fn resolve_action(
+    rhs: &str,
+    groups: &BTreeMap<String, GroupPlan>,
+    final_target: &str,
+) -> ConfigResult<RouteAction> {
+    match rhs {
+        "direct" => Ok(RouteAction::Direct),
+        "block" => Ok(RouteAction::Block),
+        // 兜底 final 时允许引用 `main` 作为分组名占位（preset 会自动注入）
         "main" if !groups.contains_key("main") && final_target == "main" => {
-            RouteAction::Group("main".into())
+            Ok(RouteAction::Group("main".into()))
         }
-        name if groups.contains_key(name) => RouteAction::Group(name.into()),
-        other => {
-            return Err(ConfigError::bad_route(format!("规则右侧引用未定义 group: {other}"))
-                .at(format!("steps: {line}"))
-                .hint("把右侧改为已存在的分组、direct 或 block"));
-        }
+        name if groups.contains_key(name) => Ok(RouteAction::Group(name.into())),
+        other => Err(
+            ConfigError::bad_route(format!("规则右侧引用未定义 group: {other}"))
+                .hint("把右侧改为已存在的分组、direct 或 block"),
+        ),
+    }
+}
+
+/// typed-key object 形式编译入口 —— 直接产出 [`RouteStep`]，不绕 DSL string。
+///
+/// **语义**：
+/// - 同字段列表值（`port: [53, 5353]`）→ [`RouteMatcher::Or`]，短路求值
+/// - 不同字段同时设置 → [`RouteMatcher::And`]，短路求值
+/// - 单字段单值 → 直接对应单个 [`RouteMatcher`]
+/// - 没有任何匹配字段 → 报错（防止打错字段名导致空规则静默通过）
+///
+/// 性能上相比"展开成多条独立 RouteStep"的优势：
+/// `{port: [53, 5353], outbound: X}` 只产生 1 条 RouteStep，引擎遍历步表时
+/// 只调用一次 `step_matches`，由 `Or` 内部短路决定结果——避免在步表上 N 次线性扫描。
+fn compile_object(
+    obj: &RouteStepObject,
+    groups: &BTreeMap<String, GroupPlan>,
+    final_target: &str,
+) -> ConfigResult<Vec<RouteStep>> {
+    let action = resolve_action(obj.outbound.trim(), groups, final_target)
+        .map_err(|e| e.at(format!("steps: object → {}", obj.outbound)))?;
+
+    let source = format_object_source(obj);
+    let mut clauses: Vec<RouteMatcher> = Vec::new();
+
+    if let Some(m_str) = &obj.r#match {
+        // 复用已有的 classical / DSL 解析路径；`match` 字段允许写 `DST-PORT,53`
+        // 也可以是 `port:53`、`domain:foo.com` 等 WutherCore DSL（此处不带箭头）。
+        clauses.extend(parse_match_lhs(m_str.trim())?);
+    }
+    if let Some(v) = &obj.domain {
+        clauses.push(matcher_from_values(v, |s| Ok(RouteMatcher::Domain(s.into())))?);
+    }
+    if let Some(v) = &obj.suffix {
+        clauses.push(matcher_from_values(v, |s| Ok(RouteMatcher::Suffix(s.into())))?);
+    }
+    if let Some(v) = &obj.keyword {
+        clauses.push(matcher_from_values(v, |s| Ok(RouteMatcher::Keyword(s.into())))?);
+    }
+    if let Some(v) = &obj.ip {
+        clauses.push(matcher_from_values(v, |s| Ok(RouteMatcher::Cidr(s.into())))?);
+    }
+    if let Some(v) = &obj.port {
+        // port 字段单独处理：值字符串里可能有 `1000-2000` 区间，要分流到 PortRange。
+        clauses.push(matcher_from_values(v, |s| parse_classical_port(s))?);
+    }
+    if let Some(v) = &obj.process {
+        clauses.push(matcher_from_values(v, |s| Ok(RouteMatcher::Process(s.into())))?);
+    }
+    if let Some(v) = &obj.set {
+        clauses.push(matcher_from_values(v, |s| Ok(RouteMatcher::Set(s.into())))?);
+    }
+    if let Some(s) = &obj.network {
+        clauses.push(RouteMatcher::Network(s.clone()));
+    }
+    if let Some(s) = &obj.proto {
+        clauses.push(RouteMatcher::Proto(s.clone()));
+    }
+
+    if clauses.is_empty() {
+        return Err(ConfigError::bad_route(format!(
+            "规则对象缺少匹配字段: outbound={}",
+            obj.outbound
+        ))
+        .hint("加上 `match`/`domain`/`suffix`/`keyword`/`ip`/`port`/`process`/`set`/`network`/`proto` 之一"));
+    }
+
+    let final_matcher = if clauses.len() == 1 {
+        clauses.into_iter().next().unwrap()
+    } else {
+        RouteMatcher::And(clauses)
     };
 
-    Ok(RouteStep {
-        matcher,
+    Ok(vec![RouteStep {
+        matcher: final_matcher,
         action,
-        source: line.into(),
+        source,
+    }])
+}
+
+/// `MatcherValue` → 单个 matcher 或 `Or(...)` 包裹的多个。
+/// `build` 闭包负责把单个字符串值变成 `RouteMatcher`，便于 port 这种值需要再解析的字段复用。
+fn matcher_from_values<F>(v: &MatcherValue, build: F) -> ConfigResult<RouteMatcher>
+where
+    F: Fn(&str) -> ConfigResult<RouteMatcher>,
+{
+    let raws = v.to_vec();
+    if raws.is_empty() {
+        return Err(ConfigError::bad_route("规则字段值为空列表").hint("至少给一个值"));
+    }
+    let mut built = Vec::with_capacity(raws.len());
+    for raw in &raws {
+        built.push(build(raw.trim())?);
+    }
+    Ok(if built.len() == 1 {
+        built.into_iter().next().unwrap()
+    } else {
+        RouteMatcher::Or(built)
     })
+}
+
+/// LHS-only 解析：`parse_step_line` 要拆 `->`，本函数只处理左侧（DSL 或 classical）。
+/// 抽出来给 `compile_object` 的 `match` 字段复用。
+fn parse_match_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
+    Ok(match lhs {
+        "home" => vec![RouteMatcher::Home],
+        "cn" => vec![RouteMatcher::Cn],
+        "ads" => vec![RouteMatcher::Ads],
+        "any" | "*" | "final" | "default" => vec![RouteMatcher::Any],
+        s if s.starts_with("domain:") => split_values(&s[7..])
+            .into_iter()
+            .map(|v| RouteMatcher::Domain(v.into()))
+            .collect(),
+        s if s.starts_with("domain-suffix:") => split_values(&s[14..])
+            .into_iter()
+            .map(|v| RouteMatcher::Suffix(v.into()))
+            .collect(),
+        s if s.starts_with("suffix:") => split_values(&s[7..])
+            .into_iter()
+            .map(|v| RouteMatcher::Suffix(v.into()))
+            .collect(),
+        s if s.starts_with("ip:") => split_values(&s[3..])
+            .into_iter()
+            .map(|v| RouteMatcher::Cidr(v.into()))
+            .collect(),
+        s if s.starts_with("port:") => {
+            vec![parse_classical_port(s[5..].trim())?]
+        }
+        s if s.starts_with("network:") => split_values(&s[8..])
+            .into_iter()
+            .map(|v| RouteMatcher::Network(v.into()))
+            .collect(),
+        s if s.starts_with("process:") => split_values(&s[8..])
+            .into_iter()
+            .map(|v| RouteMatcher::Process(v.into()))
+            .collect(),
+        s if s.starts_with("set:") => split_values(&s[4..])
+            .into_iter()
+            .map(|v| RouteMatcher::Set(v.into()))
+            .collect(),
+        s if s.starts_with("proto:") => split_values(&s[6..])
+            .into_iter()
+            .map(|v| RouteMatcher::Proto(v.into()))
+            .collect(),
+        s if s.starts_with("sni:") => split_values(&s[4..])
+            .into_iter()
+            .map(|v| RouteMatcher::Suffix(v.into()))
+            .collect(),
+        s if is_classical_lhs(s) => parse_classical_lhs(s)?,
+        "telegram" | "youtube" | "netflix" | "github" | "apple" | "google" => {
+            vec![RouteMatcher::Service(lhs.into())]
+        }
+        other => vec![RouteMatcher::Service(other.into())],
+    })
+}
+
+/// 给 [`RouteStep::source`] 用的人类可读摘要，标出哪些字段被设了。
+fn format_object_source(obj: &RouteStepObject) -> String {
+    let mut parts = Vec::new();
+    if obj.r#match.is_some() {
+        parts.push("match");
+    }
+    if obj.domain.is_some() {
+        parts.push("domain");
+    }
+    if obj.suffix.is_some() {
+        parts.push("suffix");
+    }
+    if obj.keyword.is_some() {
+        parts.push("keyword");
+    }
+    if obj.ip.is_some() {
+        parts.push("ip");
+    }
+    if obj.port.is_some() {
+        parts.push("port");
+    }
+    if obj.process.is_some() {
+        parts.push("process");
+    }
+    if obj.set.is_some() {
+        parts.push("set");
+    }
+    if obj.network.is_some() {
+        parts.push("network");
+    }
+    if obj.proto.is_some() {
+        parts.push("proto");
+    }
+    format!("object[{}] -> {}", parts.join("+"), obj.outbound)
+}
+
+/// mihomo classical 已知 TYPE 列表 —— 大小写敏感（mihomo 也只接受大写）。
+/// 用 `&str` 数组而非 enum，是因为只在解析阶段做一次 dispatch，不需要中间表示。
+const CLASSICAL_TYPES: &[&str] = &[
+    "DOMAIN",
+    "DOMAIN-SUFFIX",
+    "DOMAIN-KEYWORD",
+    "DOMAIN-REGEX",
+    "IP-CIDR",
+    "IP-CIDR6",
+    "SRC-IP-CIDR",
+    "SRC-PORT",
+    "DST-PORT",
+    "PROCESS-NAME",
+    "PROCESS-PATH",
+    "NETWORK",
+    "RULE-SET",
+    "MATCH",
+];
+
+/// 判定一段 LHS（已 trim、已剥掉 `->` 右侧）是否是 mihomo classical 写法。
+/// 只看首段是否在 [`CLASSICAL_TYPES`] 中；`MATCH` 没有 value，单独识别。
+fn is_classical_lhs(s: &str) -> bool {
+    if s.eq_ignore_ascii_case("MATCH") {
+        return true;
+    }
+    let head = s.split(',').next().unwrap_or("").trim();
+    CLASSICAL_TYPES
+        .iter()
+        .any(|t| head.eq_ignore_ascii_case(t))
+}
+
+/// 解析 mihomo classical LHS（不含 `->` 与 policy）为 [`RouteMatcher`] 列表。
+/// 失败返回带 hint 的 [`ConfigError`]。
+fn parse_classical_lhs(lhs: &str) -> ConfigResult<Vec<RouteMatcher>> {
+    if lhs.eq_ignore_ascii_case("MATCH") {
+        return Ok(vec![RouteMatcher::Any]);
+    }
+    let mut parts = lhs.splitn(2, ',');
+    let kind = parts.next().unwrap_or("").trim();
+    let value = parts.next().unwrap_or("").trim();
+    if value.is_empty() {
+        return Err(ConfigError::bad_route(format!(
+            "classical 规则缺少 value: `{lhs}`"
+        ))
+        .hint("形如 `DOMAIN-SUFFIX,example.com` 或 `DST-PORT,53`"));
+    }
+
+    let kind_uc = kind.to_ascii_uppercase();
+    let m = match kind_uc.as_str() {
+        "DOMAIN" => RouteMatcher::Domain(value.into()),
+        "DOMAIN-SUFFIX" => RouteMatcher::Suffix(value.into()),
+        "DOMAIN-KEYWORD" => RouteMatcher::Keyword(value.into()),
+        "IP-CIDR" | "IP-CIDR6" => RouteMatcher::Cidr(value.into()),
+        "DST-PORT" => parse_classical_port(value)?,
+        "PROCESS-NAME" => RouteMatcher::Process(value.into()),
+        "NETWORK" => RouteMatcher::Network(value.into()),
+        "RULE-SET" => RouteMatcher::Set(value.into()),
+        // mihomo 标准里有但 WutherCore 当前 FlowContext 还没暴露的字段
+        "SRC-IP-CIDR" | "SRC-PORT" => {
+            return Err(ConfigError::bad_route(format!(
+                "暂不支持 source-side classical 规则: `{kind_uc}`"
+            ))
+            .hint("WutherCore FlowContext 当前仅暴露 dst 端信息；如确需匹配源 IP/端口请改用 RULE-SET 外部规则集"));
+        }
+        "DOMAIN-REGEX" | "PROCESS-PATH" => {
+            return Err(ConfigError::bad_route(format!(
+                "classical 规则 `{kind_uc}` 暂未实现"
+            ))
+            .hint("可用 DOMAIN-KEYWORD / PROCESS-NAME 替代，或写入 set: 外部规则集"));
+        }
+        other => {
+            return Err(ConfigError::bad_route(format!(
+                "未知 classical TYPE: `{other}`"
+            ))
+            .hint("受支持的 TYPE 见 README route 章节"));
+        }
+    };
+    Ok(vec![m])
+}
+
+/// 解析 `DST-PORT,53` 中的 value：单端口或 `LOW-HIGH` 闭区间。
+fn parse_classical_port(value: &str) -> ConfigResult<RouteMatcher> {
+    if let Some((lo, hi)) = value.split_once('-') {
+        let lo: u16 = lo.trim().parse().map_err(|_| {
+            ConfigError::bad_route(format!("非法端口范围下界: `{value}`"))
+        })?;
+        let hi: u16 = hi.trim().parse().map_err(|_| {
+            ConfigError::bad_route(format!("非法端口范围上界: `{value}`"))
+        })?;
+        if lo > hi {
+            return Err(ConfigError::bad_route(format!(
+                "端口范围下界大于上界: `{value}`"
+            )));
+        }
+        Ok(RouteMatcher::PortRange(lo, hi))
+    } else {
+        let p: u16 = value
+            .parse()
+            .map_err(|_| ConfigError::bad_route(format!("非法端口: `{value}`")))?;
+        Ok(RouteMatcher::Port(p))
+    }
+}
+
+/// 把 mihomo classical 三段式 `TYPE,VALUE,POLICY[,FLAG]` 改写为 WutherCore 的统一
+/// 箭头形式 `TYPE,VALUE -> POLICY`。`MATCH,POLICY` 也走这条路。
+///
+/// 已知 flag（如 `no-resolve`）在 WutherCore 不需要——本项目所有 IP 规则解析后再匹配，
+/// 在此默默丢弃，不报错（mihomo 也仅把它当作不强制 DNS 解析的提示）。
+fn try_classical_to_dsl(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let head = trimmed.split(',').next().unwrap_or("").trim();
+    let is_classical = head.eq_ignore_ascii_case("MATCH")
+        || CLASSICAL_TYPES.iter().any(|t| head.eq_ignore_ascii_case(t));
+    if !is_classical {
+        return None;
+    }
+
+    // 拆出 policy（最后一段或倒数第二段，取决于有无 no-resolve flag）
+    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    let (lhs_parts, policy) = if head.eq_ignore_ascii_case("MATCH") {
+        // MATCH,POLICY  →  lhs=MATCH, policy=parts[1]
+        if parts.len() < 2 {
+            return None;
+        }
+        (vec!["MATCH"], parts[1])
+    } else {
+        // TYPE,VALUE[,POLICY[,no-resolve]]
+        if parts.len() < 3 {
+            // 无 policy；object 形式或 hybrid 形式不会进这里（已带 `->`），
+            // 这种纯 classical 但缺 policy 的写法属于配置错误，让外层报错。
+            return None;
+        }
+        // 末段若是 no-resolve / src 之类的 flag，往前挪一段当 policy
+        let policy_idx = if matches!(
+            parts.last().copied().unwrap_or("").to_ascii_lowercase().as_str(),
+            "no-resolve" | "src"
+        ) {
+            parts.len() - 2
+        } else {
+            parts.len() - 1
+        };
+        let lhs_slice = &parts[..policy_idx];
+        (lhs_slice.to_vec(), parts[policy_idx])
+    };
+
+    Some(format!("{} -> {}", lhs_parts.join(","), policy))
 }
 
 fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
@@ -530,11 +942,13 @@ fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
         CaptureMethod::Tproxy | CaptureMethod::Redirect => os == "linux" || os == "android",
     };
     if !ok {
-        return Err(ConfigError::new(crate::error::ConfigErrorKind::UnsupportedPlatform(format!(
-            "capture.method={:?} 在当前平台 ({os}) 不支持",
-            c.method
-        )))
-        .hint("改成 method: auto 或 method: virtual_nic"));
+        return Err(
+            ConfigError::new(crate::error::ConfigErrorKind::UnsupportedPlatform(format!(
+                "capture.method={:?} 在当前平台 ({os}) 不支持",
+                c.method
+            )))
+            .hint("改成 method: auto 或 method: virtual_nic"),
+        );
     }
     Ok(())
 }
@@ -594,6 +1008,500 @@ route:
             .steps
             .iter()
             .any(|s| matches!(s.matcher, RouteMatcher::Domain(ref d) if d == "example.com")));
+    }
+
+    #[test]
+    fn preset_fallback_is_after_user_rules() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+  ai:
+    choose: smart
+    use: [nodes]
+route:
+  preset: cn_smart
+  final: main
+  steps:
+    - "set:openai -> ai"
+"#,
+        );
+
+        let set_pos = plan
+            .route
+            .steps
+            .iter()
+            .position(|s| matches!(s.matcher, RouteMatcher::Set(ref name) if name == "openai"))
+            .unwrap();
+        let any_pos = plan
+            .route
+            .steps
+            .iter()
+            .position(|s| matches!(s.matcher, RouteMatcher::Any))
+            .unwrap();
+        assert!(set_pos < any_pos);
+    }
+
+    #[test]
+    fn route_aliases_used_by_examples_compile() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+route:
+  preset: custom
+  steps:
+    - "domain-suffix: lan,local,arpa -> direct"
+    - "default -> main"
+"#,
+        );
+
+        assert!(matches!(plan.route.steps[0].matcher, RouteMatcher::Suffix(ref s) if s == "lan"));
+        assert!(matches!(plan.route.steps[1].matcher, RouteMatcher::Suffix(ref s) if s == "local"));
+        assert!(matches!(plan.route.steps[2].matcher, RouteMatcher::Suffix(ref s) if s == "arpa"));
+        assert!(matches!(plan.route.steps[3].matcher, RouteMatcher::Any));
+    }
+
+    /// 用户报的最直接形式：`{match: "DST-PORT,53", outbound: <group>}`。
+    /// outbound 引用一个真实分组（不是直接拨 DNS_Hijack，因为本测试只校验解析路径）。
+    #[test]
+    fn route_step_object_form_with_dst_port_classical() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  hijack:
+    choose: smart
+    use: [nodes]
+  main:
+    choose: smart
+    use: [nodes]
+route:
+  preset: custom
+  final: main
+  steps:
+    - {match: "DST-PORT,53", outbound: hijack}
+    - "any -> main"
+"#,
+        );
+        let step = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::Port(53)))
+            .expect("DST-PORT,53 应被解析为 Port(53)");
+        assert!(matches!(step.action, RouteAction::Group(ref g) if g == "hijack"));
+    }
+
+    /// mihomo 字符串内嵌 policy 的写法 —— `"DST-PORT,53,hijack"` 也要等价生效。
+    #[test]
+    fn route_step_string_form_classical_inline_policy() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  hijack:
+    choose: smart
+    use: [nodes]
+  main:
+    choose: smart
+    use: [nodes]
+route:
+  preset: custom
+  final: main
+  steps:
+    - "DST-PORT,53,hijack"
+    - "MATCH,main"
+"#,
+        );
+        assert!(plan
+            .route
+            .steps
+            .iter()
+            .any(|s| matches!(s.matcher, RouteMatcher::Port(53))
+                && matches!(s.action, RouteAction::Group(ref g) if g == "hijack")));
+    }
+
+    /// 端口范围、关键字、IP-CIDR 三类都跑一遍，覆盖新增 matcher。
+    #[test]
+    fn route_step_classical_extended_kinds() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+route:
+  preset: custom
+  final: main
+  steps:
+    - {match: "DST-PORT,1000-2000", outbound: direct}
+    - {match: "DOMAIN-KEYWORD,google", outbound: main}
+    - {match: "IP-CIDR,1.2.3.0/24", outbound: direct}
+    - {match: "IP-CIDR,4.4.4.0/24,no-resolve", outbound: direct}
+    - "MATCH,main"
+"#,
+        );
+        let kinds: Vec<&RouteMatcher> = plan.route.steps.iter().map(|s| &s.matcher).collect();
+        assert!(kinds
+            .iter()
+            .any(|m| matches!(m, RouteMatcher::PortRange(1000, 2000))));
+        assert!(kinds
+            .iter()
+            .any(|m| matches!(m, RouteMatcher::Keyword(ref k) if k == "google")));
+        // 两条 IP-CIDR：第二条尾部 `no-resolve` 在 mapping 形式下不会触发解析路径
+        // （outbound 已显式给出），但写出来不应该出错。
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|m| matches!(m, RouteMatcher::Cidr(_)))
+                .count(),
+            2
+        );
+    }
+
+    /// `no-resolve` flag 在内嵌 policy 的 string 形式里要被识别并丢弃。
+    #[test]
+    fn route_step_classical_string_form_strips_no_resolve_flag() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: smart
+    use: [nodes]
+route:
+  preset: custom
+  final: main
+  steps:
+    - "IP-CIDR,5.5.5.0/24,direct,no-resolve"
+    - "MATCH,main"
+"#,
+        );
+        let cidr = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::Cidr(ref c) if c == "5.5.5.0/24"))
+            .expect("IP-CIDR with no-resolve flag 应被解析");
+        assert!(matches!(cidr.action, RouteAction::Direct));
+    }
+
+    /// 用户报的最直接形式：typed-key shorthand `{port: 53, outbound: ...}`
+    /// —— 不需要 mihomo classical TYPE 字符串。
+    #[test]
+    fn route_step_typed_key_port_shorthand() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  hijack: {choose: smart, use: [nodes]}
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {port: 53, outbound: hijack}
+    - "any -> main"
+"#,
+        );
+        let step = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::Port(53)))
+            .expect("typed-key port:53 应解析为 Port(53)");
+        assert!(matches!(step.action, RouteAction::Group(ref g) if g == "hijack"));
+    }
+
+    /// typed-key 字段全集冒烟 —— 每种匹配字段单独写一条，确保都解析成对应 matcher。
+    #[test]
+    fn route_step_typed_key_all_field_kinds() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+  ai: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  sets:
+    ads: {payload: ["DOMAIN-SUFFIX,doubleclick.net"]}
+  steps:
+    - {domain: example.com, outbound: direct}
+    - {suffix: cn, outbound: direct}
+    - {keyword: google, outbound: ai}
+    - {ip: 10.0.0.0/8, outbound: direct}
+    - {port: 80, outbound: main}
+    - {process: chrome, outbound: ai}
+    - {set: ads, outbound: block}
+    - {network: udp, outbound: main}
+    - {proto: quic, outbound: main}
+    - "any -> main"
+"#,
+        );
+        let m: Vec<&RouteMatcher> = plan.route.steps.iter().map(|s| &s.matcher).collect();
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Domain(d) if d == "example.com")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Suffix(s) if s == "cn")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Keyword(k) if k == "google")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Cidr(c) if c == "10.0.0.0/8")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Port(80))));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Process(p) if p == "chrome")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Set(s) if s == "ads")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Network(n) if n == "udp")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Proto(p) if p == "quic")));
+    }
+
+    /// mihomo 友好别名（hyphen 形式）应与 canonical 等价。
+    #[test]
+    fn route_step_typed_key_hyphen_aliases() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  hijack: {choose: smart, use: [nodes]}
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {dst-port: 53, outbound: hijack}
+    - {domain-suffix: example.com, outbound: direct}
+    - {domain-keyword: google, outbound: main}
+    - {ip-cidr: 10.0.0.0/8, outbound: direct}
+    - {process-name: chrome.exe, outbound: direct}
+    - "any -> main"
+"#,
+        );
+        let m: Vec<&RouteMatcher> = plan.route.steps.iter().map(|s| &s.matcher).collect();
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Port(53))));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Suffix(s) if s == "example.com")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Keyword(k) if k == "google")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Cidr(c) if c == "10.0.0.0/8")));
+        assert!(m.iter().any(|x| matches!(x, RouteMatcher::Process(p) if p == "chrome.exe")));
+    }
+
+    /// 列表值 → `Or(...)` 包装。`port: [53, 5353]` 应只产生一条 RouteStep。
+    #[test]
+    fn route_step_typed_key_list_value_becomes_or() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  hijack: {choose: smart, use: [nodes]}
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {port: [53, 5353], outbound: hijack}
+    - "any -> main"
+"#,
+        );
+        let or_step = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::Or(_)))
+            .expect("port: [..] 应包成 Or(...)");
+        if let RouteMatcher::Or(parts) = &or_step.matcher {
+            assert_eq!(parts.len(), 2);
+            assert!(matches!(parts[0], RouteMatcher::Port(53)));
+            assert!(matches!(parts[1], RouteMatcher::Port(5353)));
+        }
+        assert!(matches!(or_step.action, RouteAction::Group(ref g) if g == "hijack"));
+    }
+
+    /// 多字段 → `And(...)` 包装，跨字段 AND；端口 + 协议联合命中才触发。
+    #[test]
+    fn route_step_typed_key_multi_field_becomes_and() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  hijack: {choose: smart, use: [nodes]}
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {port: 53, network: udp, outbound: hijack}
+    - "any -> main"
+"#,
+        );
+        let and_step = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::And(_)))
+            .expect("多字段 typed object 应包成 And(...)");
+        if let RouteMatcher::And(parts) = &and_step.matcher {
+            assert_eq!(parts.len(), 2);
+            // 顺序与 compile_object 写入顺序一致：port, network
+            assert!(matches!(parts[0], RouteMatcher::Port(53)));
+            assert!(matches!(parts[1], RouteMatcher::Network(ref n) if n == "udp"));
+        }
+    }
+
+    /// 列表 + 多字段 → `And([Or([...]), other])` 嵌套。
+    #[test]
+    fn route_step_typed_key_list_and_multi_field_nests_or_inside_and() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {port: [53, 5353], suffix: example.com, outbound: direct}
+    - "any -> main"
+"#,
+        );
+        let and_step = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::And(_)))
+            .expect("应包成 And");
+        if let RouteMatcher::And(parts) = &and_step.matcher {
+            // compile_object 的写入顺序：match, domain, suffix, keyword, ip, port, ...
+            // 此处 suffix 在前、port 在后；不依赖具体顺序的更稳健写法是 any() 检查
+            assert!(parts.iter().any(|m| matches!(m, RouteMatcher::Or(_))));
+            assert!(parts
+                .iter()
+                .any(|m| matches!(m, RouteMatcher::Suffix(s) if s == "example.com")));
+        }
+    }
+
+    /// `match` 字段允许 WutherCore DSL（不只是 mihomo classical），且可以与 typed-key AND。
+    #[test]
+    fn route_step_typed_key_match_combines_with_typed_fields() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {match: "port:443", suffix: example.com, outbound: direct}
+    - "any -> main"
+"#,
+        );
+        let and_step = plan
+            .route
+            .steps
+            .iter()
+            .find(|s| matches!(s.matcher, RouteMatcher::And(_)))
+            .expect("match + typed 应 AND 在一起");
+        if let RouteMatcher::And(parts) = &and_step.matcher {
+            assert_eq!(parts.len(), 2);
+            assert!(matches!(parts[0], RouteMatcher::Port(443)));
+            assert!(matches!(parts[1], RouteMatcher::Suffix(ref s) if s == "example.com"));
+        }
+    }
+
+    /// typed-key 区间端口 —— `port: 1000-2000` 应解析成 PortRange。
+    #[test]
+    fn route_step_typed_key_port_range() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {port: 1000-2000, outbound: direct}
+    - "any -> main"
+"#,
+        );
+        assert!(plan
+            .route
+            .steps
+            .iter()
+            .any(|s| matches!(s.matcher, RouteMatcher::PortRange(1000, 2000))));
+    }
+
+    /// 缺失匹配字段 → 报错（防止打错字段名静默通过）。
+    #[test]
+    fn route_step_typed_key_missing_match_errors() {
+        let yaml = r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {outbound: main}
+"#;
+        let mut cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        apply_defaults(&mut cfg);
+        let err = compile(cfg).unwrap_err().to_string();
+        assert!(err.contains("缺少匹配字段"), "err={err}");
+    }
+
+    #[test]
+    fn route_step_classical_unsupported_kind_errors() {
+        let yaml = r#"
+version: 1
+profile: desktop
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main: {choose: smart, use: [nodes]}
+route:
+  preset: custom
+  final: main
+  steps:
+    - {match: "SRC-PORT,1234", outbound: main}
+"#;
+        let mut cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        apply_defaults(&mut cfg);
+        let err = compile(cfg).unwrap_err().to_string();
+        assert!(err.contains("SRC-PORT"), "err = {err}");
     }
 
     #[test]

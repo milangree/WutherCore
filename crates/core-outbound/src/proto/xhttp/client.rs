@@ -60,8 +60,7 @@ pub struct XhttpClient {
     pub insecure: bool,
     pub alpn: Vec<String>,
     /// 缓存的 hyper http2 sender（首次 dial 建立）
-    h2_sender:
-        AsyncMutex<Option<hyper::client::conn::http2::SendRequest<XhttpBody>>>,
+    h2_sender: AsyncMutex<Option<hyper::client::conn::http2::SendRequest<XhttpBody>>>,
 }
 
 impl XhttpClient {
@@ -96,9 +95,10 @@ impl XhttpClient {
         .connect(&self.host, self.port)
         .await?;
         let io = HyperTokioIo::new(tls);
-        let (sender, conn) = hyper::client::conn::http2::handshake::<_, _, XhttpBody>(TokioExecutor, io)
-            .await
-            .map_err(|e| io_err(format!("h2 handshake: {e}")))?;
+        let (sender, conn) =
+            hyper::client::conn::http2::handshake::<_, _, XhttpBody>(TokioExecutor, io)
+                .await
+                .map_err(|e| io_err(format!("h2 handshake: {e}")))?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -140,7 +140,10 @@ impl XhttpClient {
             .await
             .map_err(|e| io_err(format!("send_request: {e}")))?;
         if !resp.status().is_success() {
-            return Err(io_err(format!("xhttp stream-one bad status: {}", resp.status())));
+            return Err(io_err(format!(
+                "xhttp stream-one bad status: {}",
+                resp.status()
+            )));
         }
         let body = resp.into_body();
 
@@ -156,11 +159,7 @@ impl XhttpClient {
         let session = new_session_id();
 
         // 下行 GET
-        let download_cfg: &Config = self
-            .cfg
-            .download_config
-            .as_deref()
-            .unwrap_or(&self.cfg);
+        let download_cfg: &Config = self.cfg.download_config.as_deref().unwrap_or(&self.cfg);
         let download_url = format!(
             "https://{}{}",
             self.host_authority(),
@@ -196,7 +195,8 @@ impl XhttpClient {
         );
         fill_stream_request(&self.cfg, &mut uprep, &session).map_err(io_err)?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
-        let ureq = build_h2_request_unified(uprep, XhttpBody::Stream(RequestBody { rx, eof: false }))?;
+        let ureq =
+            build_h2_request_unified(uprep, XhttpBody::Stream(RequestBody { rx, eof: false }))?;
         // 异步发送 upload；不阻塞 dial 返回
         tokio::spawn(async move {
             let _ = sender_up.send_request(ureq).await;
@@ -211,11 +211,7 @@ impl XhttpClient {
         let session = new_session_id();
 
         // 下行 GET
-        let download_cfg: &Config = self
-            .cfg
-            .download_config
-            .as_deref()
-            .unwrap_or(&self.cfg);
+        let download_cfg: &Config = self.cfg.download_config.as_deref().unwrap_or(&self.cfg);
         let download_url = format!(
             "https://{}{}",
             self.host_authority(),
@@ -240,12 +236,7 @@ impl XhttpClient {
         reader.handle().set(dbody);
 
         // 上行 PacketUpWriter
-        let writer = PacketUpWriter::new(
-            self.cfg.clone(),
-            session,
-            self.host_authority(),
-            sender,
-        )?;
+        let writer = PacketUpWriter::new(self.cfg.clone(), session, self.host_authority(), sender)?;
         Ok(Box::pin(XConn::new(reader, writer)))
     }
 
@@ -285,11 +276,8 @@ impl PacketUpInner {
 
     async fn write_one(self: Arc<Self>, data: &[u8]) -> std::io::Result<()> {
         let url = format!("https://{}{}", self.host, self.cfg.normalized_path());
-        let mut prep = PreparedRequest::new(
-            self.cfg.normalized_uplink_http_method(),
-            &url,
-            &self.host,
-        );
+        let mut prep =
+            PreparedRequest::new(self.cfg.normalized_uplink_http_method(), &url, &self.host);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let seq_s = seq.to_string();
         fill_packet_request(&self.cfg, &mut prep, &self.session_id, &seq_s, data)
@@ -430,9 +418,7 @@ impl HyperBody for RequestBody {
             return Poll::Ready(None);
         }
         match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                Poll::Ready(Some(Ok(Frame::data(Bytes::from(data)))))
-            }
+            Poll::Ready(Some(data)) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(data))))),
             Poll::Ready(None) => {
                 self.eof = true;
                 Poll::Ready(None)
@@ -511,7 +497,6 @@ fn apply_prepared_headers<B>(prep: &PreparedRequest, req: &mut hyper::Request<B>
         }
     }
 }
-
 
 /* ---------------- Hyper IO 适配（与 trusttunnel 一致） ---------------- */
 

@@ -5,18 +5,37 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::adapter::{apply_outbound_mark_for_addr, resolve_host, BoxedStream};
+use crate::adapter::{
+    apply_outbound_mark_for_addr, protect_socket, resolve_host, resolve_host_for_direct,
+    BoxedStream,
+};
+use crate::loopback::TrackedTcpStream;
 use crate::transport::Transport;
 
-#[derive(Debug, Default)]
-pub struct TcpTransport;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TcpTransport {
+    /// 若为 true，解析走 `resolve_host_for_direct`（mihomo `DirectHostResolver`），
+    /// 避开 fake-ip / 业务 policy；用于 DIRECT 出站。
+    for_direct: bool,
+}
+
+impl TcpTransport {
+    /// DIRECT 出站专用：解析走 direct-nameserver group。
+    pub fn for_direct() -> Self {
+        Self { for_direct: true }
+    }
+}
 
 #[async_trait]
 impl Transport for TcpTransport {
     async fn connect(&self, host: &str, port: u16) -> std::io::Result<BoxedStream> {
         let started = Instant::now();
-        debug!(target: "dial::tcp", %host, port, "begin");
-        let addrs = resolve_host(host, port).await?;
+        debug!(target: "dial::tcp", %host, port, for_direct = self.for_direct, "begin");
+        let addrs = if self.for_direct {
+            resolve_host_for_direct(host, port).await?
+        } else {
+            resolve_host(host, port).await?
+        };
         let mut last_err: Option<std::io::Error> = None;
         let mut tried = 0usize;
         for addr in &addrs {
@@ -67,21 +86,32 @@ impl Transport for TcpTransport {
 
 /// 用 socket2 创建 socket → 应用 SO_MARK → connect（同步，带 spawn_blocking 包裹）→ 包成 tokio TcpStream。
 ///
-/// SO_MARK 让 SYN 包带 mark，配合 `ip rule fwmark <out_mark> lookup main`
-/// 直接走主路由表，绕开 TUN 自身路由表，避免 dial 时的"connect IP 又被 TUN 截走"的死循环。
+/// SO_MARK 让 SYN 包带 mark，配合 root TUN 启动时探测出的默认网络路由表，
+/// 绕开 TUN 自身路由表，避免 dial 时的"connect IP 又被 TUN 截走"的死循环。
 pub async fn marked_connect(
     addr: std::net::SocketAddr,
     timeout: Duration,
-) -> std::io::Result<TcpStream> {
-    let std_stream = tokio::task::spawn_blocking(move || -> std::io::Result<std::net::TcpStream> {
-        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-        let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        apply_outbound_mark_for_addr(&sock, addr)?;
-        sock.connect_timeout(&addr.into(), timeout)?;
-        sock.set_nonblocking(true)?;
-        Ok(sock.into())
-    })
-    .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("spawn_blocking: {e}")))??;
-    TcpStream::from_std(std_stream)
+) -> std::io::Result<TrackedTcpStream<TcpStream>> {
+    let std_stream =
+        tokio::task::spawn_blocking(move || -> std::io::Result<std::net::TcpStream> {
+            let domain = if addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+            let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+            protect_socket(&sock)?;
+            apply_outbound_mark_for_addr(&sock, addr)?;
+            crate::adapter::bind_to_device(&sock)?;
+            sock.connect_timeout(&addr.into(), timeout)?;
+            sock.set_nonblocking(true)?;
+            Ok(sock.into())
+        })
+        .await
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("spawn_blocking: {e}"))
+        })??;
+    let stream = TcpStream::from_std(std_stream)?;
+    let local = stream.local_addr()?;
+    Ok(TrackedTcpStream::new(stream, local))
 }

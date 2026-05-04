@@ -109,10 +109,18 @@ async fn patch_group(
 ) -> impl IntoResponse {
     let exists = s.runtime.groups.read().contains_key(&name);
     if !exists {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown group"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown group"})),
+        )
+            .into_response();
     }
     s.runtime.set_group_manual(&name, &body.pick);
-    (StatusCode::OK, Json(json!({"ok": true, "group": name, "pick": body.pick}))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "group": name, "pick": body.pick})),
+    )
+        .into_response()
 }
 
 async fn list_conns(State(s): State<NativeState>) -> impl IntoResponse {
@@ -142,14 +150,15 @@ async fn list_conns(State(s): State<NativeState>) -> impl IntoResponse {
     Json(json!({ "connections": conns }))
 }
 
-async fn close_conn(
-    State(s): State<NativeState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn close_conn(State(s): State<NativeState>, Path(id): Path<String>) -> impl IntoResponse {
     if s.runtime.connections.close_by_uuid_or_numeric(&id) {
         return (StatusCode::NO_CONTENT, Json(json!({}))).into_response();
     }
-    (StatusCode::NOT_FOUND, Json(json!({"error": "no such connection"}))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "no such connection"})),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -163,7 +172,11 @@ async fn resolver_query(
 ) -> impl IntoResponse {
     match s.runtime.resolver.resolve(&q.host).await {
         Ok(ips) => Json(json!({"host": q.host, "ips": ips})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -257,7 +270,13 @@ async fn smart_why(
     let groups = s.runtime.groups.read();
     let g = match groups.get(&q.group) {
         Some(g) => g,
-        None => return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown group"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown group"})),
+            )
+                .into_response()
+        }
     };
     let ctx = core_smart::SmartContext {
         group: q.group.clone(),
@@ -276,10 +295,7 @@ struct PinBody {
     node: String,
 }
 
-async fn smart_pin(
-    State(s): State<NativeState>,
-    Json(b): Json<PinBody>,
-) -> impl IntoResponse {
+async fn smart_pin(State(s): State<NativeState>, Json(b): Json<PinBody>) -> impl IntoResponse {
     s.runtime.smart.pin(&b.host, &b.group, &b.node);
     Json(json!({"ok": true}))
 }
@@ -291,13 +307,11 @@ struct AvoidBody {
     reason: Option<String>,
 }
 
-async fn smart_avoid(
-    State(s): State<NativeState>,
-    Json(b): Json<AvoidBody>,
-) -> impl IntoResponse {
-    s.runtime
-        .smart
-        .record_failure(&b.node, b.reason.clone().unwrap_or_else(|| "manual avoid".into()));
+async fn smart_avoid(State(s): State<NativeState>, Json(b): Json<AvoidBody>) -> impl IntoResponse {
+    s.runtime.smart.record_failure(
+        &b.node,
+        b.reason.clone().unwrap_or_else(|| "manual avoid".into()),
+    );
     Json(json!({"ok": true}))
 }
 
@@ -305,7 +319,11 @@ async fn smart_reset(State(s): State<NativeState>) -> impl IntoResponse {
     if let Some(store) = &s.runtime.store {
         match store.reset() {
             Ok(()) => Json(json!({"ok": true, "reset": "store cleared"})).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
         }
     } else {
         Json(json!({"ok": true, "note": "no store configured; nothing persisted"})).into_response()
@@ -316,14 +334,15 @@ async fn smart_cache(State(s): State<NativeState>) -> impl IntoResponse {
     Json(json!({ "recent_explains": s.runtime.smart.recent_explains() }))
 }
 
-async fn smart_nodes(
-    State(s): State<NativeState>,
-    Path(group): Path<String>,
-) -> impl IntoResponse {
+async fn smart_nodes(State(s): State<NativeState>, Path(group): Path<String>) -> impl IntoResponse {
     let groups = s.runtime.groups.read();
     if let Some(g) = groups.get(&group) {
         Json(json!({"group": g.name(), "members": g.members()})).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"error": "unknown group"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown group"})),
+        )
+            .into_response()
     }
 }

@@ -153,14 +153,25 @@ impl Ss2022Outbound {
 
 #[async_trait]
 impl OutboundAdapter for Ss2022Outbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "ss2022" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "ss2022"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut stream = TcpTransport::default().connect(&self.host, self.port).await?;
+        let mut stream = TcpTransport::default()
+            .connect(&self.host, self.port)
+            .await?;
 
         // 1) 随机 salt 与 PSK 等长
         let salt_len = self.cipher.key_len();
@@ -352,7 +363,9 @@ impl Ss22Cryptor {
 
 enum RecvState {
     WaitSalt,
-    WaitFixedHeader { recv: Ss22Cryptor },
+    WaitFixedHeader {
+        recv: Ss22Cryptor,
+    },
     Body {
         recv: Ss22Cryptor,
         expecting_len: Option<usize>,
@@ -420,22 +433,27 @@ impl AsyncRead for Ss22Stream {
                                 } else {
                                     // timestamp 校验：±30s
                                     let ts = u64::from_be_bytes([
-                                        plain[1], plain[2], plain[3], plain[4],
-                                        plain[5], plain[6], plain[7], plain[8],
+                                        plain[1], plain[2], plain[3], plain[4], plain[5], plain[6],
+                                        plain[7], plain[8],
                                     ]) as i64;
                                     let now = chrono::Utc::now().timestamp();
                                     if (now - ts).abs() > TIMESTAMP_TOLERANCE {
-                                        return Poll::Ready(Err(io_err("ss22 timestamp out of tolerance")));
+                                        return Poll::Ready(Err(io_err(
+                                            "ss22 timestamp out of tolerance",
+                                        )));
                                     }
                                     // 校验 request_salt echo
                                     let echoed = &plain[9..9 + salt_len];
                                     if echoed != &this.request_salt[..] {
-                                        return Poll::Ready(Err(io_err("ss22 request_salt mismatch")));
+                                        return Poll::Ready(Err(io_err(
+                                            "ss22 request_salt mismatch",
+                                        )));
                                     }
                                     let initial_len = u16::from_be_bytes([
                                         plain[9 + salt_len],
                                         plain[10 + salt_len],
-                                    ]) as usize;
+                                    ])
+                                        as usize;
                                     let dummy = Ss22Cryptor::new(
                                         *this.cipher,
                                         &[0u8; 32][..this.cipher.key_len()],
@@ -453,7 +471,11 @@ impl AsyncRead for Ss22Stream {
                         }
                     }
                 }
-                RecvState::Body { recv, expecting_len, .. } => {
+                RecvState::Body {
+                    recv,
+                    expecting_len,
+                    ..
+                } => {
                     let tag = 16;
                     if expecting_len.is_none() {
                         if this.cipher_buf.len() < 2 + tag {
@@ -534,7 +556,9 @@ impl AsyncWrite for Ss22Stream {
         let mut written = 0;
         while written < packet.len() {
             match this.inner.as_mut().poll_write(cx, &packet[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -625,8 +649,14 @@ mod tests {
 
     #[test]
     fn cipher_parse() {
-        assert_eq!(Ss22Cipher::parse("2022-blake3-aes-128-gcm"), Some(Ss22Cipher::Aes128Gcm));
-        assert_eq!(Ss22Cipher::parse("2022-blake3-aes-256-gcm"), Some(Ss22Cipher::Aes256Gcm));
+        assert_eq!(
+            Ss22Cipher::parse("2022-blake3-aes-128-gcm"),
+            Some(Ss22Cipher::Aes128Gcm)
+        );
+        assert_eq!(
+            Ss22Cipher::parse("2022-blake3-aes-256-gcm"),
+            Some(Ss22Cipher::Aes256Gcm)
+        );
         assert_eq!(
             Ss22Cipher::parse("2022-blake3-chacha20-poly1305"),
             Some(Ss22Cipher::Chacha20Poly1305)

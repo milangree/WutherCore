@@ -33,7 +33,11 @@ pub struct FlowKey {
 
 impl FlowKey {
     pub fn from_entry(e: &NatEntry) -> Self {
-        Self { network: e.network, src: e.source, dst: e.original_dst }
+        Self {
+            network: e.network,
+            src: e.source,
+            dst: e.original_dst,
+        }
     }
 }
 
@@ -77,7 +81,10 @@ impl NatTable {
     pub fn pin_host(&self, host: impl Into<String>, outbound: impl Into<String>) {
         self.host_pin.insert(
             host.into(),
-            HostPin { outbound: outbound.into(), last_seen: Instant::now() },
+            HostPin {
+                outbound: outbound.into(),
+                last_seen: Instant::now(),
+            },
         );
     }
 

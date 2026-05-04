@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::adapter::SharedOutbound;
 use crate::block::BlockOutbound;
 use crate::direct::DirectOutbound;
+use crate::dns_hijack::DnsHijackOutbound;
 use crate::http::HttpOutbound;
 use crate::proto::anytls::AnyTlsOutbound;
 use crate::proto::hysteria::HysteriaOutbound;
@@ -18,26 +19,22 @@ use crate::proto::hysteria2::Hysteria2Outbound;
 use crate::proto::mieru::{MieruCipher, MieruOutbound};
 use crate::proto::shadowsocks::{ShadowsocksOutbound, SsCipher};
 use crate::proto::snell::{SnellCipher, SnellOutbound};
-use crate::proto::ss2022::{Ss22Cipher, Ss2022Outbound};
+use crate::proto::ss2022::{Ss2022Outbound, Ss22Cipher};
 use crate::proto::ssh::SshOutbound;
 use crate::proto::ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol};
-use crate::proto::sudoku::{
-    AeadMethod as SudokuAead, SudokuOutbound,
-};
+use crate::proto::sudoku::{AeadMethod as SudokuAead, SudokuOutbound};
 use crate::proto::trojan::TrojanOutbound;
 use crate::proto::trusttunnel::TrustTunnelOutbound;
 use crate::proto::tuic::TuicOutbound;
-use crate::proto::vless::VlessOutbound;
 use crate::proto::vless::VlessNetwork;
+use crate::proto::vless::VlessOutbound;
 use crate::proto::vmess::{VmessNetwork, VmessOutbound, VmessSecurity};
 use crate::proto::vmess_legacy::VmessLegacyOutbound;
 use crate::proto::wireguard::WireGuardOutbound;
+use crate::proto::xhttp::Config as XhttpConfig;
 use crate::socks5::Socks5Outbound;
 use crate::stub::StubOutbound;
-use crate::proto::xhttp::Config as XhttpConfig;
-use crate::transport::{
-    GrpcOptions, H2Options, HttpOptions, WsOptions, XhttpOptions,
-};
+use crate::transport::{GrpcOptions, H2Options, HttpOptions, WsOptions, XhttpOptions};
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
 
@@ -62,6 +59,13 @@ impl OutboundRegistry {
         self.map.get(name).cloned()
     }
 
+    pub fn remove(&mut self, name: &str) -> Option<SharedOutbound> {
+        if name == "DIRECT" || name == "BLOCK" {
+            return None;
+        }
+        self.map.remove(name)
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(|s| s.as_str())
     }
@@ -83,6 +87,7 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
     match node.protocol {
         NodeProtocol::Direct => DirectOutbound::new(),
         NodeProtocol::Block => BlockOutbound::new(),
+        NodeProtocol::Dns => DnsHijackOutbound::new(node.name.clone()),
         NodeProtocol::Http => {
             let mut ob = HttpOutbound::new(&node.name, &node.host, node.port);
             if let (Some(u), Some(p)) = (node.user.clone(), node.password.clone()) {
@@ -91,7 +96,7 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
             ob.into_arc()
         }
         NodeProtocol::Socks5 => {
-            let mut ob = Socks5Outbound::new(&node.name, &node.host, node.port);
+            let mut ob = Socks5Outbound::new(&node.name, &node.host, node.port).with_udp(node.udp);
             if let (Some(u), Some(p)) = (node.user.clone(), node.password.clone()) {
                 ob = ob.with_auth(u, p);
             }
@@ -128,9 +133,11 @@ fn build_shadowsocks(node: &ParsedNode) -> SharedOutbound {
         }
     }
     match SsCipher::parse(method) {
-        Some(c) if !pwd.is_empty() => Arc::new(ShadowsocksOutbound::new(
-            &node.name, &node.host, node.port, c, pwd,
-        )),
+        Some(c) if !pwd.is_empty() => {
+            let mut ob = ShadowsocksOutbound::new(&node.name, &node.host, node.port, c, pwd);
+            ob.udp = node.udp;
+            Arc::new(ob)
+        }
         _ => StubOutbound::new(node.name.clone(), "shadowsocks(unknown-cipher)"),
     }
 }
@@ -138,8 +145,16 @@ fn build_shadowsocks(node: &ParsedNode) -> SharedOutbound {
 fn build_ssr(node: &ParsedNode) -> SharedOutbound {
     let method = node.method.as_deref().unwrap_or("aes-256-cfb");
     let pwd = node.password.as_deref().unwrap_or("");
-    let obfs_str = node.params.get("obfs").map(|s| s.as_str()).unwrap_or("plain");
-    let proto_str = node.params.get("protocol").map(|s| s.as_str()).unwrap_or("origin");
+    let obfs_str = node
+        .params
+        .get("obfs")
+        .map(|s| s.as_str())
+        .unwrap_or("plain");
+    let proto_str = node
+        .params
+        .get("protocol")
+        .map(|s| s.as_str())
+        .unwrap_or("origin");
     let obfs = match SsrObfs::parse(obfs_str, &node.host) {
         Some(o) => o,
         None => return StubOutbound::new(node.name.clone(), "ssr(unsupported-obfs)"),
@@ -154,7 +169,11 @@ fn build_ssr(node: &ParsedNode) -> SharedOutbound {
             ob.obfs = obfs;
             ob.protocol = proto;
             ob.obfs_param = node.params.get("obfs-param").cloned().unwrap_or_default();
-            ob.protocol_param = node.params.get("protocol-param").cloned().unwrap_or_default();
+            ob.protocol_param = node
+                .params
+                .get("protocol-param")
+                .cloned()
+                .unwrap_or_default();
             Arc::new(ob)
         }
         _ => StubOutbound::new(node.name.clone(), "ssr(unsupported-cipher)"),
@@ -187,7 +206,11 @@ fn build_vmess(node: &ParsedNode) -> SharedOutbound {
             ob.security = scy;
         }
         ob.tls = node.tls
-            || node.params.get("tls").map(|s| s == "tls" || s == "true").unwrap_or(false);
+            || node
+                .params
+                .get("tls")
+                .map(|s| s == "tls" || s == "true")
+                .unwrap_or(false);
         ob.sni = node
             .sni
             .clone()
@@ -221,7 +244,11 @@ fn build_vmess(node: &ParsedNode) -> SharedOutbound {
         ob.security = scy;
     }
     ob.tls = node.tls
-        || node.params.get("tls").map(|s| s == "tls" || s == "true").unwrap_or(false);
+        || node
+            .params
+            .get("tls")
+            .map(|s| s == "tls" || s == "true")
+            .unwrap_or(false);
     ob.sni = node
         .sni
         .clone()
@@ -291,7 +318,11 @@ fn build_vless(node: &ParsedNode) -> SharedOutbound {
         .unwrap_or_else(Uuid::nil);
     let mut ob = VlessOutbound::new(&node.name, &node.host, node.port, uuid);
     ob.tls = node.tls;
-    ob.sni = node.sni.clone().or(Some(node.host.clone()));
+    ob.sni = node
+        .sni
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or(Some(node.host.clone()));
     ob.insecure = node
         .params
         .get("allowInsecure")
@@ -335,7 +366,11 @@ fn apply_vless_network_options(node: &ParsedNode, ob: &mut VlessOutbound) {
 fn build_ws_options(node: &ParsedNode) -> WsOptions {
     WsOptions {
         enabled: true,
-        path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
+        path: node
+            .params
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| "/".into()),
         host: node.params.get("host").cloned(),
         headers: vec![],
     }
@@ -371,7 +406,11 @@ fn build_h2_options(node: &ParsedNode) -> H2Options {
     H2Options {
         enabled: true,
         host,
-        path: node.params.get("path").cloned().unwrap_or_else(|| "/".into()),
+        path: node
+            .params
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| "/".into()),
         method: node.params.get("h2-method").cloned().unwrap_or_default(),
     }
 }
@@ -411,7 +450,11 @@ fn build_xhttp_options(
     if let Some(path) = node.params.get("path") {
         cfg.path = path.clone();
     }
-    if let Some(mode) = node.params.get("mode").or_else(|| node.params.get("xhttp-mode")) {
+    if let Some(mode) = node
+        .params
+        .get("mode")
+        .or_else(|| node.params.get("xhttp-mode"))
+    {
         cfg.mode = mode.clone();
     }
     if let Some(method) = node.params.get("uplink-http-method") {
@@ -466,7 +509,12 @@ fn build_xhttp_options(
 fn build_trojan(node: &ParsedNode) -> SharedOutbound {
     let pwd = node.password.clone().unwrap_or_default();
     let mut ob = TrojanOutbound::new(&node.name, &node.host, node.port, pwd);
-    ob.sni = node.sni.clone().or(Some(node.host.clone()));
+    ob.udp = node.udp;
+    ob.sni = node
+        .sni
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or(Some(node.host.clone()));
     ob.insecure = node
         .params
         .get("allowInsecure")
@@ -494,7 +542,12 @@ fn build_snell(node: &ParsedNode) -> SharedOutbound {
         return StubOutbound::new(node.name.clone(), "snell(missing-psk)");
     }
     let mut ob = SnellOutbound::new(&node.name, &node.host, node.port, cipher, pwd);
-    if let Some(v) = node.params.get("version").and_then(|s| s.parse::<u8>().ok()) {
+    ob.udp = node.udp;
+    if let Some(v) = node
+        .params
+        .get("version")
+        .and_then(|s| s.parse::<u8>().ok())
+    {
         ob.version = v;
     }
     if let Some(obfs_type) = node.params.get("obfs").map(|s| s.as_str()) {
@@ -515,7 +568,19 @@ fn build_snell(node: &ParsedNode) -> SharedOutbound {
 fn build_anytls(node: &ParsedNode) -> SharedOutbound {
     let pwd = node.password.clone().unwrap_or_default();
     let mut ob = AnyTlsOutbound::new(&node.name, &node.host, node.port, pwd);
-    ob.sni = node.sni.clone().or(Some(node.host.clone()));
+    let disable_sni = node
+        .params
+        .get("disable-sni")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    ob.sni = if disable_sni {
+        None
+    } else {
+        node.sni
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(Some(node.host.clone()))
+    };
     ob.insecure = node
         .params
         .get("allowInsecure")
@@ -544,7 +609,12 @@ fn build_ssh(node: &ParsedNode) -> SharedOutbound {
 }
 
 fn build_hysteria_v1(node: &ParsedNode) -> SharedOutbound {
-    let auth_b = node.params.get("auth").cloned().unwrap_or_default().into_bytes();
+    let auth_b = node
+        .params
+        .get("auth")
+        .cloned()
+        .unwrap_or_default()
+        .into_bytes();
     let mut ob = HysteriaOutbound::new(&node.name, &node.host, node.port, auth_b);
     if let Some(s) = node.sni.clone() {
         ob.sni = Some(s);
@@ -650,7 +720,11 @@ fn build_mieru(node: &ParsedNode) -> SharedOutbound {
     let user = node.user.clone().unwrap_or_default();
     let pwd = node.password.clone().unwrap_or_default();
     let mut ob = MieruOutbound::new(&node.name, &node.host, node.port, user, pwd);
-    if let Some(c) = node.params.get("cipher").and_then(|s| MieruCipher::parse(s)) {
+    if let Some(c) = node
+        .params
+        .get("cipher")
+        .and_then(|s| MieruCipher::parse(s))
+    {
         ob.cipher = c;
     }
     Arc::new(ob)
@@ -668,7 +742,11 @@ fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
     }
     let mut cfg = crate::proto::sudoku::outbound::SudokuConfig::default();
     cfg.key = key;
-    if let Some(method) = node.params.get("aead-method").or_else(|| node.method.as_ref()) {
+    if let Some(method) = node
+        .params
+        .get("aead-method")
+        .or_else(|| node.method.as_ref())
+    {
         match SudokuAead::parse(method) {
             Ok(m) => cfg.aead_method = m,
             Err(_) => {
@@ -716,7 +794,11 @@ fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
     let user = node.user.clone().unwrap_or_default();
     let pwd = node.password.clone().unwrap_or_default();
     let mut ob = TrustTunnelOutbound::new(&node.name, &node.host, node.port, user, pwd);
-    ob.sni = node.sni.clone().or(Some(node.host.clone()));
+    ob.sni = node
+        .sni
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or(Some(node.host.clone()));
     ob.insecure = node
         .params
         .get("skip-cert-verify")
@@ -759,7 +841,9 @@ fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
 
 fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     use base64::Engine;
-    let v = base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()?;
+    let v = base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .ok()?;
     if v.len() != 32 {
         return None;
     }
@@ -770,6 +854,7 @@ fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
 
 fn proto_static_name(p: &NodeProtocol) -> &'static str {
     match p {
+        NodeProtocol::Dns => "dns",
         NodeProtocol::Shadowsocks => "shadowsocks",
         NodeProtocol::ShadowsocksR => "shadowsocksr",
         NodeProtocol::Vmess => "vmess",

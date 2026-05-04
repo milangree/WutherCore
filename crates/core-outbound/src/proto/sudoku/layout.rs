@@ -162,7 +162,10 @@ pub fn new_custom_layout(pattern: &str) -> Result<ByteLayout, String> {
         .filter(|c| !c.is_whitespace())
         .collect();
     if cleaned.len() != 8 {
-        return Err(format!("custom table must have 8 symbols, got {}", cleaned.len()));
+        return Err(format!(
+            "custom table must have 8 symbols, got {}",
+            cleaned.len()
+        ));
     }
 
     let mut x_bits: Vec<u8> = Vec::new();

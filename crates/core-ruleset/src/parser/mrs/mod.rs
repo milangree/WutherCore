@@ -139,9 +139,8 @@ pub fn parse(body: &[u8]) -> Result<MrsPayload, ParseError> {
 }
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), ParseError> {
-    r.read_exact(buf).map_err(|e| {
-        ParseError::Other(format!("MRS read_exact failed ({} bytes): {e}", buf.len()))
-    })
+    r.read_exact(buf)
+        .map_err(|e| ParseError::Other(format!("MRS read_exact failed ({} bytes): {e}", buf.len())))
 }
 
 fn read_i64_be<R: Read>(r: &mut R) -> Result<i64, ParseError> {

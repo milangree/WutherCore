@@ -1,12 +1,12 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
 
 use crate::adapter::{
-    apply_outbound_mark, resolve_host, BoxedStream, BoxedUdp, Capabilities, DialContext,
-    OutboundAdapter, UdpSocketLike,
+    prepare_outbound_udp_socket_for_addr, resolve_host_for_direct, BoxedStream, BoxedUdp,
+    Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
 };
 use crate::transport::tcp::TcpTransport;
 use crate::transport::Transport;
@@ -37,60 +37,95 @@ impl OutboundAdapter for DirectOutbound {
         }
     }
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        // 走 TcpTransport：自带 RPKernel resolver + SO_MARK 绕 TUN。
-        TcpTransport::default().connect(&ctx.host, ctx.port).await
+        // DIRECT 出站：解析走 direct-nameserver group，避开 fake-ip / 业务策略；
+        // SO_MARK 绕 TUN（与代理出站共用同一套防自循环路径）。
+        TcpTransport::for_direct()
+            .connect(&ctx.host, ctx.port)
+            .await
     }
 
-    /// UDP direct 通道 —— `tokio::net::UdpSocket` bind 到 0.0.0.0/任意端口，
-    /// 配合 SO_MARK 让出包绕开 TUN 路由表。每次 send_to 都现场解析目标 host。
-    async fn dial_udp(&self, _ctx: DialContext) -> std::io::Result<BoxedUdp> {
-        // 用 std::net::UdpSocket 创建 + apply_outbound_mark + 转 tokio
-        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        // SO_MARK 让回包路由绕开 TUN（与 TCP outbound 一致）
-        if let Err(e) = apply_outbound_mark(&socket2::SockRef::from(&sock)) {
-            tracing::debug!(target: "dial::udp", error = %e, "apply SO_MARK failed (non-fatal)");
+    /// UDP direct 通道 —— 先解析目标，再按目标地址族创建 socket。
+    ///
+    /// 不能在不知道目标前固定 bind `0.0.0.0:0`：
+    /// * IPv4 socket 无法连接 IPv6 目标；
+    /// * 本地/LAN/排除地址不应打 outbound mark，否则会绕错路由表。
+    async fn dial_udp(&self, ctx: DialContext) -> std::io::Result<BoxedUdp> {
+        let addrs = resolve_host_for_direct(&ctx.host, ctx.port).await?;
+        let mut last_err: Option<std::io::Error> = None;
+        for addr in addrs {
+            match open_direct_udp_socket(addr) {
+                Ok((sock, loopback_guard)) => {
+                    tracing::debug!(
+                        target: "dial::udp",
+                        id = ctx.dial_id,
+                        host = %ctx.host,
+                        port = ctx.port,
+                        peer = %addr,
+                        local = %sock.local_addr().map(|v| v.to_string()).unwrap_or_else(|_| "-".into()),
+                        "direct udp connected",
+                    );
+                    return Ok(Box::new(DirectUdp {
+                        sock: Arc::new(sock),
+                        peer: addr,
+                        loopback_guard,
+                    }));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "dial::udp",
+                        id = ctx.dial_id,
+                        host = %ctx.host,
+                        port = ctx.port,
+                        peer = %addr,
+                        error = %e,
+                        "direct udp candidate failed",
+                    );
+                    last_err = Some(e);
+                }
+            }
         }
-        sock.set_nonblocking(true)?;
-        let async_sock = UdpSocket::from_std(sock)?;
-        Ok(Box::new(DirectUdp {
-            sock: Arc::new(async_sock),
-            peer: tokio::sync::OnceCell::new(),
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "udp direct: no usable address for {}:{}",
+                    ctx.host, ctx.port
+                ),
+            )
         }))
     }
 }
 
 struct DirectUdp {
     sock: Arc<UdpSocket>,
-    /// 缓存第一次 send_to 解析的 peer：同 5-tuple 后续包不再 resolve。
-    /// 配合 TUN 侧 [`UdpSessionTable`]——同一个 session 只走 1 次 DNS 解析。
-    peer: tokio::sync::OnceCell<SocketAddr>,
+    peer: SocketAddr,
+    loopback_guard: crate::loopback::LoopbackUdpGuard,
+}
+
+fn open_direct_udp_socket(
+    peer: SocketAddr,
+) -> std::io::Result<(UdpSocket, crate::loopback::LoopbackUdpGuard)> {
+    let (std_sock, guard) = crate::adapter::create_outbound_udp_socket(peer)?;
+    Ok((UdpSocket::from_std(std_sock)?, guard))
 }
 
 #[async_trait]
 impl UdpSocketLike for DirectUdp {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize> {
-        // 已缓存 peer → 直接 send_to，跳过 resolver
-        if let Some(addr) = self.peer.get() {
-            return self.sock.send_to(buf, *addr).await;
+        if target != self.peer.ip().to_string() || port != self.peer.port() {
+            tracing::trace!(
+                target: "dial::udp",
+                peer = %self.peer,
+                send_target = %target,
+                send_port = port,
+                "send via connected direct udp socket"
+            );
         }
-        // 第一次：resolver 解析（IP literal 直接返回；hostname 走 RPKernel resolver）
-        let addrs = resolve_host(target, port).await?;
-        let mut last_err: Option<std::io::Error> = None;
-        for addr in addrs {
-            match self.sock.send_to(buf, addr).await {
-                Ok(n) => {
-                    let _ = self.peer.set(addr);
-                    return Ok(n);
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no usable target")
-        }))
+        self.sock.send(buf).await
     }
+
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let (n, _from): (usize, SocketAddr) = self.sock.recv_from(buf).await?;
-        Ok(n)
+        let _ = &self.loopback_guard;
+        self.sock.recv(buf).await
     }
 }

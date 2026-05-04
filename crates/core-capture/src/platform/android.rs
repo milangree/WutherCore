@@ -1,14 +1,13 @@
-//! Android 后端：root 模式完整能力 + 自动降级到 VpnService。
+//! Android 后端：root 模式完整透明代理能力。
 //!
 //! 行为：
 //! 1. [`detect_capability`] 通过 `su -c` 执行多个探测命令收集 [`AndroidCapability`]；
-//! 2. [`AndroidCapability::select_tier`] 选最高可用 Tier；
+//! 2. [`AndroidCapability::select_tier`] 选最高可用 root Tier；
 //! 3. [`AndroidCapture::start`] 调用对应 Tier 的 install_rules：
-//!    - **NftablesFull**：`nft add table inet rpkernel` + 双栈 TPROXY chain
+//!    - **NftablesFull**：`nft add table inet wuthercore` + 双栈 TPROXY chain
 //!    - **IptablesV4V6Tproxy**：`iptables` + `ip6tables` 双栈 TPROXY
 //!    - **IptablesV4V6Redirect**：`iptables -t nat REDIRECT` + `ip6tables -t nat REDIRECT`
 //!    - **IptablesV4Only**：仅 v4 NAT REDIRECT
-//!    - **VpnService**：交给宿主 App，本进程仅持有 fd（FFI 接入点）
 //! 4. [`AndroidCapture::stop`] 严格按 Tier 卸载规则，恢复路由表。
 //!
 //! 跨平台编译：本文件在所有平台都参与构建，但 `su -c` 命令调用使用 `cfg(target_os = "android")` 守护；
@@ -39,7 +38,7 @@ pub fn list_interfaces() -> Vec<String> {
 
 pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, CaptureError> {
     match plan.kind {
-        // Tun → 走 Linux engine 拿真实 TunIo（VpnService fd 优先；root /dev/net/tun fallback）。
+        // Tun → 走 Linux engine 拿真实 TunIo（root /dev/net/tun 优先；VpnService fd fallback）。
         #[cfg(target_os = "android")]
         EngineKind::Tun => crate::platform::linux::build_engine(plan),
         EngineKind::Tun | EngineKind::Tproxy | EngineKind::Redirect => {
@@ -52,7 +51,7 @@ pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, Capture
 pub struct AndroidCapture {
     plan: CapturePlan,
     capability: AndroidCapability,
-    tier: AndroidTier,
+    tier: Option<AndroidTier>,
     state: Mutex<bool>,
 }
 
@@ -62,10 +61,10 @@ impl AndroidCapture {
         let tier = capability.select_tier();
         info!(
             target: "capture::android",
-            tier = tier.label(),
-            ipv6 = tier.supports_ipv6(),
-            udp = tier.supports_udp_transparent(),
-            requires_root = tier.requires_root(),
+            tier = tier_label(tier),
+            ipv6 = tier.map(|t| t.supports_ipv6()).unwrap_or(false),
+            udp = tier.map(|t| t.supports_udp_transparent()).unwrap_or(false),
+            requires_root = tier.map(|t| t.requires_root()).unwrap_or(false),
             "android capture tier selected"
         );
         for note in capability.explain_degradation(tier) {
@@ -79,34 +78,48 @@ impl AndroidCapture {
         }
     }
 
-    pub fn capability(&self) -> &AndroidCapability { &self.capability }
-    pub fn tier(&self) -> AndroidTier { self.tier }
+    pub fn capability(&self) -> &AndroidCapability {
+        &self.capability
+    }
+    pub fn tier(&self) -> Option<AndroidTier> {
+        self.tier
+    }
 
     fn install(&self) -> Result<(), CaptureError> {
-        match self.tier {
+        let Some(tier) = self.tier else {
+            return Err(CaptureError::Unsupported(
+                "Android root transparent capture requires root and nftables/iptables; use virtual_nic/VpnService for non-root capture".into(),
+            ));
+        };
+        match tier {
             AndroidTier::NftablesFull => install_nft_full(&self.plan),
             AndroidTier::IptablesV4V6Tproxy => install_iptables_v4v6_tproxy(&self.plan),
             AndroidTier::IptablesV4V6Redirect => install_iptables_v4v6_redirect(&self.plan),
             AndroidTier::IptablesV4Only => install_iptables_v4_only(&self.plan),
-            AndroidTier::VpnService => Ok(()),
         }
     }
 
     fn revert(&self) {
         match self.tier {
-            AndroidTier::NftablesFull => revert_nft_full(),
-            AndroidTier::IptablesV4V6Tproxy
-            | AndroidTier::IptablesV4V6Redirect
-            | AndroidTier::IptablesV4Only => revert_iptables_all(),
-            AndroidTier::VpnService => {}
+            None => {}
+            Some(tier) => match tier {
+                AndroidTier::NftablesFull => revert_nft_full(),
+                AndroidTier::IptablesV4V6Tproxy
+                | AndroidTier::IptablesV4V6Redirect
+                | AndroidTier::IptablesV4Only => revert_iptables_all(),
+            },
         }
     }
 }
 
 #[async_trait]
 impl CaptureEngine for AndroidCapture {
-    fn kind(&self) -> EngineKind { self.plan.kind }
-    fn plan(&self) -> &CapturePlan { &self.plan }
+    fn kind(&self) -> EngineKind {
+        self.plan.kind
+    }
+    fn plan(&self) -> &CapturePlan {
+        &self.plan
+    }
 
     async fn start(
         self: Arc<Self>,
@@ -121,7 +134,7 @@ impl CaptureEngine for AndroidCapture {
         *g = true;
         info!(
             target: "capture::android",
-            tier = self.tier.label(),
+            tier = tier_label(self.tier),
             "android capture started"
         );
         Ok(())
@@ -136,7 +149,7 @@ impl CaptureEngine for AndroidCapture {
         *g = false;
         info!(
             target: "capture::android",
-            tier = self.tier.label(),
+            tier = tier_label(self.tier),
             "android capture stopped"
         );
         Ok(())
@@ -145,26 +158,28 @@ impl CaptureEngine for AndroidCapture {
     fn report(&self) -> serde_json::Value {
         serde_json::json!({
             "kind": format!("{:?}", self.kind()).to_lowercase(),
-            "android_tier": self.tier.label(),
-            "ipv6": self.tier.supports_ipv6(),
-            "udp_transparent": self.tier.supports_udp_transparent(),
+            "android_tier": tier_label(self.tier),
+            "ipv6": self.tier.map(|t| t.supports_ipv6()).unwrap_or(false),
+            "udp_transparent": self.tier.map(|t| t.supports_udp_transparent()).unwrap_or(false),
             "capability": self.capability,
         })
     }
 }
 
+fn tier_label(tier: Option<AndroidTier>) -> &'static str {
+    tier.map(|t| t.label()).unwrap_or("unsupported")
+}
+
 /* ============================================================
-   Capability 探测（通过 su -c 执行命令）
-   ============================================================ */
+Capability 探测（通过 su -c 执行命令）
+============================================================ */
 
 #[cfg(target_os = "android")]
 pub fn detect_capability() -> AndroidCapability {
     let mut c = AndroidCapability::default();
 
     // root
-    c.has_root = run_su("id")
-        .map(|o| o.contains("uid=0"))
-        .unwrap_or(false);
+    c.has_root = run_su("id").map(|o| o.contains("uid=0")).unwrap_or(false);
     if !c.has_root {
         c.notes.push("su 不可用".into());
         return c;
@@ -236,11 +251,11 @@ fn run_su_must(_cmd: &str) -> Result<(), CaptureError> {
 }
 
 /* ============================================================
-   Per-Tier 安装/撤销（Android target 才真执行）
-   ============================================================ */
+Per-Tier 安装/撤销（Android target 才真执行）
+============================================================ */
 
-const NFT_TABLE: &str = "rpkernel";
-const IPT_CHAIN: &str = "RPKERNEL";
+const NFT_TABLE: &str = "wuthercore";
+const IPT_CHAIN: &str = "WUTHERCORE";
 
 fn install_nft_full(plan: &CapturePlan) -> Result<(), CaptureError> {
     info!(target: "capture::android", "Tier=NftablesFull installing");

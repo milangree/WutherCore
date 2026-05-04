@@ -20,7 +20,7 @@
 //!   从表里 remove。这样即使 splice 任务还在 select! 里等数据，也能立刻收到
 //!   取消信号开始 shutdown，而不是只在表里消失却继续传字节。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -410,6 +410,97 @@ impl ConnectionTable {
             .collect()
     }
 
+    /// 反查一条连接的 "process → host:port" 简标签 —— 给 relay log 用。
+    /// process 字段为空时返回 `?`；host 为空时回退 destination_ip。
+    pub fn label_for(&self, id: u64) -> String {
+        let Some(e) = self.entries.get(&id) else {
+            return format!("#{id}");
+        };
+        let m = &e.meta;
+        let proc_label = if m.process.is_empty() { "?" } else { m.process.as_str() };
+        let host = if !m.host.is_empty() {
+            m.host.as_str()
+        } else if !m.destination_ip.is_empty() {
+            m.destination_ip.as_str()
+        } else {
+            "?"
+        };
+        format!("{proc_label} -> {host}:{}", m.destination_port)
+    }
+
+    /// 周期性聚合 —— 给"连接表怎么这么多"的诊断日志用。`top_n` 控制每个 bucket
+    /// 取前几名；`long_lived` 是判定"长连接"的阈值（持续超过 N 秒就单独列出来）。
+    pub fn summary(&self, top_n: usize, long_lived: std::time::Duration) -> ConnectionSummary {
+        let entries: Vec<ConnectionEntry> =
+            self.entries.iter().map(|e| e.value().clone()).collect();
+        let total = entries.len();
+        let tcp = entries.iter().filter(|e| e.meta.network == "tcp").count();
+        let udp = total.saturating_sub(tcp);
+
+        let mut dst_hist: HashMap<String, usize> = HashMap::new();
+        let mut proc_hist: HashMap<String, usize> = HashMap::new();
+        let mut rule_hist: HashMap<String, usize> = HashMap::new();
+        let mut chain_hist: HashMap<String, usize> = HashMap::new();
+        for e in &entries {
+            let m = &e.meta;
+            let host = if !m.host.is_empty() {
+                m.host.clone()
+            } else {
+                m.destination_ip.clone()
+            };
+            *dst_hist.entry(format!("{host}:{}", m.destination_port)).or_default() += 1;
+            let p = if m.process.is_empty() { "?".into() } else { m.process.clone() };
+            *proc_hist.entry(p).or_default() += 1;
+            let r = if m.rule.is_empty() { "?".into() } else { m.rule.clone() };
+            *rule_hist.entry(r).or_default() += 1;
+            let chain = m.chains.last().cloned().unwrap_or_else(|| "?".into());
+            *chain_hist.entry(chain).or_default() += 1;
+        }
+        let now_secs = now_secs();
+        let threshold = long_lived.as_secs();
+        let long_lived_entries: Vec<LongLivedEntry> = {
+            let mut v: Vec<LongLivedEntry> = entries
+                .iter()
+                .filter(|e| now_secs.saturating_sub(e.started_at) >= threshold)
+                .map(|e| LongLivedEntry {
+                    id: e.id,
+                    process: if e.meta.process.is_empty() {
+                        "?".into()
+                    } else {
+                        e.meta.process.clone()
+                    },
+                    host: if !e.meta.host.is_empty() {
+                        e.meta.host.clone()
+                    } else {
+                        e.meta.destination_ip.clone()
+                    },
+                    destination_port: e
+                        .meta
+                        .destination_port
+                        .parse::<u16>()
+                        .unwrap_or(0),
+                    age_secs: now_secs.saturating_sub(e.started_at),
+                    bytes_up: e.bytes_up.load(Ordering::Relaxed),
+                    bytes_down: e.bytes_down.load(Ordering::Relaxed),
+                    network: e.meta.network.clone(),
+                })
+                .collect();
+            v.sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
+            v.truncate(top_n);
+            v
+        };
+        ConnectionSummary {
+            total,
+            tcp,
+            udp,
+            top_destinations: top_n_buckets(dst_hist, top_n),
+            top_processes: top_n_buckets(proc_hist, top_n),
+            by_rule: top_n_buckets(rule_hist, top_n),
+            by_outbound: top_n_buckets(chain_hist, top_n),
+            long_lived: long_lived_entries,
+        }
+    }
+
     pub fn get(&self, id: u64) -> Option<ConnectionEntry> {
         self.entries.get(&id).map(|e| e.value().clone())
     }
@@ -705,6 +796,123 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/* ========================================================================
+诊断聚合 —— "连接表怎么这么多"日志的支撑结构。
+======================================================================== */
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConnectionSummary {
+    pub total: usize,
+    pub tcp: usize,
+    pub udp: usize,
+    /// (host:port, count) 倒序，长度 ≤ top_n。
+    pub top_destinations: Vec<(String, usize)>,
+    /// (process_name, count) 倒序，长度 ≤ top_n。
+    pub top_processes: Vec<(String, usize)>,
+    pub by_rule: Vec<(String, usize)>,
+    pub by_outbound: Vec<(String, usize)>,
+    /// 按 age 倒序的长连接条目，长度 ≤ top_n。
+    pub long_lived: Vec<LongLivedEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LongLivedEntry {
+    pub id: u64,
+    pub process: String,
+    pub host: String,
+    pub destination_port: u16,
+    pub age_secs: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub network: String,
+}
+
+fn top_n_buckets(map: HashMap<String, usize>, n: usize) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(n);
+    v
+}
+
+/// 把 [`ConnectionSummary`] 输出到日志。target=`"conntable"`，level=info。
+/// 每个 bucket 一行，长连接每条一行 —— 不会因为大表把单条日志撑爆。
+pub fn log_connection_summary(summary: &ConnectionSummary) {
+    tracing::info!(
+        target: "conntable",
+        "active={} tcp={} udp={}",
+        summary.total,
+        summary.tcp,
+        summary.udp
+    );
+    if !summary.top_destinations.is_empty() {
+        let s = summary
+            .top_destinations
+            .iter()
+            .map(|(k, v)| format!("{k}×{v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(target: "conntable", "top-dst: {s}");
+    }
+    if summary.top_processes.iter().any(|(k, _)| k != "?") {
+        let s = summary
+            .top_processes
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(target: "conntable", "top-process: {s}");
+    }
+    if !summary.by_rule.is_empty() {
+        let s = summary
+            .by_rule
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(target: "conntable", "by-rule: {s}");
+    }
+    if !summary.by_outbound.is_empty() {
+        let s = summary
+            .by_outbound
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(target: "conntable", "by-outbound: {s}");
+    }
+    for e in &summary.long_lived {
+        let mins = e.age_secs / 60;
+        let secs = e.age_secs % 60;
+        let up = format_bytes_short(e.bytes_up);
+        let down = format_bytes_short(e.bytes_down);
+        tracing::info!(
+            target: "conntable",
+            "long-lived #{} {} {}->{}:{} ({}m{:02}s, up {} down {})",
+            e.id,
+            e.network,
+            e.process,
+            e.host,
+            e.destination_port,
+            mins,
+            secs,
+            up,
+            down,
+        );
+    }
+}
+
+fn format_bytes_short(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +969,97 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(t.len(), 0);
         // guard drop 仍是 safe（remove_silent 对不存在的 id 无副作用）
+    }
+
+    #[test]
+    fn label_for_falls_back_when_process_blank() {
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            host: "example.com".into(),
+            destination_port: "443".into(),
+            ..ConnectionMeta::default()
+        });
+        let label = t.label_for(g.id);
+        assert_eq!(label, "? -> example.com:443");
+    }
+
+    #[test]
+    fn label_for_uses_process_when_present() {
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            host: "api.example.com".into(),
+            destination_port: "443".into(),
+            process: "chrome.exe".into(),
+            ..ConnectionMeta::default()
+        });
+        let label = t.label_for(g.id);
+        assert_eq!(label, "chrome.exe -> api.example.com:443");
+    }
+
+    #[test]
+    fn label_for_unknown_id_returns_id_marker() {
+        let t = ConnectionTable::new();
+        // 表里什么都没有；任意 id 都查不到
+        assert_eq!(t.label_for(42), "#42");
+    }
+
+    #[test]
+    fn summary_buckets_by_destination_process_rule_outbound() {
+        let t = ConnectionTable::new();
+        let _g1 = t.open(ConnectionMeta {
+            network: "tcp".into(),
+            host: "cdn.example.com".into(),
+            destination_port: "443".into(),
+            process: "chrome.exe".into(),
+            rule: "GEOIP".into(),
+            chains: vec!["main".into(), "node-a".into()],
+            ..ConnectionMeta::default()
+        });
+        let _g2 = t.open(ConnectionMeta {
+            network: "tcp".into(),
+            host: "cdn.example.com".into(),
+            destination_port: "443".into(),
+            process: "chrome.exe".into(),
+            rule: "GEOIP".into(),
+            chains: vec!["main".into(), "node-a".into()],
+            ..ConnectionMeta::default()
+        });
+        let _g3 = t.open(ConnectionMeta {
+            network: "udp".into(),
+            host: "1.1.1.1".into(),
+            destination_port: "53".into(),
+            process: "WutherCore".into(),
+            rule: "MATCH".into(),
+            chains: vec!["DIRECT".into()],
+            ..ConnectionMeta::default()
+        });
+        let s = t.summary(10, std::time::Duration::from_secs(300));
+        assert_eq!(s.total, 3);
+        assert_eq!(s.tcp, 2);
+        assert_eq!(s.udp, 1);
+        assert_eq!(s.top_destinations[0], ("cdn.example.com:443".into(), 2));
+        assert!(s.top_processes.iter().any(|(k, v)| k == "chrome.exe" && *v == 2));
+        assert!(s.top_processes.iter().any(|(k, v)| k == "WutherCore" && *v == 1));
+        assert!(s.by_rule.iter().any(|(k, v)| k == "GEOIP" && *v == 2));
+        assert!(s.by_outbound.iter().any(|(k, v)| k == "node-a" && *v == 2));
+    }
+
+    #[test]
+    fn summary_long_lived_threshold_filters_recent() {
+        let t = ConnectionTable::new();
+        let _g = t.open(ConnectionMeta {
+            host: "fresh.example.com".into(),
+            destination_port: "443".into(),
+            ..ConnectionMeta::default()
+        });
+        // 1s 阈值，新鲜连接（age ≈ 0s）应被过滤掉
+        let s = t.summary(10, std::time::Duration::from_secs(1));
+        assert!(s.long_lived.is_empty(), "新连接不该出现在 long-lived 清单");
+
+        // 0s 阈值，所有连接都算长连接
+        let s2 = t.summary(10, std::time::Duration::from_secs(0));
+        assert_eq!(s2.long_lived.len(), 1);
+        assert_eq!(s2.long_lived[0].host, "fresh.example.com");
     }
 
     #[test]

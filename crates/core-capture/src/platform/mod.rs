@@ -14,23 +14,37 @@ use crate::engine::{CaptureEngine, CaptureError, CapturePlan};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub mod linux_tun_io;
+pub mod linux_identity_bypass;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux_tproxy;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod linux_tun_io;
+
+// `virtio_net_hdr` 编解码 —— 跨平台编译，为单元测试提供主机可达的入口；
+// 实际仅 Linux/Android 在 read/write 路径上引用。
+pub mod vnet_hdr;
+// GSO 接收方向切分（kernel 投递大段 → 切成多个完整 IP 包）。
+// 阶段 3.5a：纯算法；3.5b 接到 Linux read_batch。
+pub mod gso_split;
+// GRO 发送方向合并（用户态多个连续段 → 合并成大段，让 kernel TSO 分片）。
+// 阶段 3.6b：纯算法，未接 dispatcher / write 路径。
+pub mod gro_merge;
+pub(crate) mod route_probe;
+pub mod tunrs_io;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
-pub mod wintun_abi;
-#[cfg(target_os = "windows")]
 pub mod windows_tun_io;
+#[cfg(target_os = "windows")]
+pub mod wintun_abi;
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod ios_bridge;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos_tun_io;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub mod ios_bridge;
 
 #[cfg(not(any(
     target_os = "linux",
@@ -45,9 +59,9 @@ pub mod stub;
 // 让 select_tier 等纯逻辑可在任何主机做单元测试；实际 build_engine 仍受
 // `target_os` 限制。
 pub mod android;
-pub mod android_tun_io;
 #[cfg(target_os = "android")]
 pub mod android_jni;
+pub mod android_tun_io;
 #[cfg(target_os = "android")]
 pub mod vpnservice_tun_io;
 
@@ -107,5 +121,64 @@ pub fn list_interfaces() -> Vec<String> {
     )))]
     {
         return stub::list_interfaces();
+    }
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) fn is_absent_ip_rule_delete(prog: &str, args: &[&str], stderr: &str) -> bool {
+    if prog != "ip" {
+        return false;
+    }
+    let args = strip_ip_family_prefix(args);
+    if args.len() < 2 || args[0] != "rule" || args[1] != "del" {
+        return false;
+    }
+    stderr.to_ascii_lowercase().contains("no such file")
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn strip_ip_family_prefix<'a, 'b>(args: &'a [&'b str]) -> &'a [&'b str] {
+    match args {
+        ["-4" | "-6", rest @ ..] => rest,
+        ["-f", _family, rest @ ..] => rest,
+        _ => args,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_absent_ip_rule_delete;
+
+    #[test]
+    fn ip_rule_delete_no_such_file_is_expected_cleanup_absence() {
+        assert!(is_absent_ip_rule_delete(
+            "ip",
+            &["rule", "del", "fwmark", "0xff", "lookup", "main"],
+            "RTNETLINK answers: No such file or directory\n",
+        ));
+        assert!(is_absent_ip_rule_delete(
+            "ip",
+            &["-6", "rule", "del", "priority", "9099", "lookup", "main"],
+            "RTNETLINK answers: No such file or directory\n",
+        ));
+    }
+
+    #[test]
+    fn ip_rule_delete_other_failure_is_not_expected_cleanup_absence() {
+        assert!(!is_absent_ip_rule_delete(
+            "ip",
+            &["rule", "del", "fwmark", "0xff", "lookup", "main"],
+            "Operation not permitted\n",
+        ));
+        assert!(!is_absent_ip_rule_delete(
+            "nft",
+            &["rule", "del", "fwmark", "0xff", "lookup", "main"],
+            "RTNETLINK answers: No such file or directory\n",
+        ));
+        assert!(!is_absent_ip_rule_delete(
+            "ip",
+            &["rule", "add", "fwmark", "0xff", "lookup", "main"],
+            "RTNETLINK answers: No such file or directory\n",
+        ));
     }
 }

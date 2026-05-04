@@ -80,17 +80,39 @@ pub fn parse(body: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
 fn flatten(r: Rule, out: &mut Vec<ClassicalEntry>) {
     match r {
         Rule::Default(d) => {
-            for v in d.domain { out.push(ce(ClassicalKind::Domain, v)); }
-            for v in d.domain_suffix { out.push(ce(ClassicalKind::DomainSuffix, v)); }
-            for v in d.domain_keyword { out.push(ce(ClassicalKind::DomainKeyword, v)); }
-            for v in d.domain_regex { out.push(ce(ClassicalKind::DomainRegex, v)); }
-            for v in d.ip_cidr { out.push(ce(ClassicalKind::IpCidr, v)); }
-            for v in d.source_ip_cidr { out.push(ce(ClassicalKind::SrcIpCidr, v)); }
-            for v in d.port { out.push(ce(ClassicalKind::DstPort, v.to_string())); }
-            for v in d.port_range { out.push(ce(ClassicalKind::DstPort, v.replace(':', "-"))); }
-            for v in d.source_port { out.push(ce(ClassicalKind::SrcPort, v.to_string())); }
-            for v in d.source_port_range { out.push(ce(ClassicalKind::SrcPort, v.replace(':', "-"))); }
-            for v in d.process_name { out.push(ce(ClassicalKind::ProcessName, v)); }
+            for v in d.domain {
+                out.push(ce(ClassicalKind::Domain, v));
+            }
+            for v in d.domain_suffix {
+                out.push(ce(ClassicalKind::DomainSuffix, v));
+            }
+            for v in d.domain_keyword {
+                out.push(ce(ClassicalKind::DomainKeyword, v));
+            }
+            for v in d.domain_regex {
+                out.push(ce(ClassicalKind::DomainRegex, v));
+            }
+            for v in d.ip_cidr {
+                out.push(ce(ClassicalKind::IpCidr, v));
+            }
+            for v in d.source_ip_cidr {
+                out.push(ce(ClassicalKind::SrcIpCidr, v));
+            }
+            for v in d.port {
+                out.push(ce(ClassicalKind::DstPort, v.to_string()));
+            }
+            for v in d.port_range {
+                out.push(ce(ClassicalKind::DstPort, v.replace(':', "-")));
+            }
+            for v in d.source_port {
+                out.push(ce(ClassicalKind::SrcPort, v.to_string()));
+            }
+            for v in d.source_port_range {
+                out.push(ce(ClassicalKind::SrcPort, v.replace(':', "-")));
+            }
+            for v in d.process_name {
+                out.push(ce(ClassicalKind::ProcessName, v));
+            }
             let _ = d.rtype;
         }
         Rule::Logical(l) => {
@@ -102,7 +124,11 @@ fn flatten(r: Rule, out: &mut Vec<ClassicalEntry>) {
 }
 
 fn ce(k: ClassicalKind, v: String) -> ClassicalEntry {
-    ClassicalEntry { kind: k, value: v, policy: None }
+    ClassicalEntry {
+        kind: k,
+        value: v,
+        policy: None,
+    }
 }
 
 #[cfg(test)]
@@ -124,7 +150,11 @@ mod tests {
         let v = parse(json).unwrap();
         // 1+1+1+2+1+1+1 = 8
         assert_eq!(v.len(), 8);
-        assert!(v.iter().any(|e| e.kind == ClassicalKind::DomainKeyword && e.value == "google"));
-        assert!(v.iter().any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000"));
+        assert!(v
+            .iter()
+            .any(|e| e.kind == ClassicalKind::DomainKeyword && e.value == "google"));
+        assert!(v
+            .iter()
+            .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000"));
     }
 }

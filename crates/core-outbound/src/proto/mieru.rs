@@ -87,14 +87,25 @@ impl MieruOutbound {
 
 #[async_trait]
 impl OutboundAdapter for MieruOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "mieru" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "mieru"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: false, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut stream = TcpTransport::default().connect(&self.host, self.port).await?;
+        let mut stream = TcpTransport::default()
+            .connect(&self.host, self.port)
+            .await?;
 
         // 1) salt + 派生 subkey
         let mut salt = [0u8; SALT_LEN];
@@ -156,12 +167,17 @@ struct MieruCryptor {
 impl MieruCryptor {
     fn new(cipher: MieruCipher, key: &[u8; 32]) -> Self {
         let aead = match cipher {
-            MieruCipher::Aes256Gcm => MieruAead::Aes256(Aes256Gcm::new_from_slice(key).expect("len")),
+            MieruCipher::Aes256Gcm => {
+                MieruAead::Aes256(Aes256Gcm::new_from_slice(key).expect("len"))
+            }
             MieruCipher::Chacha20Poly1305 => {
                 MieruAead::Chacha(ChaCha20Poly1305::new_from_slice(key).expect("len"))
             }
         };
-        Self { aead, nonce: [0u8; 12] }
+        Self {
+            aead,
+            nonce: [0u8; 12],
+        }
     }
 
     fn next_nonce(&mut self) -> [u8; 12] {
@@ -169,7 +185,9 @@ impl MieruCryptor {
         for b in self.nonce.iter_mut() {
             let (v, c) = b.overflowing_add(1);
             *b = v;
-            if !c { break; }
+            if !c {
+                break;
+            }
         }
         n
     }
@@ -210,7 +228,10 @@ impl MieruCryptor {
 
 enum RecvState {
     WaitSalt,
-    Ready { recv: MieruCryptor, expecting_len: Option<usize> },
+    Ready {
+        recv: MieruCryptor,
+        expecting_len: Option<usize>,
+    },
 }
 
 pin_project! {
@@ -255,7 +276,10 @@ impl AsyncRead for MieruStream {
                         };
                         Ok(true)
                     }
-                    RecvState::Ready { recv, expecting_len } => {
+                    RecvState::Ready {
+                        recv,
+                        expecting_len,
+                    } => {
                         let tag = 16;
                         if expecting_len.is_none() {
                             if this.cipher_buf.len() < 2 + tag {
@@ -318,7 +342,9 @@ impl AsyncWrite for MieruStream {
         let mut written = 0;
         while written < pkt.len() {
             match this.inner.as_mut().poll_write(cx, &pkt[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -344,8 +370,14 @@ mod tests {
 
     #[test]
     fn cipher_parse() {
-        assert_eq!(MieruCipher::parse("aes-256-gcm"), Some(MieruCipher::Aes256Gcm));
-        assert_eq!(MieruCipher::parse("chacha20-poly1305"), Some(MieruCipher::Chacha20Poly1305));
+        assert_eq!(
+            MieruCipher::parse("aes-256-gcm"),
+            Some(MieruCipher::Aes256Gcm)
+        );
+        assert_eq!(
+            MieruCipher::parse("chacha20-poly1305"),
+            Some(MieruCipher::Chacha20Poly1305)
+        );
         assert_eq!(MieruCipher::parse("aes-128-gcm"), None);
     }
 

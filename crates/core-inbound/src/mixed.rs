@@ -5,7 +5,7 @@
 //!
 //! 每个连接：
 //! 1. 解析目标 host/port；
-//! 2. 调用 [`Runtime::dial`] 建立到代理出口的流；
+//! 2. 交给 [`core_runtime::ListenerHandler`] 做规则路由、出站拨号与连接管理；
 //! 3. 双向 splice 转发字节。
 
 use std::io;
@@ -13,12 +13,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use base64::Engine;
-use core_observe::{copy_bidirectional_tracked, ConnectionMeta};
-use core_route::NetworkKind;
-use core_runtime::Runtime;
+use core_runtime::{InboundMetadata, ListenerHandler, Runtime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tokio::net::TcpStream;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct MixedListener {
@@ -126,7 +124,9 @@ async fn handle_socks5(
     sock.read_exact(&mut h).await?;
     if h[1] != 0x01 {
         // 仅支持 CONNECT；其它（BIND/UDP）回 0x07。
-        let _ = sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = sock
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
         return Err(other("socks5 仅支持 CONNECT"));
     }
     let host: String = match h[3] {
@@ -153,13 +153,18 @@ async fn handle_socks5(
     sock.read_exact(&mut port_buf).await?;
     let port = u16::from_be_bytes(port_buf);
 
-    match runtime.dial(&host, port, NetworkKind::Tcp).await {
-        Ok(res) => {
-            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-            relay(sock, res, &host, port, "socks5", "Socks5", peer, &runtime).await
+    let handler = ListenerHandler::new(runtime);
+    let inbound_addr = sock.local_addr()?;
+    let metadata = InboundMetadata::tcp("socks5", "Socks5", peer, inbound_addr, host, port);
+    match handler.prepare_tcp(metadata).await {
+        Ok(prepared) => {
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            handler.relay_prepared_tcp(sock, prepared).await
         }
         Err(e) => {
-            sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
             Err(e)
         }
     }
@@ -194,8 +199,14 @@ async fn handle_http(
     let mut lines = head_str.split("\r\n");
     let req_line = lines.next().ok_or_else(|| other("空请求行"))?;
     let mut parts = req_line.split_whitespace();
-    let method = parts.next().ok_or_else(|| other("缺少 method"))?.to_uppercase();
-    let target = parts.next().ok_or_else(|| other("缺少 target"))?.to_string();
+    let method = parts
+        .next()
+        .ok_or_else(|| other("缺少 method"))?
+        .to_uppercase();
+    let target = parts
+        .next()
+        .ok_or_else(|| other("缺少 target"))?
+        .to_string();
     let _version = parts.next().unwrap_or("HTTP/1.1");
 
     // 鉴权
@@ -212,8 +223,7 @@ async fn handle_http(
                             {
                                 if let Ok(s) = std::str::from_utf8(&decoded) {
                                     if let Some((u, p)) = s.split_once(':') {
-                                        authed =
-                                            slot.iter().any(|x| x.user == u && x.pass == p);
+                                        authed = slot.iter().any(|x| x.user == u && x.pass == p);
                                     }
                                 }
                             }
@@ -232,12 +242,15 @@ async fn handle_http(
 
     if method == "CONNECT" {
         let (host, port) = parse_host_port(&target)?;
-        let res = runtime.dial(&host, port, NetworkKind::Tcp).await;
         let mut sock = reader.into_inner();
-        match res {
-            Ok(r) => {
-                sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-                relay(sock, r, &host, port, "http-connect", "HTTP", peer, &runtime).await
+        let handler = ListenerHandler::new(runtime);
+        let inbound_addr = sock.local_addr()?;
+        let metadata = InboundMetadata::tcp("http-connect", "HTTP", peer, inbound_addr, host, port);
+        match handler.prepare_tcp(metadata).await {
+            Ok(prepared) => {
+                sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                handler.relay_prepared_tcp(sock, prepared).await
             }
             Err(e) => {
                 let _ = sock
@@ -274,12 +287,20 @@ async fn handle_http(
         }
         new_head.push_str("\r\n");
 
-        let res = runtime.dial(&host, port, NetworkKind::Tcp).await;
         let mut sock = reader.into_inner();
-        match res {
-            Ok(mut r) => {
-                r.stream.write_all(new_head.as_bytes()).await?;
-                relay(sock, r, &host, port, "http", "HTTP", peer, &runtime).await
+        let handler = ListenerHandler::new(runtime);
+        let inbound_addr = sock.local_addr()?;
+        let metadata = InboundMetadata::tcp("http", "HTTP", peer, inbound_addr, host, port);
+        match handler.prepare_tcp(metadata).await {
+            Ok(mut prepared) => {
+                let n = new_head.len() as u64;
+                prepared
+                    .result
+                    .stream
+                    .write_all(new_head.as_bytes())
+                    .await?;
+                handler.record_upload(&prepared.guard, n);
+                handler.relay_prepared_tcp(sock, prepared).await
             }
             Err(e) => {
                 let _ = sock
@@ -302,7 +323,9 @@ fn parse_host_port(s: &str) -> io::Result<(String, u16)> {
 }
 
 fn parse_absolute_target(s: &str) -> io::Result<(String, u16, String)> {
-    let s = s.trim_start_matches("http://").trim_start_matches("https://");
+    let s = s
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     let (host_part, path) = match s.find('/') {
         Some(i) => (&s[..i], s[i..].to_string()),
         None => (s, "/".to_string()),
@@ -318,96 +341,4 @@ fn parse_absolute_target(s: &str) -> io::Result<(String, u16, String)> {
 
 fn other(s: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, s.to_string())
-}
-
-async fn relay(
-    mut inbound: TcpStream,
-    mut out: core_runtime::engine::DialResult,
-    host: &str,
-    port: u16,
-    inbound_label: &'static str,
-    metadata_kind: &'static str,
-    peer: SocketAddr,
-    runtime: &Arc<Runtime>,
-) -> io::Result<()> {
-    let started = std::time::Instant::now();
-    runtime.metrics.inc_connection();
-
-    // 构造 mihomo Metadata 兼容信息：source = 浏览器 / curl 端 socket；
-    // destination = 解析后的目标 host:port；inbound = 监听器名 + 类型 + ip:port。
-    let inbound_addr = inbound.local_addr().ok();
-    let meta = ConnectionMeta {
-        network: "tcp".into(),
-        kind: metadata_kind.into(),
-        source_ip: peer.ip().to_string(),
-        source_port: peer.port().to_string(),
-        destination_ip: host.parse::<std::net::IpAddr>().map(|ip| ip.to_string()).unwrap_or_default(),
-        destination_port: port.to_string(),
-        inbound_ip: inbound_addr.map(|a| a.ip().to_string()).unwrap_or_default(),
-        inbound_port: inbound_addr.map(|a| a.port().to_string()).unwrap_or_default(),
-        inbound_name: inbound_label.into(),
-        host: host.to_string(),
-        dns_mode: "normal".into(),
-        remote_destination: out.remote_destination.clone(),
-        smart_target: out.smart_target.clone(),
-        chains: out.chain.clone(),
-        provider_chains: out.provider_chains.clone(),
-        rule: out.rule.clone(),
-        rule_payload: out.rule_payload.clone(),
-        ..ConnectionMeta::default()
-    };
-    let guard = runtime.connections.open(meta);
-    let id = guard.id;
-    let accounting = guard.accounting();
-    tracing::info!(
-        target: "relay",
-        conn_id = id,
-        inbound = inbound_label,
-        host, port,
-        outbound = %out.outbound,
-        decision = ?out.decision,
-        dial_ms = out.elapsed.as_millis() as u64,
-        "session begin",
-    );
-
-    let metrics = runtime.metrics.clone();
-    let result = copy_bidirectional_tracked(
-        &mut inbound,
-        &mut out.stream,
-        accounting,
-        Some(metrics.clone()),
-    )
-    .await;
-    metrics.dec_connection();
-    // guard drop 时自动从 ConnectionTable 移除；无需显式 close
-
-    let up = guard.up.load(std::sync::atomic::Ordering::Relaxed);
-    let down = guard.down.load(std::sync::atomic::Ordering::Relaxed);
-    let total_ms = started.elapsed().as_millis() as u64;
-    match &result {
-        Ok(_) => tracing::info!(
-            target: "relay",
-            conn_id = id,
-            inbound = inbound_label,
-            host, port,
-            outbound = %out.outbound,
-            bytes_up = up,
-            bytes_down = down,
-            duration_ms = total_ms,
-            "session end (ok)",
-        ),
-        Err(e) => tracing::warn!(
-            target: "relay",
-            conn_id = id,
-            inbound = inbound_label,
-            host, port,
-            outbound = %out.outbound,
-            bytes_up = up,
-            bytes_down = down,
-            duration_ms = total_ms,
-            error = %e,
-            "session end (error)",
-        ),
-    }
-    result.map(|_| ())
 }

@@ -7,9 +7,9 @@ pub(crate) const TPROXY_PORT: u16 = 7894;
 pub(crate) const TPROXY_ROUTE_IFACE: &str = "lo";
 
 const TPROXY_ROUTE_TABLE: u32 = 0x2d0;
-const TPROXY_PREROUTING_CHAIN: &str = "RPKERNEL_PREROUTING";
-const TPROXY_OUTPUT_CHAIN: &str = "RPKERNEL_OUTPUT";
-const TPROXY_DIVERT_CHAIN: &str = "RPKERNEL_DIVERT";
+const TPROXY_PREROUTING_CHAIN: &str = "WUTHERCORE_PREROUTING";
+const TPROXY_OUTPUT_CHAIN: &str = "WUTHERCORE_OUTPUT";
+const TPROXY_DIVERT_CHAIN: &str = "WUTHERCORE_DIVERT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TproxyCommand {
@@ -428,16 +428,16 @@ mod tests {
             rendered.contains(&"ip -f inet route add local default dev lo table 0x2d0".to_string())
         );
         assert!(rendered.contains(
-            &"iptables -t mangle -A RPKERNEL_OUTPUT -m mark --mark 0x2d0 -j RETURN".to_string()
+            &"iptables -t mangle -A WUTHERCORE_OUTPUT -m mark --mark 0x2d0 -j RETURN".to_string()
         ));
         assert!(rendered.contains(
-            &"iptables -t mangle -A RPKERNEL_PREROUTING -p tcp -m socket -j RPKERNEL_DIVERT"
+            &"iptables -t mangle -A WUTHERCORE_PREROUTING -p tcp -m socket -j WUTHERCORE_DIVERT"
                 .to_string()
         ));
-        assert!(rendered.contains(&"iptables -t mangle -A RPKERNEL_PREROUTING -p tcp -j TPROXY --on-port 7894 --tproxy-mark 0x2d0/0x2d0".to_string()));
-        assert!(rendered.contains(&"iptables -t mangle -A RPKERNEL_PREROUTING -p udp -j TPROXY --on-port 7894 --tproxy-mark 0x2d0/0x2d0".to_string()));
+        assert!(rendered.contains(&"iptables -t mangle -A WUTHERCORE_PREROUTING -p tcp -j TPROXY --on-port 7894 --tproxy-mark 0x2d0/0x2d0".to_string()));
+        assert!(rendered.contains(&"iptables -t mangle -A WUTHERCORE_PREROUTING -p udp -j TPROXY --on-port 7894 --tproxy-mark 0x2d0/0x2d0".to_string()));
         assert!(
-            rendered.contains(&"iptables -t mangle -I OUTPUT -o lo -j RPKERNEL_OUTPUT".to_string())
+            rendered.contains(&"iptables -t mangle -I OUTPUT -o lo -j WUTHERCORE_OUTPUT".to_string())
         );
     }
 
@@ -451,9 +451,9 @@ mod tests {
             rendered.contains(&"ip -f inet route del local default dev lo table 0x2d0".to_string())
         );
         assert!(rendered
-            .contains(&"iptables -t mangle -D PREROUTING -j RPKERNEL_PREROUTING".to_string()));
+            .contains(&"iptables -t mangle -D PREROUTING -j WUTHERCORE_PREROUTING".to_string()));
         assert!(
-            rendered.contains(&"iptables -t mangle -D OUTPUT -o lo -j RPKERNEL_OUTPUT".to_string())
+            rendered.contains(&"iptables -t mangle -D OUTPUT -o lo -j WUTHERCORE_OUTPUT".to_string())
         );
     }
 }

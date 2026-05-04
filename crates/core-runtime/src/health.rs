@@ -105,8 +105,8 @@ pub struct UrlTestOpts {
 }
 
 /* ========================================================================
-   Per-(node, url) statistics —— 对齐 mihomo `Proxy.extra` map。
-   ======================================================================== */
+Per-(node, url) statistics —— 对齐 mihomo `Proxy.extra` map。
+======================================================================== */
 
 #[derive(Debug)]
 pub struct NodeUrlStats {
@@ -137,10 +137,14 @@ impl NodeUrlStats {
     pub fn record(&self, delay_ms: u32, alive: bool) {
         let now = now_ms();
         self.alive.store(alive, Ordering::Release);
-        self.last_delay_ms.store(if alive { delay_ms } else { DEAD_DELAY }, Ordering::Release);
+        self.last_delay_ms
+            .store(if alive { delay_ms } else { DEAD_DELAY }, Ordering::Release);
         self.last_seen_ms.store(now, Ordering::Release);
         let mut g = self.history.lock();
-        g.push_back(HistoryEntry { time_ms: now, delay_ms: if alive { delay_ms } else { 0 } });
+        g.push_back(HistoryEntry {
+            time_ms: now,
+            delay_ms: if alive { delay_ms } else { 0 },
+        });
         while g.len() > HISTORY_CAP {
             g.pop_front();
         }
@@ -161,8 +165,8 @@ impl NodeUrlStats {
 }
 
 /* ========================================================================
-   FastPickCache —— mihomo singledo.Single 的最小复刻。
-   ======================================================================== */
+FastPickCache —— mihomo singledo.Single 的最小复刻。
+======================================================================== */
 
 #[derive(Debug, Clone)]
 struct FastPickResult {
@@ -176,8 +180,8 @@ struct FastPickEntry {
 }
 
 /* ========================================================================
-   UrlTester
-   ======================================================================== */
+UrlTester
+======================================================================== */
 
 #[derive(Debug)]
 pub struct UrlTester {
@@ -211,7 +215,9 @@ impl UrlTester {
             return s.clone();
         }
         let mut g = self.stats.write();
-        g.entry(key).or_insert_with(|| Arc::new(NodeUrlStats::default())).clone()
+        g.entry(key)
+            .or_insert_with(|| Arc::new(NodeUrlStats::default()))
+            .clone()
     }
 
     /// `LastDelayForTestUrl(node, url)` —— 与 mihomo 同名方法语义。
@@ -269,7 +275,9 @@ impl UrlTester {
         let cfg = self.cfg.read().clone();
         let url = opts.url.unwrap_or_else(|| cfg.default_url.clone());
         let limit = opts.timeout.unwrap_or(cfg.default_timeout);
-        let expected = opts.expected_status.unwrap_or(cfg.default_expected_status.clone());
+        let expected = opts
+            .expected_status
+            .unwrap_or(cfg.default_expected_status.clone());
         let unified = opts.unified_delay.unwrap_or(cfg.default_unified_delay);
 
         let parsed = parse_test_url(&url)?;
@@ -307,7 +315,9 @@ impl UrlTester {
         match &outcome {
             Ok(ms) => {
                 stats.record(*ms, true);
-                runtime.smart.record_probe_for(node, Duration::from_millis(*ms as u64));
+                runtime
+                    .smart
+                    .record_probe_for(node, Duration::from_millis(*ms as u64));
                 debug!(target: "urltest", node, url, ms, unified, "probe ok");
             }
             Err(e) => {
@@ -384,8 +394,8 @@ impl UrlTester {
     }
 
     /* ====================================================================
-       fast() —— mihomo URLTest 选点逻辑 + tolerance + 10s singledo 缓存。
-       ==================================================================== */
+    fast() —— mihomo URLTest 选点逻辑 + tolerance + 10s singledo 缓存。
+    ==================================================================== */
 
     /// 在已知 last_delay 表中按 `tolerance` 选最快节点。
     /// 与 mihomo `urltest.go fast(touch)` 行为一致：
@@ -443,7 +453,13 @@ impl UrlTester {
             (Some(prev), None) => return Some(prev.node), // 全 dead 时保留上一个
             (None, None) => return None,
         };
-        entry.last = Some((Instant::now(), FastPickResult { node: final_node.clone(), delay: final_delay }));
+        entry.last = Some((
+            Instant::now(),
+            FastPickResult {
+                node: final_node.clone(),
+                delay: final_delay,
+            },
+        ));
         Some(final_node)
     }
 
@@ -454,13 +470,18 @@ impl UrlTester {
 }
 
 /// 后台周期任务：每 interval 跑一次 test_all。
+///
+/// 启动延迟 500ms（足够 outbound registry / DialResolver 注入完成），
+/// 然后立即跑首轮——之前 3s 延迟意味着 dashboard 在前 3s 加载时看到全空 history，
+/// 加上每轮 60s 间隔，体感是"长时间显示 timeout"。mihomo 的对应行为是按需 Touch
+/// 触发首测，这里改用启动即跑。
 pub fn spawn_periodic(
     tester: Arc<UrlTester>,
     runtime: Arc<Runtime>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         loop {
             let started = Instant::now();
             let results = tester.test_all(&runtime, None, None).await;
@@ -478,8 +499,8 @@ pub fn spawn_periodic(
 }
 
 /* ========================================================================
-   URL 解析 + HTTP/HTTPS 探测
-   ======================================================================== */
+URL 解析 + HTTP/HTTPS 探测
+======================================================================== */
 
 #[derive(Debug, Clone)]
 struct ParsedTestUrl {
@@ -501,7 +522,9 @@ fn parse_test_url(s: &str) -> Result<ParsedTestUrl, DelayError> {
     } else if let Some(r) = s.strip_prefix("http://") {
         (Scheme::Http, r, 80u16)
     } else {
-        return Err(DelayError::BadUrl(format!("only http(s):// supported: {s}")));
+        return Err(DelayError::BadUrl(format!(
+            "only http(s):// supported: {s}"
+        )));
     };
     let (host_part, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
@@ -516,7 +539,12 @@ fn parse_test_url(s: &str) -> Result<ParsedTestUrl, DelayError> {
     } else {
         (host_part.to_string(), port_default)
     };
-    Ok(ParsedTestUrl { scheme, host, port, path })
+    Ok(ParsedTestUrl {
+        scheme,
+        host,
+        port,
+        path,
+    })
 }
 
 async fn run_probe(
@@ -591,21 +619,25 @@ where
     let req = format!(
         "HEAD {path} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
-         User-Agent: rpkernel-urltest/1.0\r\n\
+         User-Agent: wuthercore-urltest/1.0\r\n\
          Connection: keep-alive\r\n\
          Accept: */*\r\n\r\n"
     );
     s.write_all(req.as_bytes())
         .await
         .map_err(|e| DelayError::Http(e.to_string()))?;
-    s.flush().await.map_err(|e| DelayError::Http(e.to_string()))?;
+    s.flush()
+        .await
+        .map_err(|e| DelayError::Http(e.to_string()))?;
 
     // 读到 \r\n 即可拿状态行；HEAD 响应没有 body，且服务端发完 headers 后会
     // 等下一个请求（keep-alive）；为避免阻塞，先读到 256 字节就解析。
     let mut buf = [0u8; 256];
     let mut total = 0usize;
     loop {
-        let n = s.read(&mut buf[total..]).await
+        let n = s
+            .read(&mut buf[total..])
+            .await
             .map_err(|e| DelayError::Http(e.to_string()))?;
         if n == 0 {
             if total == 0 {
@@ -629,7 +661,12 @@ where
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
-        .ok_or_else(|| DelayError::Http(format!("bad status line: {:?}", &line[..line.len().min(40)])))?;
+        .ok_or_else(|| {
+            DelayError::Http(format!(
+                "bad status line: {:?}",
+                &line[..line.len().min(40)]
+            ))
+        })?;
     if !expected.check(code) {
         return Err(DelayError::StatusMismatch(code));
     }
@@ -700,15 +737,21 @@ mod tests {
         t.ensure_stats("a", url).record(200, true);
         t.ensure_stats("b", url).record(190, true);
         // 第一次：选最小 b
-        let pick = t.pick_fast("g", &["a".into(), "b".into()], url, 50).unwrap();
+        let pick = t
+            .pick_fast("g", &["a".into(), "b".into()], url, 50)
+            .unwrap();
         assert_eq!(pick, "b");
         // 把 a 降到 175 —— tolerance=50，现 fast=b(190) vs new=a(175)，差 15 < 50，应保持 b。
         t.ensure_stats("a", url).record(175, true);
-        let pick = t.pick_fast("g", &["a".into(), "b".into()], url, 50).unwrap();
+        let pick = t
+            .pick_fast("g", &["a".into(), "b".into()], url, 50)
+            .unwrap();
         assert_eq!(pick, "b");
         // 显式 invalidate 后才会换。
         t.invalidate_fast_pick("g");
-        let pick = t.pick_fast("g", &["a".into(), "b".into()], url, 50).unwrap();
+        let pick = t
+            .pick_fast("g", &["a".into(), "b".into()], url, 50)
+            .unwrap();
         assert_eq!(pick, "a");
     }
 
@@ -718,7 +761,9 @@ mod tests {
         let url = "https://t/";
         t.ensure_stats("dead", url).record(0, false);
         t.ensure_stats("ok", url).record(300, true);
-        let pick = t.pick_fast("g", &["dead".into(), "ok".into()], url, 0).unwrap();
+        let pick = t
+            .pick_fast("g", &["dead".into(), "ok".into()], url, 0)
+            .unwrap();
         assert_eq!(pick, "ok");
     }
 

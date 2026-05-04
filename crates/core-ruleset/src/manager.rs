@@ -56,7 +56,9 @@ impl RulesetManager {
         *self.sink.write() = Some(sink);
     }
 
-    pub fn index(&self) -> Arc<RulesetIndex> { self.index.clone() }
+    pub fn index(&self) -> Arc<RulesetIndex> {
+        self.index.clone()
+    }
 
     /// 启动：每个规则集独立后台协程，立刻拉一次 + 按 `every` 周期刷新。
     ///
@@ -147,7 +149,11 @@ impl RulesetManager {
     }
 
     /// 一次完整的拉取 + 解析 + 编译 + 入索引。
-    pub async fn refresh_once(&self, name: &str, spec: &RulesetSpec) -> Result<RulesetUpdate, String> {
+    pub async fn refresh_once(
+        &self,
+        name: &str,
+        spec: &RulesetSpec,
+    ) -> Result<RulesetUpdate, String> {
         let timeout = Duration::from_secs(30);
         let src = spec.url.as_deref().or(spec.path.as_deref());
         let body = match src {
@@ -173,7 +179,11 @@ impl RulesetManager {
                 let stats = m.stats();
                 let total = stats.domains + stats.suffixes + stats.cidr_v4 + stats.cidr_v6;
                 self.index.insert(m);
-                return Ok(RulesetUpdate { name: name.to_string(), size: total, from_cache: false });
+                return Ok(RulesetUpdate {
+                    name: name.to_string(),
+                    size: total,
+                    from_cache: false,
+                });
             }
         };
 
@@ -197,19 +207,35 @@ impl RulesetManager {
         }
         let m = Arc::new(RulesetMatcher::compile_any(name.to_string(), compiled));
         self.index.insert(m);
-        Ok(RulesetUpdate { name: name.to_string(), size: total, from_cache: false })
+        Ok(RulesetUpdate {
+            name: name.to_string(),
+            size: total,
+            from_cache: false,
+        })
     }
 }
 
 fn clamp_interval(d: Duration) -> Duration {
     let min = Duration::from_secs(5 * 60);
     let max = Duration::from_secs(30 * 24 * 3600);
-    if d < min { min } else if d > max { max } else { d }
+    if d < min {
+        min
+    } else if d > max {
+        max
+    } else {
+        d
+    }
 }
 
 fn safe_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -251,12 +277,19 @@ mod tests {
     #[tokio::test]
     async fn refresh_local_yaml_works() {
         let dir = std::env::temp_dir().join(format!(
-            "rpkernel-ruleset-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            "wuthercore-ruleset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("test.yaml");
-        std::fs::write(&p, b"payload:\n  - DOMAIN-SUFFIX,test.com\n  - 192.168.0.0/16\n").unwrap();
+        std::fs::write(
+            &p,
+            b"payload:\n  - DOMAIN-SUFFIX,test.com\n  - 192.168.0.0/16\n",
+        )
+        .unwrap();
         let mut sets = BTreeMap::new();
         sets.insert(
             "rs1".into(),

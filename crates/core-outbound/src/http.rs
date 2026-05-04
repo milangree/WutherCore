@@ -48,7 +48,7 @@ impl OutboundAdapter for HttpOutbound {
         "http"
     }
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        // 走 TcpTransport：自带 RPKernel resolver + SO_MARK 绕 TUN。
+        // 走 TcpTransport：自带 WutherCore resolver + SO_MARK 绕 TUN。
         let mut s = crate::transport::tcp::TcpTransport::default()
             .connect(&self.host, self.port)
             .await?;

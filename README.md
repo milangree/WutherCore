@@ -205,7 +205,7 @@ VLESS / VMess 通过 `network` 字段（兼容 `net` / `type` 别名）分发到
 
 ### 动作
 
-| sing-box 名称 | RPKernel 实现 | 说明 |
+| sing-box 名称 | WutherCore 实现 | 说明 |
 |---|---|---|
 | route | `Route { server, opts }` | 转发并终止匹配 |
 | evaluate | `Evaluate { server, opts }` | 转发但不终止；结果保存为 saved_response |
@@ -255,7 +255,7 @@ rule.opts.client_subnet  >  server.default_client_subnet  >  resolver.global_cli
 | YAML payload | mihomo / Clash |
 | TXT / LIST | mihomo / Clash（含 `+.suffix`、`.suffix`、CIDR、policy 短写法） |
 | JSON | sing-box rule-set（v1 / v2 + logical 嵌套） |
-| RRS（自研二进制） | RPKernel；CRC32 校验，体积约为 YAML 的 45% |
+| RRS（自研二进制） | WutherCore；CRC32 校验，体积约为 YAML 的 45% |
 | MRS / SRS（mihomo / sing-box 二进制） | 仅嗅探识别，提示用工具转文本 |
 
 ### RRS 格式
@@ -313,7 +313,8 @@ proxy-core ruleset convert in.txt  out.rrs --output-format rrs
 
 ## Android 透明代理
 
-Root 模式按可用能力降级，共 5 层：
+Root 透明代理按可用能力降级，共 4 层；未 root 的 `virtual_nic` 走 Android
+`VpnService` 注入 TUN fd，它不是 root 透明代理能力层，也不是桥接网卡。
 
 | 层级 | 名称 | 条件 | 备注 |
 |---|---|---|---|
@@ -321,9 +322,13 @@ Root 模式按可用能力降级，共 5 层：
 | 2 | IptablesV4V6Tproxy | iptables + ip6tables + 双栈 TPROXY | |
 | 3 | IptablesV4V6Redirect | iptables + ip6tables NAT REDIRECT | UDP 受限 |
 | 4 | IptablesV4Only | 仅 iptables v4 NAT REDIRECT | |
-| 5 | VpnService | 无 root 或上述全部失败 | 用户态 TUN |
 
-`AndroidCapability::detect_capability()` 通过 `su -c` 探测 11 项能力（has_root / has_ip6tables / has_nftables / kernel_ipv6_nat / kernel_tproxy_v6 / uid_owner_match / ...），自动选最高可用层。`try_request_root_android()` 在启动钩子中失败时透明降级到 VpnService。
+`VpnService` 模式必须由宿主 App 调用 `VpnBridge.vpnServiceConfigJson(configPath)`，
+把返回的 `addresses`、`routes`、`dns_servers`、应用白/黑名单逐项写入
+`VpnService.Builder`，再 `establish()`、`detachFd()`、`setVpnService(this)`、
+`setVpnFd(fd)`。没有 Builder 路由/DNS 时，native 侧拿到 fd 也不会有真实流量进入。
+
+`AndroidCapability::detect_capability()` 通过 `su -c` 探测 11 项能力（has_root / has_ip6tables / has_nftables / kernel_ipv6_nat / kernel_tproxy_v6 / uid_owner_match / ...），自动选最高可用 root 层。没有 root 或没有 iptables/nftables 时，root 透明代理不可用，应显式使用 `virtual_nic` + VpnService fd 注入。
 
 ---
 

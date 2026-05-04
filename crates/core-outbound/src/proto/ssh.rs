@@ -76,7 +76,10 @@ impl SshOutbound {
             port,
             user: user.into(),
             auth: SshAuth::None,
-            host_key_check: SshHostKeyCheck { accept_unknown: true, known_hosts_lines: vec![] },
+            host_key_check: SshHostKeyCheck {
+                accept_unknown: true,
+                known_hosts_lines: vec![],
+            },
             host_key_alg: vec![],
             client_version: format!("SSH-2.0-WutherCore_{}", env!("CARGO_PKG_VERSION")),
             keepalive_interval_secs: 30,
@@ -135,7 +138,9 @@ impl SshOutbound {
 
     async fn connect_session_inner(&self) -> std::io::Result<russh::client::Handle<NopHandler>> {
         let config = Arc::new(russh::client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(self.keepalive_interval_secs.max(60))),
+            inactivity_timeout: Some(std::time::Duration::from_secs(
+                self.keepalive_interval_secs.max(60),
+            )),
             keepalive_interval: Some(std::time::Duration::from_secs(self.keepalive_interval_secs)),
             ..Default::default()
         });
@@ -159,7 +164,10 @@ impl SshOutbound {
                     .await
                     .map_err(|e| io_err(format!("ssh auth pubkey: {e}")))?
             }
-            SshAuth::PrivateKeyContent { content, passphrase } => {
+            SshAuth::PrivateKeyContent {
+                content,
+                passphrase,
+            } => {
                 let key = russh_keys::decode_secret_key(content, passphrase.as_deref())
                     .map_err(|e| io_err(format!("ssh decode key: {e}")))?;
                 session
@@ -181,10 +189,19 @@ impl SshOutbound {
 
 #[async_trait]
 impl OutboundAdapter for SshOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "ssh" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "ssh"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: false, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {

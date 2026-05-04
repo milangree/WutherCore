@@ -64,20 +64,27 @@ impl MacUtunIo {
             .map_err(|e| TunIoError::Open(format!("set O_NONBLOCK: {e}")))?;
         let async_fd = AsyncFd::with_interest(owned, Interest::READABLE | Interest::WRITABLE)
             .map_err(|e| TunIoError::Open(format!("AsyncFd: {e}")))?;
-        Ok(Self { name, mtu, fd: async_fd })
+        Ok(Self {
+            name,
+            mtu,
+            fd: async_fd,
+        })
     }
 
     pub fn open(name_hint: &str, mtu: u32) -> Result<Self, TunIoError> {
         // utun 接口名形如 utun7。从 hint 中提取数字 unit；空时用 0（让内核自选）。
         let unit = parse_utun_unit(name_hint).unwrap_or(0);
-        let (owned_fd, final_name) = unsafe_open_utun(unit)
-            .map_err(|e| TunIoError::Open(format!("utun open: {e}")))?;
+        let (owned_fd, final_name) =
+            unsafe_open_utun(unit).map_err(|e| TunIoError::Open(format!("utun open: {e}")))?;
         let raw = owned_fd.as_raw_fd();
-        set_nonblocking(raw)
-            .map_err(|e| TunIoError::Open(format!("set O_NONBLOCK: {e}")))?;
+        set_nonblocking(raw).map_err(|e| TunIoError::Open(format!("set O_NONBLOCK: {e}")))?;
         let async_fd = AsyncFd::with_interest(owned_fd, Interest::READABLE | Interest::WRITABLE)
             .map_err(|e| TunIoError::Open(format!("AsyncFd: {e}")))?;
-        Ok(Self { name: final_name, mtu, fd: async_fd })
+        Ok(Self {
+            name: final_name,
+            mtu,
+            fd: async_fd,
+        })
     }
 }
 
@@ -122,9 +129,50 @@ impl TunIo for MacUtunIo {
         }
     }
 
-    fn name(&self) -> &str { &self.name }
-    fn mtu(&self) -> u32 { self.mtu }
-    async fn close(&self) -> Result<(), TunIoError> { Ok(()) }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn mtu(&self) -> u32 {
+        self.mtu
+    }
+    async fn close(&self) -> Result<(), TunIoError> {
+        Ok(())
+    }
+
+    /// macOS drain-on-ready —— 第一次 `readable()` 后非阻塞 `try_io` 循环，
+    /// 每次 readv 拉一个完整 utun frame（4B AF 头 + IP 包），直到 WouldBlock。
+    /// 与 Linux 非 vnet 路径思路一致；utun 没有 GSO，没有特殊路径。
+    async fn read_batch(
+        &self,
+        bufs: &mut [&mut [u8]],
+        sizes: &mut [usize],
+    ) -> Result<usize, TunIoError> {
+        let max = bufs.len().min(sizes.len());
+        if max == 0 {
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        // `head` 在 inner 循环多次复用；每次 readv 完整覆盖 4 字节，无 stale 数据。
+        let mut head = [0u8; 4];
+        loop {
+            let mut guard = self.fd.readable().await.map_err(TunIoError::Read)?;
+            while count < max {
+                let res = guard.try_io(|inner| readv_fd(inner.as_raw_fd(), &mut head, bufs[count]));
+                match res {
+                    Ok(Ok(n)) if n >= 4 => {
+                        sizes[count] = n - 4;
+                        count += 1;
+                    }
+                    Ok(Ok(_)) => continue, // 短帧（< 4B AF 头）—— 跳过继续 drain
+                    Ok(Err(e)) => return Err(TunIoError::Read(e)),
+                    Err(_would_block) => break, // tokio 已清 readiness
+                }
+            }
+            if count > 0 {
+                return Ok(count);
+            }
+        }
+    }
 }
 
 fn parse_utun_unit(hint: &str) -> Option<u32> {
@@ -198,7 +246,11 @@ fn unsafe_open_utun(unit: u32) -> std::io::Result<(OwnedFd, String)> {
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let end = ifname.iter().take(len as usize).position(|&b| b == 0).unwrap_or(len as usize);
+    let end = ifname
+        .iter()
+        .take(len as usize)
+        .position(|&b| b == 0)
+        .unwrap_or(len as usize);
     let final_name = std::str::from_utf8(&ifname[..end])
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
         .to_string();

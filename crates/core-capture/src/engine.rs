@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use core_config::model::{Capture, CaptureMethod, CaptureStack, CaptureTraffic, TunHttpProxyOptions};
+use core_config::model::{
+    Capture, CaptureMethod, CaptureStack, CaptureTraffic, TunHttpProxyOptions,
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -83,7 +85,7 @@ pub struct CapturePlan {
     pub exclude_processes: Vec<String>,
     pub interface_name: String,
     pub tun_v4_cidr: ipnet::Ipv4Net,
-    pub tun_v6_cidr: ipnet::Ipv6Net,
+    pub tun_v6_cidr: Option<ipnet::Ipv6Net>,
 
     /* ---- sing-box auto_route / auto_redirect ---- */
     pub auto_route: bool,
@@ -109,6 +111,15 @@ pub struct CapturePlan {
     pub filters: CaptureFilters,
     /// 平台 HTTP 代理透传配置（iOS/Android）。
     pub platform_http_proxy: Option<TunHttpProxyOptions>,
+
+    /// 全局 IPv6 开关（mihomo `ipv6: false` 等价行为）。`from_config` 只能拿到
+    /// `Capture` 一段配置，无法看到 `Resolver.ipv6`，所以这里默认 `true`，由
+    /// 上层（[`crate::supervisor::CaptureSupervisor::build`]）注入实际值。
+    ///
+    /// 关闭时 TUN dispatcher 在 `tun_inbound::classify_packet` 阶段直接丢掉
+    /// 所有 IPv6 包（silent drop，与 mihomo 一致），让应用通过 happy-eyeballs
+    /// 快速回落到 IPv4，避免 250ms+ TCP 超时。
+    pub ipv6_enabled: bool,
 }
 
 impl CapturePlan {
@@ -142,6 +153,7 @@ impl CapturePlan {
                 tun_v6 = n;
             }
         }
+        let tun_v6: Option<ipnet::Ipv6Net> = if c.tun.inet6 { Some(tun_v6) } else { None };
 
         let interface_name = c
             .tun
@@ -158,12 +170,36 @@ impl CapturePlan {
             .filter_map(|s| s.parse().ok())
             .collect();
 
+        // 配置缺省时回填 sing-tun 默认值；与 mihomo `listener/sing_tun/server.go::202-221`
+        // 一致——0 视为未设置，回退到 `tun.DefaultXxx` 常量。
+        // 对应 sing-tun `redirect.go::13-16` + `tun.go::70`。
+        fn nonzero_or<T: PartialEq + Default + Copy>(v: Option<T>, default_v: T) -> T {
+            match v {
+                Some(x) if x != T::default() => x,
+                _ => default_v,
+            }
+        }
         let auto_redirect_marks = AutoRedirectMarks {
-            input: c.tun.auto_redirect_input_mark.as_deref().and_then(parse_hex_mark),
-            output: c.tun.auto_redirect_output_mark.as_deref().and_then(parse_hex_mark),
-            reset: c.tun.auto_redirect_reset_mark.as_deref().and_then(parse_hex_mark),
-            nfqueue: c.tun.auto_redirect_nfqueue,
-            fallback_rule_index: c.tun.auto_redirect_iproute2_fallback_rule_index,
+            input: Some(nonzero_or(
+                c.tun.auto_redirect_input_mark.as_deref().and_then(parse_hex_mark),
+                core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK,
+            )),
+            output: Some(nonzero_or(
+                c.tun.auto_redirect_output_mark.as_deref().and_then(parse_hex_mark),
+                core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
+            )),
+            reset: Some(nonzero_or(
+                c.tun.auto_redirect_reset_mark.as_deref().and_then(parse_hex_mark),
+                core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK,
+            )),
+            nfqueue: Some(nonzero_or(
+                c.tun.auto_redirect_nfqueue,
+                core_config::model::DEFAULT_AUTO_REDIRECT_NFQUEUE,
+            )),
+            fallback_rule_index: Some(nonzero_or(
+                c.tun.auto_redirect_iproute2_fallback_rule_index,
+                core_config::model::DEFAULT_IPROUTE2_AUTO_REDIRECT_FALLBACK_RULE_INDEX,
+            )),
         };
 
         let filters = CaptureFilters {
@@ -189,7 +225,8 @@ impl CapturePlan {
             kind,
             stack: c.stack,
             traffic: c.traffic,
-            mtu: c.mtu.unwrap_or(default_mtu(kind)),
+            // mihomo `server.go::192-195`：MTU 为 0 视为未设置，回退到默认值。
+            mtu: nonzero_or(c.mtu, default_mtu(kind)),
             offload: c.offload,
             hijack_dns: matches!(c.resolver, core_config::model::CaptureResolver::Hijack),
             exclude_cidrs: excludes,
@@ -200,8 +237,9 @@ impl CapturePlan {
 
             auto_route: c.tun.auto_route,
             strict_route: c.tun.strict_route,
-            iproute2_table_index: c.tun.iproute2_table_index,
-            iproute2_rule_index: c.tun.iproute2_rule_index,
+            // mihomo `server.go::202-208`：0 视为未设置，回退到 sing-tun 默认值。
+            iproute2_table_index: nonzero_or(Some(c.tun.iproute2_table_index), 2022),
+            iproute2_rule_index: nonzero_or(Some(c.tun.iproute2_rule_index), 9000),
             auto_redirect: c.tun.auto_redirect,
             auto_redirect_marks,
 
@@ -216,29 +254,57 @@ impl CapturePlan {
             exclude_mptcp: c.tun.exclude_mptcp,
 
             filters,
-            platform_http_proxy: c
-                .tun
-                .platform
-                .as_ref()
-                .and_then(|p| p.http_proxy.clone()),
+            platform_http_proxy: c.tun.platform.as_ref().and_then(|p| p.http_proxy.clone()),
+            // Default true; supervisor overrides from `Resolver.ipv6` after build.
+            ipv6_enabled: true,
         })
     }
 
     /// 是否需要 nftables auto_redirect chain。
     pub fn needs_nft_chain(&self) -> bool {
-        self.auto_redirect
-            && cfg!(any(target_os = "linux", target_os = "android"))
+        self.auto_redirect && cfg!(any(target_os = "linux", target_os = "android"))
     }
 
     /// `route_address` 命中或为空（全开放）才接管。
     pub fn route_allows(&self, ip: IpAddr) -> bool {
-        if self.route_exclude_addresses.iter().any(|n| n.contains(&ip)) {
+        if self.is_loopback_ip(ip) || self.route_exclude_addresses.iter().any(|n| n.contains(&ip)) {
             return false;
         }
         if self.route_addresses.is_empty() {
             return true;
         }
         self.route_addresses.iter().any(|n| n.contains(&ip))
+    }
+
+    /// 内置回环地址和用户配置的 `loopback_address` 都不应进入代理出站。
+    pub fn is_loopback_ip(&self, ip: IpAddr) -> bool {
+        ip.is_loopback() || self.loopback_addresses.contains(&ip)
+    }
+
+    /// TUN 自身网段的子网广播地址 —— sing-tun `stack_system.go` 用
+    /// `BroadcastAddr(...)` 算出当前 TUN 接口的广播 IP（如 `198.18.0.0/16` →
+    /// `198.18.255.255`）并在 ingress 直接 drop。我们在 `route_policy` 同处拦下，
+    /// 避免应用把 TUN 子网广播当成普通 unicast 目的地（dashboard 上会看到
+    /// `inbound`/`outbound` IP 一致的“连接到自己网关广播位”的怪条目）。
+    /// IPv6 没有 broadcast 概念，统一返回 false。
+    pub fn is_tun_subnet_broadcast(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.tun_v4_cidr.broadcast() == v4,
+            IpAddr::V6(_) => false,
+        }
+    }
+
+    pub fn tun_v4_addr_cidr(&self) -> String {
+        format!(
+            "{}/{}",
+            self.tun_v4_cidr.addr(),
+            self.tun_v4_cidr.prefix_len()
+        )
+    }
+
+    pub fn tun_v6_addr_cidr(&self) -> Option<String> {
+        self.tun_v6_cidr
+            .map(|c| format!("{}/{}", c.addr(), c.prefix_len()))
     }
 }
 
@@ -278,7 +344,7 @@ fn default_mtu(kind: EngineKind) -> u32 {
 
 fn default_iface_name() -> String {
     if cfg!(target_os = "windows") {
-        "RPKernelTun".into()
+        "WutherCoreTun".into()
     } else if cfg!(target_os = "macos") {
         "utun7".into()
     } else {
@@ -367,8 +433,8 @@ pub fn is_excluded(plan: &CapturePlan, ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use core_config::model::{
-        Capture, CaptureExclude, CaptureResolver, TunInboundOptions, TunPlatformOptions,
-        TunHttpProxyOptions,
+        Capture, CaptureExclude, CaptureResolver, TunHttpProxyOptions, TunInboundOptions,
+        TunPlatformOptions,
     };
 
     fn base() -> Capture {
@@ -381,7 +447,10 @@ mod tests {
             mtu: Some(9000),
             offload: true,
             exclude: CaptureExclude::default(),
-            tun: TunInboundOptions::default(),
+            tun: TunInboundOptions {
+                inet6: true,
+                ..TunInboundOptions::default()
+            },
         }
     }
 
@@ -425,7 +494,7 @@ mod tests {
         assert_eq!(plan.mtu, 9000);
         // ipnet 解析时保留 host bits；Display 显示 host/prefix。
         assert_eq!(plan.tun_v4_cidr.to_string(), "172.18.0.1/30");
-        assert_eq!(plan.tun_v6_cidr.to_string(), "fdfe:dcba:9876::1/126");
+        assert_eq!(plan.tun_v6_cidr.unwrap().to_string(), "fdfe:dcba:9876::1/126");
         assert_eq!(plan.iproute2_table_index, 2022);
         assert!(plan.auto_redirect);
         assert_eq!(plan.auto_redirect_marks.input, Some(0x2023));
@@ -444,6 +513,16 @@ mod tests {
         let http = plan.platform_http_proxy.unwrap();
         assert_eq!(http.server, "127.0.0.1");
         assert_eq!(http.server_port, 8080);
+    }
+
+    #[test]
+    fn tun_interface_cidrs_use_configured_host_addresses() {
+        let mut c = base();
+        c.tun.address = vec!["172.19.0.1/30".into(), "fdfe:dcba:9876::1/126".into()];
+        let plan = CapturePlan::from_config(&c).unwrap();
+
+        assert_eq!(plan.tun_v4_addr_cidr(), "172.19.0.1/30");
+        assert_eq!(plan.tun_v6_addr_cidr().unwrap(), "fdfe:dcba:9876::1/126");
     }
 
     #[test]
@@ -491,6 +570,58 @@ mod tests {
         assert_eq!(plan.filters.include_gid_range, vec![(10000u32, 19999u32)]);
         assert_eq!(plan.filters.exclude_gid, vec![1000u32]);
         assert_eq!(plan.filters.exclude_gid_range, vec![(2000u32, 2099u32)]);
+    }
+
+    #[test]
+    fn auto_redirect_marks_default_to_sing_tun_constants_when_unset() {
+        // 用户未设置任何 auto_redirect 标记 / nfqueue / fallback rule index 时，
+        // WutherCore 必须回填 sing-tun 默认值（`redirect.go::13-16` + `tun.go::70`）。
+        let plan = CapturePlan::from_config(&base()).unwrap();
+        assert_eq!(
+            plan.auto_redirect_marks.input,
+            Some(core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK)
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.input,
+            Some(0x2023),
+            "must match sing-tun DefaultAutoRedirectInputMark"
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.output,
+            Some(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.output,
+            Some(0x2024),
+            "must match sing-tun DefaultAutoRedirectOutputMark"
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.reset,
+            Some(core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK)
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.reset,
+            Some(0x2025),
+            "must match sing-tun DefaultAutoRedirectResetMark"
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.nfqueue,
+            Some(core_config::model::DEFAULT_AUTO_REDIRECT_NFQUEUE)
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.nfqueue,
+            Some(100),
+            "must match sing-tun DefaultAutoRedirectNFQueue"
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.fallback_rule_index,
+            Some(core_config::model::DEFAULT_IPROUTE2_AUTO_REDIRECT_FALLBACK_RULE_INDEX)
+        );
+        assert_eq!(
+            plan.auto_redirect_marks.fallback_rule_index,
+            Some(32768),
+            "must match sing-tun DefaultIPRoute2AutoRedirectFallbackRuleIndex"
+        );
     }
 
     #[test]

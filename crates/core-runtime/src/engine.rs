@@ -22,6 +22,8 @@ use tracing::{debug, info, warn};
 
 use crate::group_selector::GroupSelector;
 
+const DIAL_MAX_RETRIES: usize = 10;
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("配置错误: {0}")]
@@ -39,6 +41,9 @@ pub struct Runtime {
     node_info: parking_lot::RwLock<BTreeMap<String, RuntimeNodeInfo>>,
     pub route: RouteEngine,
     pub resolver: Arc<Resolver>,
+    /// 本机 DNS 服务 —— capture DNS hijack、`type: dns` 出站、独立 listener
+    /// 共用同一份；与 [`Self::resolver`] 完全等价（fake-ip / cache 共享）。
+    pub dns_service: Arc<core_resolver::DnsService>,
     pub smart: Arc<SmartSelector>,
     pub metrics: Arc<Metrics>,
     pub connections: Arc<ConnectionTable>,
@@ -50,6 +55,10 @@ pub struct Runtime {
     /// URLTest 实例 —— main.rs 在创建后通过 `set_urltest` 注入。
     /// `pick_in_group` 把它传给 `GroupSelector::pick` 让 URLTest/Fallback/LB 走死节点感知。
     pub urltest: parking_lot::RwLock<Option<Arc<crate::health::UrlTester>>>,
+    /// 进程反查 —— 与 mihomo `find-process-mode` 1:1。
+    /// `None` 表示 mode=off（默认）；`Some(finder)` 表示 strict 或 always。
+    /// strict 模式下调用方判定路由用到 process 字段才查；always 则每条都查。
+    pub process_finder: Option<Arc<dyn core_process::ProcessFinder>>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,20 +135,47 @@ impl Runtime {
             Some(idx) => RouteEngine::with_rulesets(plan.route.clone(), idx),
             None => RouteEngine::new(plan.route.clone()),
         };
-        let resolver = Arc::new(Resolver::new(plan.resolver.clone()));
+        let mut resolver = Resolver::try_new_with_rulesets(plan.resolver.clone(), rulesets.clone())
+            .unwrap_or_else(|e| panic!("resolver config invalid: {e}"));
+        if let Some(store) = store.clone() {
+            resolver.attach_store(store);
+        }
+        let resolver = Arc::new(resolver);
         // 把 resolver 注入到 core-outbound 的全局，让 TcpTransport / TlsTransport
-        // 等所有协议出站在 connect 之前先用 RPKernel 自己的 resolver 解析节点 host —— 否则
+        // 等所有协议出站在 connect 之前先用 WutherCore 自己的 resolver 解析节点 host —— 否则
         // tokio 默认 getaddrinfo 走系统 DNS，TUN 接管后会自循环死锁。
         core_outbound::set_global_dial_resolver(Arc::new(ResolverAdapter {
             resolver: resolver.clone(),
         }));
+        // DnsService 注入到 core-outbound：让 type=dns 的 DnsHijackOutbound
+        // 能拿到本机 service（fake-ip / cache / nameserver-policy 与 capture
+        // / standalone listener 共享同一份）。
+        let dns_service = Arc::new(core_resolver::DnsService::new(resolver.clone()));
+        core_outbound::set_global_dns_responder(Arc::new(DnsResponderAdapter {
+            service: dns_service.clone(),
+        }));
         // 注入 outbound fwmark：对齐 mihomo `dialer.DefaultRoutingMark`。
         // 默认值必须是 0（禁用），否则普通 Mixed/Direct 在无 CAP_NET_ADMIN 的
         // Linux 环境会因 SO_MARK=EPERM 直接无法出站。只有显式配置
-        // auto_redirect_output_mark、启用 TUN auto_redirect、或 TPROXY iptables
-        // 接管时，才使用 mark 绕过 redirect/tproxy chain。
+        // auto_redirect_output_mark、TUN auto_route、或 TPROXY iptables 接管时，
+        // 才使用 mark 绕过 redirect/tproxy chain。
         let out_mark = outbound_fwmark_for_plan(&plan);
         core_outbound::set_outbound_fwmark(out_mark);
+        core_resolver::upstream::marked::set_dns_socket_factory(Arc::new(
+            OutboundDnsSocketFactory,
+        ));
+        // 注入带自定义 DNS 的 HTTP client（避免 reqwest 用 getaddrinfo → fake-IP 循环）
+        if let Ok(client) = reqwest::Client::builder()
+            .user_agent("WutherCore/0.3")
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .gzip(true)
+            .brotli(true)
+            .no_proxy()
+            .build()
+        {
+            core_ruleset::fetch::set_shared_http_client(client);
+        }
         let smart = if let Some(store) = store.clone() {
             Arc::new(SmartSelector::with_store(
                 plan.smart.goal,
@@ -174,6 +210,11 @@ impl Runtime {
             ..MutableConfig::default()
         };
         let node_info = initial_node_info(&plan);
+        let process_finder = if plan.find_process_mode.is_enabled() {
+            Some(core_process::create_finder())
+        } else {
+            None
+        };
         Self {
             plan,
             outbounds: parking_lot::RwLock::new(reg),
@@ -181,6 +222,7 @@ impl Runtime {
             node_info: parking_lot::RwLock::new(node_info),
             route,
             resolver,
+            dns_service,
             smart,
             metrics: Metrics::new(),
             connections: ConnectionTable::new(),
@@ -188,6 +230,7 @@ impl Runtime {
             logs: Arc::new(core_observe::LogBus::new(512)),
             mutable: parking_lot::RwLock::new(mutable),
             urltest: parking_lot::RwLock::new(None),
+            process_finder,
         }
     }
 
@@ -195,6 +238,39 @@ impl Runtime {
     /// 能拿到 alive_for_url / pick_fast。
     pub fn set_urltest(&self, t: Arc<crate::health::UrlTester>) {
         *self.urltest.write() = Some(t);
+    }
+
+    /// 周期性把连接表聚合摘要打到日志（target="conntable", level=info）。
+    /// `interval` ≤ 1s 视为禁用 —— 避免误配置导致的日志洪水。
+    /// 每次 tick 输出：总数 / TCP-UDP 拆分 / top-N 目的地 / top-N 进程 /
+    /// by-rule / by-outbound / 长连接清单。
+    /// 非 `None` 句柄返回给调用方 —— 优雅停机时 `.abort()` 关 logger。
+    pub fn spawn_conntable_logger(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if interval < std::time::Duration::from_secs(1) {
+            return None;
+        }
+        let me = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // 第一次 tick 立刻触发；让用户启动后即时看到一条 baseline 摘要。
+            ticker.tick().await;
+            tracing::info!(
+                target: "conntable",
+                "logger started (interval={:?})", interval
+            );
+            loop {
+                ticker.tick().await;
+                let summary = me
+                    .connections
+                    .summary(10, std::time::Duration::from_secs(300));
+                core_observe::log_connection_summary(&summary);
+            }
+        });
+        Some(handle)
     }
 
     /// 把 group manual 选择写入 store（持久化跨重启）。
@@ -221,6 +297,7 @@ impl Runtime {
     /// 优雅停止：把 Smart writer 的内存数据 flush 到磁盘。
     pub async fn shutdown(&self) {
         self.smart.shutdown().await;
+        self.resolver.flush_to_store().await;
     }
 
     pub fn group_names(&self) -> Vec<String> {
@@ -238,12 +315,27 @@ impl Runtime {
     /// 把订阅刷新得到的最新节点列表注入到 outbound registry，
     /// 同时把 group.members 中的 `feed:<name>` 占位符替换为真实节点名集合。
     pub fn apply_feed_nodes(&self, feed_name: &str, nodes: Vec<core_config::node_uri::ParsedNode>) {
-        let placeholder = format!("feed:{feed_name}");
         let mut new_names: Vec<String> = Vec::with_capacity(nodes.len());
+        let static_nodes: BTreeSet<String> =
+            self.plan.nodes.iter().map(|n| n.name.clone()).collect();
+        let removed_names: Vec<String> = {
+            let info = self.node_info.read();
+            info.iter()
+                .filter(|(name, v)| {
+                    v.provider.as_deref() == Some(feed_name) && !static_nodes.contains(*name)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
         {
             let mut reg = self.outbounds.write();
             let mut info = self.node_info.write();
-            info.retain(|_, v| v.provider.as_deref() != Some(feed_name));
+            for name in &removed_names {
+                reg.remove(name);
+            }
+            info.retain(|name, v| {
+                v.provider.as_deref() != Some(feed_name) || static_nodes.contains(name)
+            });
             for n in &nodes {
                 let ob = core_outbound::registry::build_outbound(n);
                 reg.insert(n.name.clone(), ob);
@@ -255,42 +347,80 @@ impl Runtime {
                 self.smart.ensure_node(&n.name);
             }
         }
+
+        let provider_nodes = self.provider_nodes_by_name();
         // 重建受影响的 GroupSelector：对每个含 feed:<name> 占位符的分组，
-        // 用 (原 members - 占位符 + 实际节点名) 重建一个新的 selector。
+        // 用所有已加载 provider 快照展开，而不是只展开本次刷新 feed。
         let plan_map = self.plan.groups.clone();
         let mut groups = self.groups.write();
+        let mut updated_groups = 0usize;
         for (name, base_plan) in plan_map {
-            if base_plan.members.iter().any(|m| m == &placeholder) {
-                let mut new_members = Vec::with_capacity(base_plan.members.len() + new_names.len());
+            if base_plan
+                .members
+                .iter()
+                .any(|m| feed_member_name(m).is_some())
+            {
+                let mut new_members = Vec::new();
                 for m in &base_plan.members {
-                    if m == &placeholder {
-                        for nn in &new_names {
-                            if !new_members.contains(nn) {
-                                new_members.push(nn.clone());
+                    if let Some(provider) = feed_member_name(m) {
+                        if let Some(names) = provider_nodes.get(provider) {
+                            for nn in names {
+                                if !new_members.contains(nn) {
+                                    new_members.push(nn.clone());
+                                }
                             }
+                        } else if !new_members.contains(m) {
+                            new_members.push(m.clone());
                         }
                     } else if !new_members.contains(m) {
                         new_members.push(m.clone());
                     }
                 }
+                let (old_options, old_manual) = groups
+                    .get(&name)
+                    .map(|g| (g.options(), g.current_manual()))
+                    .unwrap_or_default();
                 let mut updated = base_plan.clone();
                 updated.members = new_members;
-                groups.insert(
-                    name.clone(),
-                    Arc::new(crate::group_selector::GroupSelector::new(updated)),
-                );
+                let selector = Arc::new(crate::group_selector::GroupSelector::with_options(
+                    updated.clone(),
+                    old_options,
+                ));
+                if let Some(manual) = old_manual {
+                    if updated.members.iter().any(|m| m == &manual) {
+                        selector.set_manual(manual);
+                    }
+                }
+                groups.insert(name.clone(), selector);
+                updated_groups += 1;
             }
         }
         tracing::info!(
             target: "feeds",
             feed = feed_name,
             registered = new_names.len(),
+            removed = removed_names.len(),
+            groups = updated_groups,
             "feed nodes applied to runtime"
         );
     }
 
+    fn provider_nodes_by_name(&self) -> BTreeMap<String, Vec<String>> {
+        let info = self.node_info.read();
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, node) in info.iter() {
+            let Some(provider) = node.provider.as_ref() else {
+                continue;
+            };
+            let names = out.entry(provider.clone()).or_default();
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        out
+    }
+
     pub fn pick_outbound(&self, host: &str, port: u16, network: NetworkKind) -> RoutePick {
-        self.metrics.inc_route();
         let ip = host.parse().ok();
         let ctx = FlowContext {
             host: host.to_string(),
@@ -300,13 +430,27 @@ impl Runtime {
             process: None,
             protocol: None,
         };
+        self.pick_outbound_for_context(ctx)
+    }
+
+    pub fn pick_outbound_for_context(&self, ctx: FlowContext) -> RoutePick {
+        self.metrics.inc_route();
         let (decision, kind, source) = self.route.decide(&ctx);
-        debug!(target: "route", host = %host, port, ?decision, kind, source = %source, "rule hit");
+        debug!(
+            target: "route",
+            host = %ctx.host,
+            port = ctx.port,
+            network = ctx.network.as_str(),
+            ?decision,
+            kind,
+            source = %source,
+            "rule hit"
+        );
 
         let (label, outbound) = match &decision {
             RouteDecision::Direct => ("DIRECT".into(), self.must_get("DIRECT")),
             RouteDecision::Block => ("BLOCK".into(), self.must_get("BLOCK")),
-            RouteDecision::Group(name) => self.pick_in_group(name, host),
+            RouteDecision::Group(name) => self.pick_in_group(name, &ctx),
         };
         RoutePick {
             decision,
@@ -317,22 +461,40 @@ impl Runtime {
         }
     }
 
-    fn pick_in_group(&self, group: &str, host: &str) -> (String, SharedOutbound) {
+    fn pick_in_group(&self, group: &str, ctx: &FlowContext) -> (String, SharedOutbound) {
         let groups = self.groups.read();
         let Some(g) = groups.get(group) else {
-            warn!(target: "route", group, "未知分组，回退 DIRECT");
-            return ("DIRECT".into(), self.must_get("DIRECT"));
+            warn!(target: "route", group, "未知分组，阻断流量避免回退 DIRECT");
+            return ("BLOCK".into(), self.must_get("BLOCK"));
         };
-        let meta = crate::group_selector::FlowMeta::for_host(host, 0, "tcp");
+        let mut meta = crate::group_selector::FlowMeta::for_host(
+            ctx.host.clone(),
+            ctx.port,
+            ctx.network.as_str(),
+        );
+        meta.dst_ip = ctx.ip;
         let tester = self.urltest.read().clone();
-        let pick = g.pick(&meta, &self.smart, tester.as_ref());
+        let registry = self.outbounds.read();
+        let pick = if ctx.network == NetworkKind::Udp {
+            g.pick_eligible(&meta, &self.smart, tester.as_ref(), |name| {
+                registry
+                    .get(name)
+                    .map(|ob| ob.capabilities().udp)
+                    .unwrap_or(false)
+            })
+            .or_else(|| g.pick(&meta, &self.smart, tester.as_ref()))
+        } else {
+            g.pick(&meta, &self.smart, tester.as_ref())
+        };
         if let Some(name) = pick {
-            if let Some(ob) = self.outbounds.read().get(&name) {
+            if let Some(ob) = registry.get(&name) {
                 return (name, ob);
             }
-            warn!(target: "route", node = %name, "节点未注册，回退 DIRECT");
+            warn!(target: "route", node = %name, "节点未注册，阻断流量避免回退 DIRECT");
+        } else if g.has_unresolved_feed_placeholders() {
+            warn!(target: "route", group, "订阅节点尚未加载或为空，阻断流量避免回退 DIRECT");
         }
-        ("DIRECT".into(), self.must_get("DIRECT"))
+        ("BLOCK".into(), self.must_get("BLOCK"))
     }
 
     fn must_get(&self, name: &str) -> SharedOutbound {
@@ -349,11 +511,24 @@ impl Runtime {
         port: u16,
         network: NetworkKind,
     ) -> std::io::Result<DialResult> {
-        let dial_id = core_outbound::next_dial_id();
-        let net_str = match network {
-            NetworkKind::Tcp => "tcp",
-            NetworkKind::Udp => "udp",
+        let ip = host.parse().ok();
+        let ctx = FlowContext {
+            host: host.to_string(),
+            ip,
+            port,
+            network,
+            process: None,
+            protocol: None,
         };
+        self.dial_with_context(ctx).await
+    }
+
+    pub async fn dial_with_context(&self, ctx: FlowContext) -> std::io::Result<DialResult> {
+        let dial_id = core_outbound::next_dial_id();
+        let host = ctx.host.clone();
+        let port = ctx.port;
+        let network = ctx.network;
+        let net_str = network.as_str();
         let started = Instant::now();
         info!(
             target: "dial",
@@ -361,104 +536,218 @@ impl Runtime {
             %host, port, network = net_str,
             "begin",
         );
-        let pick = self.pick_outbound(host, port, network);
+        let mut attempted = BTreeSet::new();
+        let mut last_err: Option<std::io::Error> = None;
+        for attempt in 1..=DIAL_MAX_RETRIES {
+            let pick = self.pick_outbound_for_context(ctx.clone());
+            info!(
+                target: "dial",
+                id = dial_id,
+                attempt,
+                %host, port,
+                outbound = %pick.label,
+                decision = ?pick.decision,
+                protocol = pick.outbound.protocol(),
+                "route picked",
+            );
+            if matches!(pick.decision, RouteDecision::Block) {
+                info!(target: "dial", id = dial_id, attempt, %host, port, outbound = %pick.label, "blocked by rule");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "blocked",
+                ));
+            }
+            if !attempted.insert(pick.label.clone()) {
+                if let Some(err) = last_err {
+                    debug!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        %host, port,
+                        outbound = %pick.label,
+                        error = %err,
+                        "retry stopped because group selected the same outbound again",
+                    );
+                    return Err(err);
+                }
+            }
+            let dial_ctx = DialContext {
+                host: host.to_string(),
+                port,
+                network: net_str,
+                dial_id,
+            };
+            let dial_start = Instant::now();
+            let res = pick.outbound.dial_tcp(dial_ctx).await;
+            let elapsed = started.elapsed();
+            let dial_ms = dial_start.elapsed().as_millis() as u64;
+            let group_for_event = match &pick.decision {
+                RouteDecision::Group(g) => Some(g.clone()),
+                _ => None,
+            };
+            match res {
+                Ok(stream) => {
+                    info!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        %host, port,
+                        outbound = %pick.label,
+                        dial_ms,
+                        total_ms = elapsed.as_millis() as u64,
+                        "ok",
+                    );
+                    if pick.label != "DIRECT" && pick.label != "BLOCK" {
+                        self.smart.record_success(&pick.label, elapsed);
+                    }
+                    if let Some(name) = &group_for_event {
+                        if let Some(g) = self.groups.read().get(name) {
+                            g.on_dial_success();
+                        }
+                    }
+                    let chain = build_chain(&pick.decision, &pick.label);
+                    let provider_chains = self.provider_chains_for_chain(&chain);
+                    let remote_destination =
+                        self.remote_destination_for_outbound(&pick.label, &host, port);
+                    let smart_target = self.smart_target_for_decision(&pick.decision, &host);
+                    return Ok(DialResult {
+                        stream,
+                        outbound: pick.label,
+                        decision: pick.decision,
+                        elapsed,
+                        chain,
+                        provider_chains,
+                        remote_destination,
+                        smart_target,
+                        rule: pick.rule,
+                        rule_payload: pick.rule_payload,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        %host, port,
+                        outbound = %pick.label,
+                        dial_ms,
+                        total_ms = elapsed.as_millis() as u64,
+                        error = %e,
+                        "failed",
+                    );
+                    if pick.label != "DIRECT" && pick.label != "BLOCK" {
+                        self.smart.record_failure(&pick.label, e.to_string());
+                    }
+                    if let Some(name) = &group_for_event {
+                        if let Some(g) = self.groups.read().get(name).cloned() {
+                            let tester = self.urltest.read().clone();
+                            let err_str = e.to_string();
+                            let g_name = g.name().to_string();
+                            g.on_dial_failed(&err_str, move || {
+                                // 健康检查最小动作：清 fast-pick 缓存。
+                                // 真实重测延迟到下一次 spawn_periodic round（避免 dial 热路径阻塞）。
+                                if let Some(t) = tester.clone() {
+                                    t.invalidate_fast_pick(&g_name);
+                                }
+                            });
+                        }
+                    }
+                    if !should_retry_dial(&pick, &e, network, attempt) {
+                        return Err(e);
+                    }
+                    debug!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        next_attempt = attempt + 1,
+                        max_attempts = DIAL_MAX_RETRIES,
+                        %host, port,
+                        "retry dial with next group candidate",
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "dial retry exhausted")
+        }))
+    }
+
+    /// Bypass capture policy and dial through DIRECT while keeping real accounting metadata.
+    ///
+    /// TUN `route_exclude_address(_set)` and `route_address(_set)` are routing-layer
+    /// capture controls in mihomo/sing-tun. If a packet has already reached the
+    /// userspace TUN stack, dropping it would blackhole the flow; direct dialing is
+    /// the closest equivalent to "do not capture".
+    pub async fn dial_direct_with_context(
+        &self,
+        ctx: FlowContext,
+        reason: impl Into<String>,
+    ) -> std::io::Result<DialResult> {
+        self.metrics.inc_route();
+        let reason = reason.into();
+        let dial_id = core_outbound::next_dial_id();
+        let host = ctx.host.clone();
+        let port = ctx.port;
+        let network = ctx.network;
+        let net_str = network.as_str();
+        let started = Instant::now();
         info!(
             target: "dial",
             id = dial_id,
-            %host, port,
-            outbound = %pick.label,
-            decision = ?pick.decision,
-            protocol = pick.outbound.protocol(),
-            "route picked",
+            %host, port, network = net_str,
+            bypass = %reason,
+            "begin direct bypass",
         );
-        if matches!(pick.decision, RouteDecision::Block) {
-            info!(target: "dial", id = dial_id, %host, port, outbound = %pick.label, "blocked by rule");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "blocked",
-            ));
-        }
-        let ctx = DialContext {
-            host: host.to_string(),
-            port,
-            network: net_str,
-            dial_id,
-        };
+        let direct = self.must_get("DIRECT");
         let dial_start = Instant::now();
-        let res = pick.outbound.dial_tcp(ctx).await;
+        let res = direct
+            .dial_tcp(DialContext {
+                host: host.clone(),
+                port,
+                network: net_str,
+                dial_id,
+            })
+            .await;
         let elapsed = started.elapsed();
         let dial_ms = dial_start.elapsed().as_millis() as u64;
-        let group_for_event = match &pick.decision {
-            RouteDecision::Group(g) => Some(g.clone()),
-            _ => None,
-        };
         match &res {
-            Ok(_) => {
-                info!(
-                    target: "dial",
-                    id = dial_id,
-                    %host, port,
-                    outbound = %pick.label,
-                    dial_ms,
-                    total_ms = elapsed.as_millis() as u64,
-                    "ok",
-                );
-                if pick.label != "DIRECT" && pick.label != "BLOCK" {
-                    self.smart.record_success(&pick.label, elapsed);
-                }
-                if let Some(name) = &group_for_event {
-                    if let Some(g) = self.groups.read().get(name) {
-                        g.on_dial_success();
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    target: "dial",
-                    id = dial_id,
-                    %host, port,
-                    outbound = %pick.label,
-                    dial_ms,
-                    total_ms = elapsed.as_millis() as u64,
-                    error = %e,
-                    "failed",
-                );
-                if pick.label != "DIRECT" && pick.label != "BLOCK" {
-                    self.smart.record_failure(&pick.label, e.to_string());
-                }
-                if let Some(name) = &group_for_event {
-                    if let Some(g) = self.groups.read().get(name).cloned() {
-                        let tester = self.urltest.read().clone();
-                        let err_str = e.to_string();
-                        let g_name = g.name().to_string();
-                        g.on_dial_failed(&err_str, move || {
-                            // 健康检查最小动作：清 fast-pick 缓存。
-                            // 真实重测延迟到下一次 spawn_periodic round（避免 dial 热路径阻塞）。
-                            if let Some(t) = tester.clone() {
-                                t.invalidate_fast_pick(&g_name);
-                            }
-                        });
-                    }
-                }
-            }
+            Ok(_) => info!(
+                target: "dial",
+                id = dial_id,
+                %host, port,
+                outbound = "DIRECT",
+                dial_ms,
+                total_ms = elapsed.as_millis() as u64,
+                bypass = %reason,
+                "ok",
+            ),
+            Err(e) => warn!(
+                target: "dial",
+                id = dial_id,
+                %host, port,
+                outbound = "DIRECT",
+                dial_ms,
+                total_ms = elapsed.as_millis() as u64,
+                bypass = %reason,
+                error = %e,
+                "failed",
+            ),
         }
         let stream = res?;
-        // chain：分组场景 ["<group>", "<picked-node>"]，否则 ["DIRECT"]/["BLOCK"]/["<node>"]
-        let chain = build_chain(&pick.decision, &pick.label);
-        let provider_chains = self.provider_chains_for_chain(&chain);
-        let remote_destination = self.remote_destination_for_outbound(&pick.label, host, port);
-        let smart_target = self.smart_target_for_decision(&pick.decision, host);
+        let decision = RouteDecision::Direct;
+        let chain = build_chain(&decision, "DIRECT");
         Ok(DialResult {
             stream,
-            outbound: pick.label,
-            decision: pick.decision,
+            outbound: "DIRECT".into(),
+            decision,
             elapsed,
             chain,
-            provider_chains,
-            remote_destination,
-            smart_target,
-            rule: pick.rule,
-            rule_payload: pick.rule_payload,
+            provider_chains: Vec::new(),
+            remote_destination: self.remote_destination_for_outbound("DIRECT", &host, port),
+            smart_target: String::new(),
+            rule: "TUN-BYPASS".into(),
+            rule_payload: reason,
         })
     }
 
@@ -467,80 +756,193 @@ impl Runtime {
     /// 行为对齐 mihomo：
     /// * `RouteDecision::Block` —— 直接 `ConnectionAborted`，**不** fallback
     ///   DIRECT（mihomo 同样直接拒绝，否则黑名单 UDP 会偷偷走出去）。
-    /// * outbound 返回 `ErrorKind::Unsupported`（vmess/trojan 暂未实现 UDP 通道
-    ///   的占位错误）—— fallback DIRECT，但用 once_cell 限流的 warn 避免每包刷屏。
+    /// * outbound 返回 `ErrorKind::Unsupported` —— 直接返回错误；UDP 不应静默
+    ///   fallback DIRECT，否则代理规则命中了不支持 UDP 的节点时会发生泄漏。
     pub async fn dial_udp(&self, host: &str, port: u16) -> std::io::Result<UdpDialResult> {
+        let ip = host.parse().ok();
+        let ctx = FlowContext {
+            host: host.to_string(),
+            ip,
+            port,
+            network: NetworkKind::Udp,
+            process: None,
+            protocol: None,
+        };
+        self.dial_udp_with_context(ctx).await
+    }
+
+    pub async fn dial_udp_with_context(&self, ctx: FlowContext) -> std::io::Result<UdpDialResult> {
         let started = Instant::now();
         let dial_id = core_outbound::next_dial_id();
+        let host = ctx.host.clone();
+        let port = ctx.port;
         debug!(
             target: "dial",
             id = dial_id,
             %host, port, network = "udp",
             "begin (udp)",
         );
-        let pick = self.pick_outbound(host, port, NetworkKind::Udp);
-        if matches!(pick.decision, RouteDecision::Block) {
-            debug!(target: "dial", id = dial_id, %host, port, outbound = %pick.label, "udp blocked");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "blocked",
-            ));
-        }
-        let ctx = DialContext {
-            host: host.to_string(),
-            port,
-            network: "udp",
-            dial_id,
-        };
-        let res = pick.outbound.dial_udp(ctx.clone()).await;
-        let mut actual_label = pick.label.clone();
-        let mut actual_decision = pick.decision.clone();
-        let socket = match res {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                warn_udp_unsupported_once(&pick.label);
-                // fallback DIRECT —— 不丢包，但 dashboard 仍标记"实际 outbound = DIRECT"
-                actual_label = "DIRECT".into();
-                actual_decision = RouteDecision::Direct;
-                let direct = self.must_get("DIRECT");
-                direct.dial_udp(ctx).await?
+        let mut attempted = BTreeSet::new();
+        let mut last_err: Option<std::io::Error> = None;
+        for attempt in 1..=DIAL_MAX_RETRIES {
+            let pick = self.pick_outbound_for_context(ctx.clone());
+            if matches!(pick.decision, RouteDecision::Block) {
+                debug!(target: "dial", id = dial_id, attempt, %host, port, outbound = %pick.label, "udp blocked");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "blocked",
+                ));
             }
-            Err(e) => {
+            if !attempted.insert(pick.label.clone()) {
+                if let Some(err) = last_err {
+                    debug!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        %host, port,
+                        outbound = %pick.label,
+                        error = %err,
+                        "udp retry stopped because group selected the same outbound again",
+                    );
+                    return Err(err);
+                }
+            }
+            if !pick.outbound.capabilities().udp {
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "outbound `{}`/{} does not support UDP relay",
+                        pick.label,
+                        pick.outbound.protocol()
+                    ),
+                );
+                warn_udp_unsupported_once(&pick.label);
                 debug!(
                     target: "dial",
                     id = dial_id,
+                    attempt,
                     %host, port,
                     outbound = %pick.label,
-                    error = %e,
-                    "udp dial failed"
+                    error = %err,
+                    "udp unsupported by picked outbound"
                 );
-                return Err(e);
+                return Err(err);
             }
-        };
+            let dial_ctx = DialContext {
+                host: host.to_string(),
+                port,
+                network: "udp",
+                dial_id,
+            };
+            match pick.outbound.dial_udp(dial_ctx).await {
+                Ok(socket) => {
+                    let elapsed = started.elapsed();
+                    let chain = build_chain(&pick.decision, &pick.label);
+                    let provider_chains = self.provider_chains_for_chain(&chain);
+                    let remote_destination =
+                        self.remote_destination_for_outbound(&pick.label, &host, port);
+                    let smart_target = self.smart_target_for_decision(&pick.decision, &host);
+                    debug!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        %host, port,
+                        outbound = %pick.label,
+                        total_ms = elapsed.as_millis() as u64,
+                        "udp ok",
+                    );
+                    if pick.label != "DIRECT" && pick.label != "BLOCK" {
+                        self.smart.record_success(&pick.label, elapsed);
+                    }
+                    return Ok(UdpDialResult {
+                        socket,
+                        outbound: pick.label,
+                        decision: pick.decision,
+                        elapsed,
+                        chain,
+                        provider_chains,
+                        remote_destination,
+                        smart_target,
+                        rule: pick.rule,
+                        rule_payload: pick.rule_payload,
+                    });
+                }
+                Err(e) => {
+                    debug!(
+                        target: "dial",
+                        id = dial_id,
+                        attempt,
+                        %host, port,
+                        outbound = %pick.label,
+                        error = %e,
+                        "udp dial failed"
+                    );
+                    if pick.label != "DIRECT" && pick.label != "BLOCK" {
+                        self.smart.record_failure(&pick.label, e.to_string());
+                    }
+                    if !should_retry_dial(&pick, &e, NetworkKind::Udp, attempt) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "udp dial retry exhausted")
+        }))
+    }
+
+    pub async fn dial_udp_direct_with_context(
+        &self,
+        mut ctx: FlowContext,
+        reason: impl Into<String>,
+    ) -> std::io::Result<UdpDialResult> {
+        self.metrics.inc_route();
+        ctx.network = NetworkKind::Udp;
+        let reason = reason.into();
+        let started = Instant::now();
+        let dial_id = core_outbound::next_dial_id();
+        let host = ctx.host.clone();
+        let port = ctx.port;
+        debug!(
+            target: "dial",
+            id = dial_id,
+            %host, port, network = "udp",
+            bypass = %reason,
+            "begin direct bypass (udp)",
+        );
+        let direct = self.must_get("DIRECT");
+        let socket = direct
+            .dial_udp(DialContext {
+                host: host.clone(),
+                port,
+                network: "udp",
+                dial_id,
+            })
+            .await?;
         let elapsed = started.elapsed();
-        let chain = build_chain(&actual_decision, &actual_label);
-        let provider_chains = self.provider_chains_for_chain(&chain);
-        let remote_destination = self.remote_destination_for_outbound(&actual_label, host, port);
-        let smart_target = self.smart_target_for_decision(&actual_decision, host);
+        let decision = RouteDecision::Direct;
+        let chain = build_chain(&decision, "DIRECT");
         debug!(
             target: "dial",
             id = dial_id,
             %host, port,
-            outbound = %actual_label,
+            outbound = "DIRECT",
             total_ms = elapsed.as_millis() as u64,
+            bypass = %reason,
             "udp ok",
         );
         Ok(UdpDialResult {
             socket,
-            outbound: actual_label,
-            decision: actual_decision,
+            outbound: "DIRECT".into(),
+            decision,
             elapsed,
             chain,
-            provider_chains,
-            remote_destination,
-            smart_target,
-            rule: pick.rule,
-            rule_payload: pick.rule_payload,
+            provider_chains: Vec::new(),
+            remote_destination: self.remote_destination_for_outbound("DIRECT", &host, port),
+            smart_target: String::new(),
+            rule: "TUN-BYPASS".into(),
+            rule_payload: reason,
         })
     }
 
@@ -608,7 +1010,7 @@ fn warn_udp_unsupported_once(label: &str) {
         warn!(
             target: "dial",
             outbound = label,
-            "udp unsupported by outbound; falling back to DIRECT (rate-limited)"
+            "udp unsupported by outbound (rate-limited)"
         );
     }
 }
@@ -637,6 +1039,12 @@ fn infer_provider_from_name(
             None
         }
     })
+}
+
+fn feed_member_name(member: &str) -> Option<&str> {
+    member
+        .strip_prefix("feed:")
+        .filter(|provider| !provider.trim().is_empty())
 }
 
 fn format_host_port(host: &str, port: u16) -> String {
@@ -674,6 +1082,55 @@ fn build_chain(decision: &RouteDecision, label: &str) -> Vec<String> {
             }
         }
     }
+}
+
+fn should_retry_dial(
+    pick: &RoutePick,
+    err: &std::io::Error,
+    network: NetworkKind,
+    attempt: usize,
+) -> bool {
+    if attempt >= DIAL_MAX_RETRIES {
+        return false;
+    }
+    if !matches!(pick.decision, RouteDecision::Group(_)) {
+        return false;
+    }
+    if pick.label == "DIRECT" || pick.label == "BLOCK" {
+        return false;
+    }
+    !is_non_retryable_dial_error(err, network)
+}
+
+fn is_non_retryable_dial_error(err: &std::io::Error, network: NetworkKind) -> bool {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::Unsupported
+        | ErrorKind::InvalidInput
+        | ErrorKind::AddrNotAvailable
+        | ErrorKind::PermissionDenied
+        | ErrorKind::ConnectionAborted => return true,
+        _ => {}
+    }
+
+    let msg = err.to_string().to_ascii_lowercase();
+    let resolver_ip_not_found = msg.contains("no address associated")
+        || msg.contains("name or service not known")
+        || msg.contains("no such host")
+        || msg.contains("ip not found")
+        || msg.contains("dns record not found");
+    let ip_version_error = msg.contains("ip version")
+        || msg.contains("address family")
+        || msg.contains("ipv6 disabled")
+        || msg.contains("ipv6 is disabled");
+    let loopback_error = msg.contains("loopback") || msg.contains("self-capture");
+    let udp_unsupported = network == NetworkKind::Udp
+        && (msg.contains("does not support udp")
+            || msg.contains("udp relay")
+            || msg.contains("udp 通道")
+            || msg.contains("不支持 udp"));
+
+    resolver_ip_not_found || ip_version_error || loopback_error || udp_unsupported
 }
 
 pub struct RoutePick {
@@ -734,12 +1191,25 @@ fn outbound_fwmark_for_plan(plan: &RuntimePlan) -> u32 {
     {
         return mark;
     }
-    if plan.capture.on && plan.capture.tun.auto_redirect {
-        0x2024
+    if capture_uses_tun_auto_route(&plan.capture) {
+        core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
     } else if plan.capture.on && capture_uses_tproxy(&plan.capture) {
         0x2d0
     } else {
         0
+    }
+}
+
+fn capture_uses_tun_auto_route(capture: &core_config::model::Capture) -> bool {
+    if !capture.on || !(capture.tun.auto_route || capture.tun.auto_redirect) {
+        return false;
+    }
+    match capture.method {
+        core_config::model::CaptureMethod::VirtualNic => true,
+        core_config::model::CaptureMethod::Auto => {
+            !cfg!(any(target_os = "linux", target_os = "android"))
+        }
+        _ => false,
     }
 }
 
@@ -754,17 +1224,31 @@ fn capture_uses_tproxy(capture: &core_config::model::Capture) -> bool {
 }
 
 /// 把 [`core_resolver::Resolver`] 适配为 [`core_outbound::DialResolver`]，
-/// 让所有 outbound 在 dial 前用 RPKernel resolver（IP-literal DoH）解析主机名，
+/// 让所有 outbound 在 dial 前用 WutherCore resolver（IP-literal DoH）解析主机名，
 /// 避开 TUN 自循环。
 #[derive(Debug)]
 struct ResolverAdapter {
     resolver: Arc<Resolver>,
 }
 
+/// 把 [`core_resolver::DnsService`] 桥到 [`core_outbound::DnsResponder`] —— 让
+/// `type: dns` 出站和 capture DNS hijack 共享同一份 service。
+#[derive(Debug)]
+struct DnsResponderAdapter {
+    service: Arc<core_resolver::DnsService>,
+}
+
+#[async_trait::async_trait]
+impl core_outbound::DnsResponder for DnsResponderAdapter {
+    async fn serve_packet(&self, req: &[u8]) -> Vec<u8> {
+        self.service.serve_packet(req).await
+    }
+}
+
 #[async_trait::async_trait]
 impl core_outbound::DialResolver for ResolverAdapter {
     async fn resolve(&self, host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
-        match self.resolver.resolve(host).await {
+        match self.resolver.resolve_via_bootstrap(host).await {
             Ok(ips) => Ok(ips),
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -772,22 +1256,191 @@ impl core_outbound::DialResolver for ResolverAdapter {
             )),
         }
     }
+
+    async fn resolve_for_direct(&self, host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+        match self.resolver.resolve_via_direct(host).await {
+            Ok(ips) => Ok(ips),
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("resolver: {e}"),
+            )),
+        }
+    }
+
+    fn ipv6_enabled(&self) -> bool {
+        self.resolver.ipv6_enabled()
+    }
+}
+
+struct OutboundDnsSocketFactory;
+
+impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFactory {
+    fn create_udp(
+        &self,
+        peer: std::net::SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket> {
+        let bind_addr: std::net::SocketAddr = if peer.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        let sock = std::net::UdpSocket::bind(bind_addr)?;
+        core_outbound::protect_socket(&sock)?;
+        let s2 = socket2::SockRef::from(&sock);
+        // SO_MARK: 让 fwmark rule 路由到物理网卡
+        if let Err(e) = core_outbound::apply_outbound_mark_for_addr(&s2, peer) {
+            let mark = core_outbound::outbound_fwmark();
+            if mark != 0 {
+                tracing::warn!(target: "dial::dns", %peer, error = %e, "DNS UDP SO_MARK failed");
+                return Err(e);
+            }
+        }
+        // SO_BINDTODEVICE: 直接绑定到物理网卡，双重保障
+        if let Err(e) = core_outbound::bind_to_device(&s2) {
+            tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS UDP SO_BINDTODEVICE failed (non-fatal)");
+        }
+        Ok(sock)
+    }
+
+    fn create_tcp(
+        &self,
+        peer: std::net::SocketAddr,
+    ) -> std::io::Result<std::net::TcpStream> {
+        let domain = if peer.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        core_outbound::protect_socket(&sock)?;
+        // SO_MARK + SO_BINDTODEVICE: 双重保障绕 TUN
+        if let Err(e) = core_outbound::apply_outbound_mark_for_addr(&sock, peer) {
+            let mark = core_outbound::outbound_fwmark();
+            if mark != 0 {
+                tracing::warn!(target: "dial::dns", %peer, error = %e, "DNS TCP SO_MARK failed");
+                return Err(e);
+            }
+        }
+        if let Err(e) = core_outbound::bind_to_device(&sock) {
+            tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS TCP SO_BINDTODEVICE failed (non-fatal)");
+        }
+        sock.connect_timeout(
+            &peer.into(),
+            std::time::Duration::from_secs(10),
+        )?;
+        Ok(sock.into())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use core_outbound::DialResolver;
+    use core_resolver::{DnsError, DnsGroup, DnsUpstream, GroupStrategy, QType, ResolverBuilder};
+    use std::net::IpAddr;
 
-    static FWMARK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[derive(Debug)]
+    struct StaticDnsUpstream {
+        ip: IpAddr,
+    }
+
+    #[async_trait]
+    impl DnsUpstream for StaticDnsUpstream {
+        fn name(&self) -> &str {
+            "static"
+        }
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+        async fn query_a(&self, _: &str) -> Result<Vec<IpAddr>, DnsError> {
+            Ok(vec![self.ip])
+        }
+        async fn query_aaaa(&self, _: &str) -> Result<Vec<IpAddr>, DnsError> {
+            Ok(Vec::new())
+        }
+    }
 
     fn load_plan(yaml: &str) -> RuntimePlan {
         core_config::loader::load_from_str(yaml).unwrap()
     }
 
+    #[tokio::test]
+    async fn dial_resolver_uses_bootstrap_not_business_policy() {
+        let bootstrap = Arc::new(DnsGroup::new(
+            "bootstrap",
+            GroupStrategy::Fallback,
+            vec![Arc::new(StaticDnsUpstream {
+                ip: "9.9.9.9".parse().unwrap(),
+            }) as _],
+        ));
+        let resolver = ResolverBuilder::new()
+            .bootstrap(bootstrap)
+            .policy(
+                core_resolver::PolicyEngine::new()
+                    .with_default(core_resolver::DnsAction::Reject(Default::default())),
+            )
+            .build();
+        let adapter = ResolverAdapter {
+            resolver: Arc::new(resolver),
+        };
+
+        let ips = adapter.resolve("node.example.com").await.unwrap();
+        assert_eq!(ips, vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn runtime_with_store_restores_dns_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "wuthercore-runtime-dns-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = core_store::Store::open(&path).unwrap();
+        let expire_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        store
+            .write_batch(&[core_store::store::BatchOp::PutDnsCache(
+                "persist-runtime.example.invalid|A".into(),
+                core_store::DnsCacheBlob {
+                    ips: vec!["9.9.9.9".into()],
+                    expire_secs,
+                    origin: "test".into(),
+                },
+            )])
+            .unwrap();
+
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+resolver:
+  mode: system
+  fake: off
+route:
+  preset: direct
+"#,
+        );
+        let runtime = Runtime::build_with_store(plan, Some(store));
+
+        let ips = runtime
+            .resolver
+            .resolve_qtype("persist-runtime.example.invalid", QType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(ips, vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
+    }
+
     #[test]
     fn runtime_leaves_outbound_fwmark_disabled_when_not_configured() {
-        let _guard = FWMARK_TEST_LOCK.lock().unwrap();
-        core_outbound::set_outbound_fwmark(0x7bad);
         let plan = load_plan(
             r#"
 version: 1
@@ -799,15 +1452,11 @@ route:
 "#,
         );
 
-        let _runtime = Runtime::build(plan);
-
-        assert_eq!(core_outbound::outbound_fwmark(), 0);
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0);
     }
 
     #[test]
     fn runtime_uses_auto_redirect_default_output_mark_only_when_enabled() {
-        let _guard = FWMARK_TEST_LOCK.lock().unwrap();
-        core_outbound::set_outbound_fwmark(0);
         let plan = load_plan(
             r#"
 version: 1
@@ -824,15 +1473,32 @@ route:
 "#,
         );
 
-        let _runtime = Runtime::build(plan);
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0x2024);
+    }
 
-        assert_eq!(core_outbound::outbound_fwmark(), 0x2024);
+    #[test]
+    fn runtime_uses_tun_auto_route_output_mark_without_auto_redirect() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+capture:
+  on: true
+  method: virtual_nic
+  tun:
+    auto_route: true
+route:
+  preset: direct
+"#,
+        );
+
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0x2024);
     }
 
     #[test]
     fn runtime_uses_mihomo_tproxy_mark_when_tproxy_capture_enabled() {
-        let _guard = FWMARK_TEST_LOCK.lock().unwrap();
-        core_outbound::set_outbound_fwmark(0);
         let mut plan = load_plan(
             r#"
 version: 1
@@ -846,9 +1512,7 @@ route:
         plan.capture.on = true;
         plan.capture.method = core_config::model::CaptureMethod::Tproxy;
 
-        let _runtime = Runtime::build(plan);
-
-        assert_eq!(core_outbound::outbound_fwmark(), 0x2d0);
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0x2d0);
     }
 
     #[test]
@@ -900,6 +1564,300 @@ route:
     }
 
     #[test]
+    fn feed_updates_expand_all_loaded_providers_without_erasing_each_other() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/a.yaml"
+  provider-b: "https://example.invalid/b.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a, provider-b]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        runtime.apply_feed_nodes(
+            "provider-a",
+            vec![core_config::node_uri::ParsedNode::new(
+                "provider-a/node-1",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.10",
+                10001,
+            )],
+        );
+        runtime.apply_feed_nodes(
+            "provider-b",
+            vec![core_config::node_uri::ParsedNode::new(
+                "provider-b/node-1",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.20",
+                10002,
+            )],
+        );
+
+        let groups = runtime.groups.read();
+        let members = groups.get("main").unwrap().members();
+
+        assert!(members.contains(&"provider-a/node-1".to_string()));
+        assert!(members.contains(&"provider-b/node-1".to_string()));
+        assert!(!members.contains(&"feed:provider-a".to_string()));
+        assert!(!members.contains(&"feed:provider-b".to_string()));
+    }
+
+    #[test]
+    fn feed_update_replaces_stale_provider_outbounds_for_new_tun_flows() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        runtime.apply_feed_nodes(
+            "provider-a",
+            vec![core_config::node_uri::ParsedNode::new(
+                "provider-a/old",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.10",
+                10001,
+            )],
+        );
+        runtime.apply_feed_nodes(
+            "provider-a",
+            vec![core_config::node_uri::ParsedNode::new(
+                "provider-a/new",
+                core_config::node_uri::NodeProtocol::Direct,
+                "203.0.113.20",
+                10002,
+            )],
+        );
+
+        let names = runtime.outbound_names();
+        let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+
+        assert!(!names.contains(&"provider-a/old".to_string()));
+        assert!(names.contains(&"provider-a/new".to_string()));
+        assert_eq!(pick.label, "provider-a/new");
+    }
+
+    #[test]
+    fn unresolved_feed_group_blocks_instead_of_falling_back_direct() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+
+        let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+
+        assert_eq!(pick.label, "BLOCK");
+    }
+
+    #[test]
+    fn process_finder_disabled_by_default() {
+        // 与 mihomo 一致：未配置 find-process-mode 默认 off，process_finder 不构建。
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        assert!(
+            runtime.process_finder.is_none(),
+            "find-process-mode 默认 off → finder 不应构建"
+        );
+    }
+
+    #[test]
+    fn process_finder_built_when_mode_enabled() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+find-process-mode: always
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        assert!(
+            runtime.process_finder.is_some(),
+            "find-process-mode: always → finder 必须构建"
+        );
+    }
+
+    #[test]
+    fn process_finder_built_for_strict_mode() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+find-process-mode: strict
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        assert!(
+            runtime.process_finder.is_some(),
+            "find-process-mode: strict → finder 必须构建"
+        );
+    }
+
+    #[test]
+    fn unresolved_feed_group_can_use_static_direct_fallback() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+nodes:
+  - "direct://0.0.0.0:0#direct-fallback"
+groups:
+  main:
+    choose: manual
+    use: [provider-a, nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+
+        let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+
+        assert_eq!(pick.label, "direct-fallback");
+    }
+
+    #[test]
+    fn retry_stop_conditions_match_mihomo_dialer() {
+        assert!(is_non_retryable_dial_error(
+            &std::io::Error::new(std::io::ErrorKind::Unsupported, "no udp"),
+            NetworkKind::Udp,
+        ));
+        assert!(is_non_retryable_dial_error(
+            &std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "resolver: failed to lookup address information: No address associated with hostname",
+            ),
+            NetworkKind::Tcp,
+        ));
+        assert!(is_non_retryable_dial_error(
+            &std::io::Error::new(std::io::ErrorKind::Other, "ipv6 disabled"),
+            NetworkKind::Tcp,
+        ));
+        assert!(is_non_retryable_dial_error(
+            &std::io::Error::new(std::io::ErrorKind::Other, "loopback self-capture"),
+            NetworkKind::Udp,
+        ));
+        assert!(!is_non_retryable_dial_error(
+            &std::io::Error::new(std::io::ErrorKind::TimedOut, "node timed out"),
+            NetworkKind::Tcp,
+        ));
+        assert!(!is_non_retryable_dial_error(
+            &std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "node refused"),
+            NetworkKind::Tcp,
+        ));
+    }
+
+    #[test]
+    fn udp_group_pick_skips_members_without_udp_relay() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "http://127.0.0.1:8080#tcp-only"
+  - "direct://0.0.0.0:0#udp-direct"
+groups:
+  main:
+    choose: manual
+    use: [tcp-only, udp-direct]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+
+        let pick = runtime.pick_outbound("8.8.8.8", 53, NetworkKind::Udp);
+
+        assert_eq!(pick.label, "udp-direct");
+    }
+
+    #[tokio::test]
+    async fn udp_dial_returns_unsupported_when_group_has_no_udp_capable_node() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "http://127.0.0.1:8080#tcp-only"
+groups:
+  main:
+    choose: manual
+    use: [tcp-only]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+
+        let err = match runtime.dial_udp("8.8.8.8", 53).await {
+            Ok(_) => panic!("UDP dial unexpectedly succeeded through tcp-only outbound"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        let err_s = err.to_string();
+        assert!(err_s.contains("tcp-only"));
+        assert!(err_s.contains("http"));
+    }
+
+    #[test]
     fn smart_group_sets_smart_target_from_real_route_decision() {
         let plan = load_plan(
             r#"
@@ -927,5 +1885,45 @@ route:
             runtime.smart_target_for_decision(&pick.decision, "Example.COM."),
             "Example.COM"
         );
+    }
+
+    #[test]
+    fn runtime_ruleset_step_is_evaluated_before_preset_fallback() {
+        let idx = core_ruleset::RulesetIndex::new();
+        idx.insert(std::sync::Arc::new(
+            core_ruleset::RulesetMatcher::compile_domains(
+                "openai",
+                vec!["+.openai.com".to_string()],
+            ),
+        ));
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#node-a"
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+  ai:
+    choose: manual
+    use: [nodes]
+route:
+  preset: cn_smart
+  final: main
+  steps:
+    - "set:openai -> ai"
+"#,
+        );
+        let runtime = Runtime::build_with(plan, None, Some(idx));
+
+        let pick = runtime.pick_outbound("api.openai.com", 443, NetworkKind::Tcp);
+
+        assert!(matches!(pick.decision, RouteDecision::Group(ref group) if group == "ai"));
+        assert_eq!(pick.rule, "RULE-SET");
+        assert_eq!(pick.rule_payload, "set:openai -> ai");
     }
 }

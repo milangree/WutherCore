@@ -4,8 +4,8 @@
 //!
 //! 1. **跨平台**：Linux / Android / macOS / iOS / Windows 一律一个 [`PrivilegeReport::detect()`]。
 //! 2. **诚实**：不假装拥有权限；检测失败时 `level = User` 并把所有受限能力降级。
-//! 3. **Android 优先 root，再降级**：[`try_request_root_android`] 调用 `su -c id`，
-//!    成功标记 `Elevated`，失败保持 `User`，由调用方走 VpnService 路径。
+//! 3. **Android 诚实探测 su**：[`try_request_root_android`] 调用 `su -c id`，
+//!    成功只表示可执行 root 子命令；不会把当前进程伪装成 uid=0。
 //! 4. **零 unsafe**：unix 用 [`nix`] 封装，Windows 走外部命令检测。
 
 use serde::Serialize;
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PrivilegeLevel {
-    /// Linux/macOS root（uid=0），Windows Administrator，Android root（su 可用）。
+    /// Linux/macOS root（uid=0），Windows Administrator，或当前进程持有等价权限。
     Elevated,
     /// 受限：低位端口受限，无法改路由表，无法创建 raw/TPROXY socket。
     User,
@@ -43,10 +43,18 @@ pub struct PrivilegeReport {
 }
 
 impl PrivilegeReport {
-    pub fn is_elevated(&self) -> bool { self.level.is_elevated() }
+    pub fn is_elevated(&self) -> bool {
+        self.level.is_elevated()
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+))]
 fn detect_unix() -> PrivilegeReport {
     use nix::unistd::{geteuid, User};
 
@@ -65,11 +73,18 @@ fn detect_unix() -> PrivilegeReport {
 
     let capabilities = read_linux_capabilities();
     if !elevated && !capabilities.is_empty() {
-        notes.push(format!("non-root with capabilities: {}", capabilities.join(", ")));
+        notes.push(format!(
+            "non-root with capabilities: {}",
+            capabilities.join(", ")
+        ));
     }
 
     PrivilegeReport {
-        level: if elevated { PrivilegeLevel::Elevated } else { PrivilegeLevel::User },
+        level: if elevated {
+            PrivilegeLevel::Elevated
+        } else {
+            PrivilegeLevel::User
+        },
         platform: std::env::consts::OS,
         username,
         uid: Some(uid),
@@ -98,15 +113,25 @@ fn read_linux_capabilities() -> Vec<String> {
     let bits = u64::from_str_radix(&cap_eff, 16).unwrap_or(0);
     let mut caps = Vec::new();
     // bit 编号见 capabilities(7)
-    if bits & (1 << 13) != 0 { caps.push("cap_net_admin".into()); }
-    if bits & (1 << 10) != 0 { caps.push("cap_net_bind_service".into()); }
-    if bits & (1 << 12) != 0 { caps.push("cap_net_raw".into()); }
-    if bits & (1 << 21) != 0 { caps.push("cap_sys_admin".into()); }
+    if bits & (1 << 13) != 0 {
+        caps.push("cap_net_admin".into());
+    }
+    if bits & (1 << 10) != 0 {
+        caps.push("cap_net_bind_service".into());
+    }
+    if bits & (1 << 12) != 0 {
+        caps.push("cap_net_raw".into());
+    }
+    if bits & (1 << 21) != 0 {
+        caps.push("cap_sys_admin".into());
+    }
     caps
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn read_linux_capabilities() -> Vec<String> { Vec::new() }
+fn read_linux_capabilities() -> Vec<String> {
+    Vec::new()
+}
 
 #[cfg(target_os = "windows")]
 fn detect_windows() -> PrivilegeReport {
@@ -126,7 +151,11 @@ fn detect_windows() -> PrivilegeReport {
     }
 
     PrivilegeReport {
-        level: if elevated { PrivilegeLevel::Elevated } else { PrivilegeLevel::User },
+        level: if elevated {
+            PrivilegeLevel::Elevated
+        } else {
+            PrivilegeLevel::User
+        },
         platform: "windows",
         username,
         uid: None,
@@ -141,8 +170,12 @@ fn detect_windows() -> PrivilegeReport {
 }
 
 #[cfg(not(any(
-    target_os = "linux", target_os = "android", target_os = "macos",
-    target_os = "ios", target_os = "freebsd", target_os = "windows"
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "windows"
 )))]
 fn detect_other() -> PrivilegeReport {
     PrivilegeReport {
@@ -162,21 +195,38 @@ fn detect_other() -> PrivilegeReport {
 
 impl PrivilegeReport {
     pub fn detect() -> Self {
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-        { return detect_unix(); }
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd"
+        ))]
+        {
+            return detect_unix();
+        }
         #[cfg(target_os = "windows")]
-        { return detect_windows(); }
+        {
+            return detect_windows();
+        }
         #[cfg(not(any(
-            target_os = "linux", target_os = "android", target_os = "macos",
-            target_os = "ios", target_os = "freebsd", target_os = "windows"
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "windows"
         )))]
-        { return detect_other(); }
+        {
+            return detect_other();
+        }
     }
 }
 
 /// Android 平台：尝试通过 `su -c id` 提权。
-/// 成功返回 Ok(())，调用方应 *重新检测* PrivilegeReport（注：本进程的 uid 不会因此变成 0，
-/// 但表示宿主允许我们 spawn `su` 子进程做特权操作 —— 例如 `iptables`、`ip rule` 等）。
+/// 成功返回 Ok(()) 仅表示宿主允许 spawn `su` 子进程做特权操作。
+/// 注意：本进程的 uid / capabilities 不会因此变化；ROOT TUN 打开 `/dev/net/tun`
+/// 与 ioctl 配置仍要求当前进程本身具备 uid=0 或 CAP_NET_ADMIN，或者走 VpnService fd。
 #[cfg(target_os = "android")]
 pub async fn try_request_root_android() -> Result<(), String> {
     let out = tokio::process::Command::new("su")
@@ -208,15 +258,18 @@ pub async fn ensure_best_effort_privilege() -> PrivilegeReport {
     if cfg!(target_os = "android") && !report.is_elevated() {
         match try_request_root_android().await {
             Ok(_) => {
-                info!(target: "privilege", "android root unlocked; promoting to Elevated");
-                report.level = PrivilegeLevel::Elevated;
-                report.can_create_tun = true;
-                report.can_modify_routes = true;
-                report.can_iptables = true;
-                report.notes.push("android root via su".into());
+                warn!(
+                    target: "privilege",
+                    "android su available, but current process is still unprivileged; ROOT TUN needs uid=0/CAP_NET_ADMIN or VpnService fd"
+                );
+                report.notes.push(
+                    "android su available for explicit root subprocess commands; current process uid/capabilities unchanged".into(),
+                );
             }
             Err(e) => {
-                report.notes.push(format!("android su failed → VpnService fallback: {e}"));
+                report
+                    .notes
+                    .push(format!("android su failed → VpnService fallback: {e}"));
             }
         }
     }
@@ -242,7 +295,10 @@ mod tests {
         let r = PrivilegeReport::detect();
         // 不强制断言 elevated（host 可能非 root），但字段必须填上
         assert!(!r.platform.is_empty());
-        assert!(matches!(r.level, PrivilegeLevel::Elevated | PrivilegeLevel::User));
+        assert!(matches!(
+            r.level,
+            PrivilegeLevel::Elevated | PrivilegeLevel::User
+        ));
     }
 
     #[tokio::test]

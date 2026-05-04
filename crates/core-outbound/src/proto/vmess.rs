@@ -82,9 +82,9 @@ use uuid::Uuid;
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 use crate::proto::vmess_kdf::{
-    kdf_n, KDF_AEAD_KEY, KDF_AEAD_KEY_LEN, KDF_AEAD_NONCE, KDF_AEAD_NONCE_LEN, KDF_AUTH_ID,
-    KDF_AEAD_RESP_HEADER_LEN_IV, KDF_AEAD_RESP_HEADER_LEN_KEY,
-    KDF_AEAD_RESP_HEADER_PAYLOAD_IV, KDF_AEAD_RESP_HEADER_PAYLOAD_KEY,
+    kdf_n, KDF_AEAD_KEY, KDF_AEAD_KEY_LEN, KDF_AEAD_NONCE, KDF_AEAD_NONCE_LEN,
+    KDF_AEAD_RESP_HEADER_LEN_IV, KDF_AEAD_RESP_HEADER_LEN_KEY, KDF_AEAD_RESP_HEADER_PAYLOAD_IV,
+    KDF_AEAD_RESP_HEADER_PAYLOAD_KEY, KDF_AUTH_ID,
 };
 use crate::transport::{
     grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
@@ -197,12 +197,7 @@ impl Default for VmessNetwork {
 }
 
 impl VmessOutbound {
-    pub fn new(
-        name: impl Into<String>,
-        host: impl Into<String>,
-        port: u16,
-        uuid: Uuid,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, host: impl Into<String>, port: u16, uuid: Uuid) -> Self {
         Self {
             name: name.into(),
             host: host.into(),
@@ -285,10 +280,19 @@ impl VmessOutbound {
 
 #[async_trait]
 impl OutboundAdapter for VmessOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "vmess" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "vmess"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: true, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -305,11 +309,22 @@ impl OutboundAdapter for VmessOutbound {
         rand::rngs::OsRng.fill_bytes(&mut resp_auth);
 
         let security = self.security.select();
-        let cmd = if ctx.network == "udp" { VMESS_CMD_UDP } else { VMESS_CMD_TCP };
+        let cmd = if ctx.network == "udp" {
+            VMESS_CMD_UDP
+        } else {
+            VMESS_CMD_TCP
+        };
 
         // 2) 构造 header_payload
         let header_payload = build_header_payload_full(
-            &iv, &req_key, resp_auth[0], self.options, security, cmd, ctx.port, &ctx.host,
+            &iv,
+            &req_key,
+            resp_auth[0],
+            self.options,
+            security,
+            cmd,
+            ctx.port,
+            &ctx.host,
         );
 
         // 3) AEAD 头部封装
@@ -324,8 +339,7 @@ impl OutboundAdapter for VmessOutbound {
             aead_seal_header_payload(&cmd_key, &auth_id, &conn_nonce, &header_payload)?;
 
         // 4) 写出
-        let mut wire =
-            Vec::with_capacity(16 + length_aead.len() + 8 + payload_aead.len());
+        let mut wire = Vec::with_capacity(16 + length_aead.len() + 8 + payload_aead.len());
         wire.extend_from_slice(&auth_id);
         wire.extend_from_slice(&length_aead);
         wire.extend_from_slice(&conn_nonce);
@@ -354,7 +368,16 @@ pub fn build_legacy_header_payload(
     host: &str,
 ) -> Vec<u8> {
     // legacy 模式默认无 chunk masking 与 padding 也无 auth len（向旧服务端兼容）
-    build_header_payload_full(iv, req_key, resp_auth, VMESS_OPTION_CHUNK_STREAM, sec, cmd, port, host)
+    build_header_payload_full(
+        iv,
+        req_key,
+        resp_auth,
+        VMESS_OPTION_CHUNK_STREAM,
+        sec,
+        cmd,
+        port,
+        host,
+    )
 }
 
 /// 给 [`vmess_legacy`] 复用的 chunk-stream 包装。
@@ -553,7 +576,9 @@ impl Shaker {
         use sha3::digest::Update as _;
         let mut h = Shake128::default();
         h.update(seed);
-        Self { reader: h.finalize_xof() }
+        Self {
+            reader: h.finalize_xof(),
+        }
     }
 
     fn next_u16(&mut self) -> u16 {
@@ -586,7 +611,9 @@ struct ChunkCryptor {
 impl ChunkCryptor {
     fn new(sec: VmessSecurity, key: &[u8; 16], iv: &[u8; 16], options: u8) -> Self {
         let aead = match sec {
-            VmessSecurity::Aes128Gcm => ChunkAead::Aes128(Aes128Gcm::new_from_slice(key).expect("aes128 key")),
+            VmessSecurity::Aes128Gcm => {
+                ChunkAead::Aes128(Aes128Gcm::new_from_slice(key).expect("aes128 key"))
+            }
             VmessSecurity::Chacha20Poly1305 => {
                 let k1 = {
                     let mut h = Md5::new();
@@ -867,15 +894,16 @@ impl AsyncWrite for VmessStream {
             Ok(v) => v,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        let mut packet =
-            Vec::with_capacity(length_field.len() + sealed.len() + padding_len);
+        let mut packet = Vec::with_capacity(length_field.len() + sealed.len() + padding_len);
         packet.extend_from_slice(&length_field);
         packet.extend_from_slice(&sealed);
         packet.extend_from_slice(&padding);
         let mut written = 0;
         while written < packet.len() {
             match this.inner.as_mut().poll_write(cx, &packet[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -925,7 +953,14 @@ mod tests {
         let iv = [1u8; 16];
         let key = [2u8; 16];
         let p = build_header_payload_full(
-            &iv, &key, 0x42, VMESS_DEFAULT_OPTIONS, VmessSecurity::Aes128Gcm, VMESS_CMD_TCP, 443, "example.com",
+            &iv,
+            &key,
+            0x42,
+            VMESS_DEFAULT_OPTIONS,
+            VmessSecurity::Aes128Gcm,
+            VMESS_CMD_TCP,
+            443,
+            "example.com",
         );
         assert_eq!(p[0], 0x01);
         assert!(p.windows(11).any(|w| w == b"example.com"));
@@ -942,7 +977,10 @@ mod tests {
 
     #[test]
     fn security_parse_works() {
-        assert_eq!(VmessSecurity::parse("AES-128-GCM"), Some(VmessSecurity::Aes128Gcm));
+        assert_eq!(
+            VmessSecurity::parse("AES-128-GCM"),
+            Some(VmessSecurity::Aes128Gcm)
+        );
         assert_eq!(VmessSecurity::parse("auto"), Some(VmessSecurity::Auto));
         assert_eq!(VmessSecurity::parse("none"), Some(VmessSecurity::None));
         assert_eq!(VmessSecurity::parse("rc4"), None);

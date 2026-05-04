@@ -54,7 +54,9 @@ impl AsyncWriter {
     }
 
     pub fn enqueue_batch(&self, ops: Vec<BatchOp>) -> bool {
-        if ops.is_empty() { return true; }
+        if ops.is_empty() {
+            return true;
+        }
         self.tx.try_send(WriteOp::Batch(ops)).is_ok()
     }
 
@@ -112,7 +114,9 @@ async fn run_loop(store: Arc<Store>, mut rx: mpsc::Receiver<WriteOp>, shutdown: 
 }
 
 fn flush(store: &Arc<Store>, buffer: &mut Vec<BatchOp>) {
-    if buffer.is_empty() { return; }
+    if buffer.is_empty() {
+        return;
+    }
     let n = buffer.len();
     let drained: Vec<BatchOp> = buffer.drain(..).collect();
     match store.write_batch(&drained) {
@@ -130,14 +134,19 @@ mod tests {
     #[tokio::test]
     async fn enqueue_and_flush_persists() {
         let path = std::env::temp_dir().join(format!(
-            "rpkernel-aw-{}",
+            "wuthercore-aw-{}",
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let store = Store::open(&path).unwrap();
         let writer = AsyncWriter::spawn(store.clone());
         for i in 0..32 {
-            let blob = NodeStatsBlob { samples: i, ..Default::default() };
+            let blob = NodeStatsBlob {
+                samples: i,
+                ..Default::default()
+            };
             assert!(writer.enqueue(BatchOp::PutNodeStats(format!("N{i}"), blob)));
         }
         writer.shutdown().await;

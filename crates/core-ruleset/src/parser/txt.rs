@@ -32,10 +32,18 @@ pub fn parse_line(line: &str) -> Option<ClassicalEntry> {
 
     // 短写法
     if let Some(rest) = s.strip_prefix("+.") {
-        return Some(ClassicalEntry { kind: ClassicalKind::DomainSuffix, value: rest.into(), policy: None });
+        return Some(ClassicalEntry {
+            kind: ClassicalKind::DomainSuffix,
+            value: rest.into(),
+            policy: None,
+        });
     }
     if s.starts_with('.') && !s.contains(',') {
-        return Some(ClassicalEntry { kind: ClassicalKind::DomainSuffix, value: s.trim_start_matches('.').into(), policy: None });
+        return Some(ClassicalEntry {
+            kind: ClassicalKind::DomainSuffix,
+            value: s.trim_start_matches('.').into(),
+            policy: None,
+        });
     }
 
     // mihomo 标准 `KIND,VALUE[,policy[,no-resolve]]`
@@ -47,7 +55,11 @@ pub fn parse_line(line: &str) -> Option<ClassicalEntry> {
                 .next()
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("no-resolve"));
-            return Some(ClassicalEntry { kind: k, value, policy });
+            return Some(ClassicalEntry {
+                kind: k,
+                value,
+                policy,
+            });
         }
         // 不识别的 kind：丢
         return None;
@@ -55,16 +67,26 @@ pub fn parse_line(line: &str) -> Option<ClassicalEntry> {
 
     // 没逗号：尝试自动判型
     if s.parse::<ipnet::IpNet>().is_ok() {
-        return Some(ClassicalEntry { kind: ClassicalKind::IpCidr, value: s.into(), policy: None });
+        return Some(ClassicalEntry {
+            kind: ClassicalKind::IpCidr,
+            value: s.into(),
+            policy: None,
+        });
     }
     if looks_like_domain(s) {
-        return Some(ClassicalEntry { kind: ClassicalKind::Domain, value: s.into(), policy: None });
+        return Some(ClassicalEntry {
+            kind: ClassicalKind::Domain,
+            value: s.into(),
+            policy: None,
+        });
     }
     None
 }
 
 fn looks_like_domain(s: &str) -> bool {
-    s.contains('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    s.contains('.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 #[cfg(test)]

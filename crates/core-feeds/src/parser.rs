@@ -131,28 +131,16 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     let host = str_g("server")?;
     let port = u64_g("port")? as u16;
 
-    let proto = match kind.as_str() {
-        "ss" => NodeProtocol::Shadowsocks,
-        "ssr" => NodeProtocol::ShadowsocksR,
-        "vmess" => NodeProtocol::Vmess,
-        "vless" => NodeProtocol::Vless,
-        "trojan" => NodeProtocol::Trojan,
-        "hysteria" => NodeProtocol::Hysteria,
-        "hysteria2" | "hy2" => NodeProtocol::Hysteria2,
-        "tuic" => NodeProtocol::Tuic,
-        "wireguard" => NodeProtocol::Wireguard,
-        "ssh" => NodeProtocol::Ssh,
-        "snell" => NodeProtocol::Snell,
-        "http" => NodeProtocol::Http,
-        "socks5" | "socks" => NodeProtocol::Socks5,
-        other => NodeProtocol::Other(other.into()),
-    };
+    let proto = NodeProtocol::from_scheme(&kind);
     let mut node = ParsedNode::new(name, proto.clone(), host, port);
     node.password = str_g("password");
     node.uuid = str_g("uuid");
     node.method = str_g("cipher").or_else(|| str_g("method"));
     node.tls = g("tls").and_then(|v| v.as_bool()).unwrap_or(false)
-        || matches!(proto, NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic);
+        || matches!(
+            proto,
+            NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
+        );
     node.sni = str_g("sni").or_else(|| str_g("servername"));
     if let Some(net) = str_g("network") {
         node.transport = net;
@@ -162,12 +150,12 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     }
 
     /* ============================================================
-       关键：把全部顶层标量字段 + 嵌套 transport-opts 平铺到 node.params。
-       下游 registry::build_outbound 通过 params.get() 读 skip-cert-verify /
-       alpn / ws-path / grpc-service-name / reality public-key 等。
-       否则 Clash YAML 订阅的"假 SNI + skip-cert-verify"无法生效，
-       证书校验会用真实服务端 cert 失败（用户实际遭遇）。
-       ============================================================ */
+    关键：把全部顶层标量字段 + 嵌套 transport-opts 平铺到 node.params。
+    下游 registry::build_outbound 通过 params.get() 读 skip-cert-verify /
+    alpn / ws-path / grpc-service-name / reality public-key 等。
+    否则 Clash YAML 订阅的"假 SNI + skip-cert-verify"无法生效，
+    证书校验会用真实服务端 cert 失败（用户实际遭遇）。
+    ============================================================ */
 
     // 1. 全部顶层标量
     for (k, v) in m.iter() {
@@ -175,8 +163,19 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
         if matches!(
             key,
             // 已经映射到 ParsedNode 字段的，避免重复
-            "name" | "type" | "server" | "port" | "password" | "uuid" | "cipher" | "method"
-            | "tls" | "sni" | "servername" | "network" | "udp"
+            "name"
+                | "type"
+                | "server"
+                | "port"
+                | "password"
+                | "uuid"
+                | "cipher"
+                | "method"
+                | "tls"
+                | "sni"
+                | "servername"
+                | "network"
+                | "udp"
         ) {
             continue;
         }
@@ -216,16 +215,37 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     flatten_transport_opts(m, "ws-opts", &["path", "headers"], &mut node.params, "ws-");
     flatten_transport_opts(m, "grpc-opts", &["grpc-service-name"], &mut node.params, "");
     flatten_transport_opts(m, "h2-opts", &["host", "path"], &mut node.params, "h2-");
-    flatten_transport_opts(m, "reality-opts", &["public-key", "short-id"], &mut node.params, "reality-");
-    flatten_transport_opts(m, "ech-opts", &["enable", "config"], &mut node.params, "ech-");
+    flatten_transport_opts(
+        m,
+        "reality-opts",
+        &["public-key", "short-id"],
+        &mut node.params,
+        "reality-",
+    );
+    flatten_transport_opts(
+        m,
+        "ech-opts",
+        &["enable", "config"],
+        &mut node.params,
+        "ech-",
+    );
 
     // 5. ws-opts 嵌套 path / headers（headers 是 map）
     if let Some(ws_opts) = g("ws-opts").and_then(|v| v.as_mapping().cloned()) {
-        if let Some(path) = ws_opts.get(&serde_yaml::Value::String("path".into())).and_then(|v| v.as_str()) {
+        if let Some(path) = ws_opts
+            .get(&serde_yaml::Value::String("path".into()))
+            .and_then(|v| v.as_str())
+        {
             node.params.insert("path".into(), path.to_string());
         }
-        if let Some(headers) = ws_opts.get(&serde_yaml::Value::String("headers".into())).and_then(|v| v.as_mapping().cloned()) {
-            if let Some(host) = headers.get(&serde_yaml::Value::String("Host".into())).or_else(|| headers.get(&serde_yaml::Value::String("host".into()))) {
+        if let Some(headers) = ws_opts
+            .get(&serde_yaml::Value::String("headers".into()))
+            .and_then(|v| v.as_mapping().cloned())
+        {
+            if let Some(host) = headers
+                .get(&serde_yaml::Value::String("Host".into()))
+                .or_else(|| headers.get(&serde_yaml::Value::String("host".into())))
+            {
                 if let Some(s) = host.as_str() {
                     node.params.insert("host".into(), s.to_string());
                 }
@@ -233,7 +253,10 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
         }
     }
     if let Some(grpc) = g("grpc-opts").and_then(|v| v.as_mapping().cloned()) {
-        if let Some(svc) = grpc.get(&serde_yaml::Value::String("grpc-service-name".into())).and_then(|v| v.as_str()) {
+        if let Some(svc) = grpc
+            .get(&serde_yaml::Value::String("grpc-service-name".into()))
+            .and_then(|v| v.as_str())
+        {
             node.params.insert("serviceName".into(), svc.to_string());
         }
     }
@@ -409,7 +432,8 @@ proxies:
             (b"trojan://pwd@a:443#HK-1x\n\
               trojan://pwd@b:443#JP-2x\n\
               trojan://pwd@c:443#US-3x\n\
-              trojan://pwd@d:443#Expire-2026").as_ref(),
+              trojan://pwd@d:443#Expire-2026")
+                .as_ref(),
             FormatHint::PlainUri,
         );
         assert_eq!(nodes.len(), 4);

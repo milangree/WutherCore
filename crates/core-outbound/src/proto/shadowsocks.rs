@@ -13,6 +13,7 @@
 //! * `aes-256-gcm`             —— 32B key, 32B salt, 12B nonce
 //! * `chacha20-ietf-poly1305`  —— 32B key, 32B salt, 12B nonce
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -25,14 +26,18 @@ use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
-#[allow(unused_imports)]
-use sha2 as _;
 use rand::RngCore;
 use sha1::Sha1;
+#[allow(unused_imports)]
+use sha2 as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::UdpSocket;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::addr::encode_socks_addr;
+use crate::adapter::{
+    prepare_outbound_udp_socket, resolve_host, BoxedStream, BoxedUdp, Capabilities, DialContext,
+    OutboundAdapter, UdpSocketLike,
+};
+use crate::proto::addr::{decode_socks_addr, encode_socks_addr};
 use crate::transport::{tcp::TcpTransport, Transport};
 
 const PAYLOAD_MAX: usize = 0x3fff;
@@ -52,8 +57,12 @@ impl SsCipher {
             Self::Chacha20Poly1305 => 32,
         }
     }
-    pub fn tag_len(&self) -> usize { 16 }
-    pub fn salt_len(&self) -> usize { self.key_len() }
+    pub fn tag_len(&self) -> usize {
+        16
+    }
+    pub fn salt_len(&self) -> usize {
+        self.key_len()
+    }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
@@ -97,10 +106,19 @@ impl ShadowsocksOutbound {
 
 #[async_trait]
 impl OutboundAdapter for ShadowsocksOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "shadowsocks" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "shadowsocks"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: self.udp,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -120,6 +138,14 @@ impl OutboundAdapter for ShadowsocksOutbound {
         let target = encode_socks_addr(&ctx.host, ctx.port);
         let head_packet = encrypt_chunk(&mut writer, &target)?;
         stream.write_all(&head_packet).await?;
+        tracing::info!(
+            target: "dial::shadowsocks",
+            id = ctx.dial_id,
+            proxy = %self.name,
+            server = %format!("{}:{}", self.host, self.port),
+            target = %format!("{}:{}", ctx.host, ctx.port),
+            "tcp request header sent",
+        );
 
         // 3) 包装成 SS 流（reader 在第一次读取时才拿到对端 salt）
         Ok(Box::pin(SsStream {
@@ -131,6 +157,84 @@ impl OutboundAdapter for ShadowsocksOutbound {
             cipher_buf: BytesMut::with_capacity(16 * 1024),
             plain_buf: BytesMut::with_capacity(16 * 1024),
         }))
+    }
+
+    async fn dial_udp(&self, ctx: DialContext) -> std::io::Result<BoxedUdp> {
+        if !self.udp {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "outbound `{}`/shadowsocks udp disabled by config",
+                    self.name
+                ),
+            ));
+        }
+        let server = resolve_first(&self.host, self.port).await?;
+        let (std_sock, loopback_guard) = crate::create_outbound_udp_socket(server)?;
+        let sock = UdpSocket::from_std(std_sock)?;
+        tracing::info!(
+            target: "dial::shadowsocks",
+            id = ctx.dial_id,
+            proxy = %self.name,
+            server = %server,
+            "udp associate ok",
+        );
+        Ok(Box::new(ShadowsocksUdp {
+            sock: Arc::new(sock),
+            cipher: self.cipher,
+            key: self.key.clone(),
+            loopback_guard,
+        }))
+    }
+}
+
+struct ShadowsocksUdp {
+    sock: Arc<UdpSocket>,
+    cipher: SsCipher,
+    key: Arc<[u8]>,
+    loopback_guard: crate::loopback::LoopbackUdpGuard,
+}
+
+#[async_trait]
+impl UdpSocketLike for ShadowsocksUdp {
+    async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize> {
+        let salt_len = self.cipher.salt_len();
+        let mut salt = vec![0u8; salt_len];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let subkey = hkdf_subkey(&self.key, &salt, salt_len);
+        let cryptor = SsCryptor::new(self.cipher, &subkey);
+        let addr = encode_socks_addr(target, port);
+        let mut plaintext = Vec::with_capacity(addr.len() + buf.len());
+        plaintext.extend_from_slice(&addr);
+        plaintext.extend_from_slice(buf);
+        let ct = cryptor.aead.encrypt(&[0u8; 12], &plaintext)?;
+        let mut packet = Vec::with_capacity(salt.len() + ct.len());
+        packet.extend_from_slice(&salt);
+        packet.extend_from_slice(&ct);
+        self.sock.send(&packet).await?;
+        Ok(buf.len())
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut packet = vec![0u8; buf.len().saturating_add(512).max(1500)];
+        let n = self.sock.recv(&mut packet).await?;
+        let salt_len = self.cipher.salt_len();
+        if n <= salt_len + self.cipher.tag_len() {
+            return Err(io_err("ss udp packet too short"));
+        }
+        let subkey = hkdf_subkey(&self.key, &packet[..salt_len], salt_len);
+        let cryptor = SsCryptor::new(self.cipher, &subkey);
+        let plaintext = cryptor.aead.decrypt(&[0u8; 12], &packet[salt_len..n])?;
+        let (_, _, used) = decode_socks_addr(&plaintext)?;
+        let payload = &plaintext[used..];
+        let copy_len = payload.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+        Ok(copy_len)
+    }
+
+    async fn close(&self) -> std::io::Result<()> {
+        let _ = &self.loopback_guard;
+        Ok(())
     }
 }
 
@@ -179,7 +283,10 @@ struct SsCryptor {
 
 impl SsCryptor {
     fn new(cipher: SsCipher, key: &[u8]) -> Self {
-        Self { aead: Aead12::new(cipher, key), nonce: [0u8; 12] }
+        Self {
+            aead: Aead12::new(cipher, key),
+            nonce: [0u8; 12],
+        }
     }
     fn next_nonce(&mut self) -> [u8; 12] {
         let n = self.nonce;
@@ -187,7 +294,9 @@ impl SsCryptor {
         for b in self.nonce.iter_mut() {
             let (v, c) = b.overflowing_add(1);
             *b = v;
-            if !c { break; }
+            if !c {
+                break;
+            }
         }
         n
     }
@@ -208,7 +317,10 @@ fn encrypt_chunk(c: &mut SsCryptor, data: &[u8]) -> std::io::Result<Vec<u8>> {
 
 enum RecvState {
     WaitSalt,
-    Ready { recv: SsCryptor, expecting_len: Option<usize> },
+    Ready {
+        recv: SsCryptor,
+        expecting_len: Option<usize>,
+    },
 }
 
 pin_project! {
@@ -270,7 +382,10 @@ impl AsyncRead for SsStream {
     }
 }
 
-enum StepResult { Produced, NeedMore }
+enum StepResult {
+    Produced,
+    NeedMore,
+}
 
 fn try_decrypt_step(
     state: &mut RecvState,
@@ -293,7 +408,10 @@ fn try_decrypt_step(
             };
             Ok(StepResult::Produced) // 让 outer loop 再走一次
         }
-        RecvState::Ready { recv, expecting_len } => {
+        RecvState::Ready {
+            recv,
+            expecting_len,
+        } => {
             let tag = cipher.tag_len();
             // 阶段 A：未知 length
             if expecting_len.is_none() {
@@ -334,7 +452,9 @@ impl AsyncWrite for SsStream {
         let mut written = 0;
         while written < packet.len() {
             match this.inner.as_mut().poll_write(cx, &packet[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -352,6 +472,14 @@ impl AsyncWrite for SsStream {
 
 fn io_err(s: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, s)
+}
+
+async fn resolve_first(host: &str, port: u16) -> std::io::Result<SocketAddr> {
+    resolve_host(host, port)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| io_err("no addr resolved"))
 }
 
 /* ---------------- 密钥派生 ---------------- */
@@ -394,7 +522,10 @@ mod tests {
     #[test]
     fn cipher_parse_works() {
         assert_eq!(SsCipher::parse("AES-256-GCM"), Some(SsCipher::Aes256Gcm));
-        assert_eq!(SsCipher::parse("chacha20-ietf-poly1305"), Some(SsCipher::Chacha20Poly1305));
+        assert_eq!(
+            SsCipher::parse("chacha20-ietf-poly1305"),
+            Some(SsCipher::Chacha20Poly1305)
+        );
         assert_eq!(SsCipher::parse("rc4"), None);
     }
 
@@ -415,5 +546,48 @@ mod tests {
         let n2 = recv.next_nonce();
         let dec = recv.aead.decrypt(&n2, &pkt[2 + 16..]).unwrap();
         assert_eq!(dec, b"hello world");
+    }
+
+    #[test]
+    fn udp_capability_is_declared_when_enabled() {
+        let ob = ShadowsocksOutbound::new("ss", "127.0.0.1", 8388, SsCipher::Aes128Gcm, "password");
+        assert!(ob.capabilities().udp);
+    }
+
+    #[tokio::test]
+    async fn udp_send_encrypts_socks_address_and_payload() {
+        use crate::adapter::OutboundAdapter;
+        use tokio::net::UdpSocket;
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let ob = ShadowsocksOutbound::new(
+            "ss",
+            server_addr.ip().to_string(),
+            server_addr.port(),
+            SsCipher::Aes128Gcm,
+            "password",
+        );
+        let udp = ob
+            .dial_udp(DialContext::udp("example.com", 53))
+            .await
+            .unwrap();
+        udp.send_to(b"ping", "example.com", 53).await.unwrap();
+
+        let mut packet = [0u8; 1500];
+        let (n, _) = server.recv_from(&mut packet).await.unwrap();
+        let salt_len = ob.cipher.salt_len();
+        assert!(n > salt_len + ob.cipher.tag_len());
+        let subkey = hkdf_subkey(&ob.key, &packet[..salt_len], salt_len);
+        let cryptor = SsCryptor::new(ob.cipher, &subkey);
+        let plaintext = cryptor
+            .aead
+            .decrypt(&[0u8; 12], &packet[salt_len..n])
+            .unwrap();
+        assert_eq!(plaintext[0], 0x03);
+        assert_eq!(plaintext[1] as usize, "example.com".len());
+        assert_eq!(&plaintext[2..13], b"example.com");
+        assert_eq!(&plaintext[13..15], &53u16.to_be_bytes());
+        assert_eq!(&plaintext[15..], b"ping");
     }
 }

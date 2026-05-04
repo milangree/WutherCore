@@ -21,13 +21,41 @@ pub enum StoreError {
     Serde(String),
 }
 
-impl From<redb::Error> for StoreError { fn from(e: redb::Error) -> Self { Self::Db(e.to_string()) } }
-impl From<redb::DatabaseError> for StoreError { fn from(e: redb::DatabaseError) -> Self { Self::Db(e.to_string()) } }
-impl From<redb::TransactionError> for StoreError { fn from(e: redb::TransactionError) -> Self { Self::Db(e.to_string()) } }
-impl From<redb::TableError> for StoreError { fn from(e: redb::TableError) -> Self { Self::Db(e.to_string()) } }
-impl From<redb::CommitError> for StoreError { fn from(e: redb::CommitError) -> Self { Self::Db(e.to_string()) } }
-impl From<redb::StorageError> for StoreError { fn from(e: redb::StorageError) -> Self { Self::Db(e.to_string()) } }
-impl From<serde_json::Error> for StoreError { fn from(e: serde_json::Error) -> Self { Self::Serde(e.to_string()) } }
+impl From<redb::Error> for StoreError {
+    fn from(e: redb::Error) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+impl From<redb::DatabaseError> for StoreError {
+    fn from(e: redb::DatabaseError) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+impl From<redb::TransactionError> for StoreError {
+    fn from(e: redb::TransactionError) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+impl From<redb::TableError> for StoreError {
+    fn from(e: redb::TableError) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+impl From<redb::CommitError> for StoreError {
+    fn from(e: redb::CommitError) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+impl From<redb::StorageError> for StoreError {
+    fn from(e: redb::StorageError) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+impl From<serde_json::Error> for StoreError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Serde(e.to_string())
+    }
+}
 
 #[derive(Debug)]
 pub struct Store {
@@ -68,7 +96,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// 通用单值读。
     pub fn get_json<T: DeserializeOwned>(
@@ -122,38 +152,66 @@ impl Store {
 
     /// 批量 put：把多个写合并到单个事务，**性能关键路径**。
     pub fn write_batch(&self, ops: &[BatchOp]) -> Result<(), StoreError> {
-        if ops.is_empty() { return Ok(()); }
+        if ops.is_empty() {
+            return Ok(());
+        }
         let txn = self.db.begin_write()?;
         {
             // 预先把每张表 open 一次，减少反复打开开销。
-            let mut t_stats   = txn.open_table(SMART_NODE_STATS)?;
-            let mut t_domain  = txn.open_table(SMART_DOMAIN_BEST)?;
-            let mut t_neg     = txn.open_table(SMART_NEGATIVE)?;
-            let mut t_pin     = txn.open_table(SMART_PIN)?;
-            let mut t_manual  = txn.open_table(GROUP_MANUAL)?;
-            let mut t_feed    = txn.open_table(FEED_META)?;
-            let mut t_dns     = txn.open_table(DNS_CACHE)?;
+            let mut t_stats = txn.open_table(SMART_NODE_STATS)?;
+            let mut t_domain = txn.open_table(SMART_DOMAIN_BEST)?;
+            let mut t_neg = txn.open_table(SMART_NEGATIVE)?;
+            let mut t_pin = txn.open_table(SMART_PIN)?;
+            let mut t_manual = txn.open_table(GROUP_MANUAL)?;
+            let mut t_feed = txn.open_table(FEED_META)?;
+            let mut t_dns = txn.open_table(DNS_CACHE)?;
             for op in ops {
                 match op {
-                    BatchOp::PutNodeStats(k, v)   => { t_stats.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?; }
-                    BatchOp::PutDomainBest(k, v)  => { t_domain.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?; }
-                    BatchOp::PutNegative(k, v)    => { t_neg.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?; }
-                    BatchOp::PutPin(k, v)         => { t_pin.insert(k.as_str(), v.as_bytes())?; }
-                    BatchOp::PutGroupManual(k, v) => { t_manual.insert(k.as_str(), v.as_bytes())?; }
-                    BatchOp::PutFeedMeta(k, v)    => { t_feed.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?; }
-                    BatchOp::PutDnsCache(k, v)    => { t_dns.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?; }
-                    BatchOp::Delete(table, key)   => {
-                        match *table {
-                            "smart_node_stats"  => { t_stats.remove(key.as_str())?; }
-                            "smart_domain_best" => { t_domain.remove(key.as_str())?; }
-                            "smart_negative"    => { t_neg.remove(key.as_str())?; }
-                            "smart_pin"         => { t_pin.remove(key.as_str())?; }
-                            "group_manual"      => { t_manual.remove(key.as_str())?; }
-                            "feed_meta"         => { t_feed.remove(key.as_str())?; }
-                            "dns_cache"         => { t_dns.remove(key.as_str())?; }
-                            _ => {}
-                        }
+                    BatchOp::PutNodeStats(k, v) => {
+                        t_stats.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?;
                     }
+                    BatchOp::PutDomainBest(k, v) => {
+                        t_domain.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?;
+                    }
+                    BatchOp::PutNegative(k, v) => {
+                        t_neg.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?;
+                    }
+                    BatchOp::PutPin(k, v) => {
+                        t_pin.insert(k.as_str(), v.as_bytes())?;
+                    }
+                    BatchOp::PutGroupManual(k, v) => {
+                        t_manual.insert(k.as_str(), v.as_bytes())?;
+                    }
+                    BatchOp::PutFeedMeta(k, v) => {
+                        t_feed.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?;
+                    }
+                    BatchOp::PutDnsCache(k, v) => {
+                        t_dns.insert(k.as_str(), serde_json::to_vec(v)?.as_slice())?;
+                    }
+                    BatchOp::Delete(table, key) => match *table {
+                        "smart_node_stats" => {
+                            t_stats.remove(key.as_str())?;
+                        }
+                        "smart_domain_best" => {
+                            t_domain.remove(key.as_str())?;
+                        }
+                        "smart_negative" => {
+                            t_neg.remove(key.as_str())?;
+                        }
+                        "smart_pin" => {
+                            t_pin.remove(key.as_str())?;
+                        }
+                        "group_manual" => {
+                            t_manual.remove(key.as_str())?;
+                        }
+                        "feed_meta" => {
+                            t_feed.remove(key.as_str())?;
+                        }
+                        "dns_cache" => {
+                            t_dns.remove(key.as_str())?;
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -195,20 +253,23 @@ impl Store {
         let mut out = Vec::new();
         for entry in t.iter()? {
             let (k, v) = entry?;
-            out.push((k.value().to_string(), String::from_utf8_lossy(v.value()).into_owned()));
+            out.push((
+                k.value().to_string(),
+                String::from_utf8_lossy(v.value()).into_owned(),
+            ));
         }
         Ok(out)
     }
 
     pub fn approximate_stats(&self) -> Result<StoreStats, StoreError> {
         let mut s = StoreStats::default();
-        s.smart_node_stats  = self.iter_json::<NodeStatsBlob>(SMART_NODE_STATS)?.len();
+        s.smart_node_stats = self.iter_json::<NodeStatsBlob>(SMART_NODE_STATS)?.len();
         s.smart_domain_best = self.iter_json::<DomainBestBlob>(SMART_DOMAIN_BEST)?.len();
-        s.smart_negative    = self.iter_json::<NegativeBlob>(SMART_NEGATIVE)?.len();
-        s.smart_pin         = self.iter_string(SMART_PIN)?.len();
-        s.group_manual      = self.iter_string(GROUP_MANUAL)?.len();
-        s.feed_meta         = self.iter_json::<FeedMetaBlob>(FEED_META)?.len();
-        s.dns_cache         = self.iter_json::<DnsCacheBlob>(DNS_CACHE)?.len();
+        s.smart_negative = self.iter_json::<NegativeBlob>(SMART_NEGATIVE)?.len();
+        s.smart_pin = self.iter_string(SMART_PIN)?.len();
+        s.group_manual = self.iter_string(GROUP_MANUAL)?.len();
+        s.feed_meta = self.iter_json::<FeedMetaBlob>(FEED_META)?.len();
+        s.dns_cache = self.iter_json::<DnsCacheBlob>(DNS_CACHE)?.len();
         s.path = self.path.display().to_string();
         s.size_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         Ok(s)
@@ -218,13 +279,13 @@ impl Store {
     pub fn reset(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_write()?;
         {
-            let mut t_stats  = txn.open_table(SMART_NODE_STATS)?;
+            let mut t_stats = txn.open_table(SMART_NODE_STATS)?;
             let mut t_domain = txn.open_table(SMART_DOMAIN_BEST)?;
-            let mut t_neg    = txn.open_table(SMART_NEGATIVE)?;
-            let mut t_pin    = txn.open_table(SMART_PIN)?;
+            let mut t_neg = txn.open_table(SMART_NEGATIVE)?;
+            let mut t_pin = txn.open_table(SMART_PIN)?;
             let mut t_manual = txn.open_table(GROUP_MANUAL)?;
-            let mut t_feed   = txn.open_table(FEED_META)?;
-            let mut t_dns    = txn.open_table(DNS_CACHE)?;
+            let mut t_feed = txn.open_table(FEED_META)?;
+            let mut t_dns = txn.open_table(DNS_CACHE)?;
 
             // 收集所有 key，然后逐个删除（redb 没有 truncate）。
             let collect = |t: &redb::Table<'_, &str, &[u8]>| -> Result<Vec<String>, StoreError> {
@@ -235,13 +296,27 @@ impl Store {
                 }
                 Ok(keys)
             };
-            for k in collect(&t_stats)?  { t_stats.remove(k.as_str())?; }
-            for k in collect(&t_domain)? { t_domain.remove(k.as_str())?; }
-            for k in collect(&t_neg)?    { t_neg.remove(k.as_str())?; }
-            for k in collect(&t_pin)?    { t_pin.remove(k.as_str())?; }
-            for k in collect(&t_manual)? { t_manual.remove(k.as_str())?; }
-            for k in collect(&t_feed)?   { t_feed.remove(k.as_str())?; }
-            for k in collect(&t_dns)?    { t_dns.remove(k.as_str())?; }
+            for k in collect(&t_stats)? {
+                t_stats.remove(k.as_str())?;
+            }
+            for k in collect(&t_domain)? {
+                t_domain.remove(k.as_str())?;
+            }
+            for k in collect(&t_neg)? {
+                t_neg.remove(k.as_str())?;
+            }
+            for k in collect(&t_pin)? {
+                t_pin.remove(k.as_str())?;
+            }
+            for k in collect(&t_manual)? {
+                t_manual.remove(k.as_str())?;
+            }
+            for k in collect(&t_feed)? {
+                t_feed.remove(k.as_str())?;
+            }
+            for k in collect(&t_dns)? {
+                t_dns.remove(k.as_str())?;
+            }
         }
         txn.commit()?;
         Ok(())
@@ -279,9 +354,11 @@ mod tests {
 
     fn tmp_path(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "rpkernel-store-{label}-{}",
+            "wuthercore-store-{label}-{}",
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_file(&p);
         p
@@ -312,9 +389,27 @@ mod tests {
         let p = tmp_path("batch");
         let s = Store::open(&p).unwrap();
         let ops = vec![
-            BatchOp::PutNodeStats("A".into(), NodeStatsBlob { samples: 1, ..Default::default() }),
-            BatchOp::PutNodeStats("B".into(), NodeStatsBlob { samples: 2, ..Default::default() }),
-            BatchOp::PutDomainBest("main|youtube.com".into(), DomainBestBlob { node: "A".into(), set_at_secs: 100 }),
+            BatchOp::PutNodeStats(
+                "A".into(),
+                NodeStatsBlob {
+                    samples: 1,
+                    ..Default::default()
+                },
+            ),
+            BatchOp::PutNodeStats(
+                "B".into(),
+                NodeStatsBlob {
+                    samples: 2,
+                    ..Default::default()
+                },
+            ),
+            BatchOp::PutDomainBest(
+                "main|youtube.com".into(),
+                DomainBestBlob {
+                    node: "A".into(),
+                    set_at_secs: 100,
+                },
+            ),
             BatchOp::PutPin("main|netflix.com".into(), "B".into()),
             BatchOp::PutGroupManual("main".into(), "A".into()),
         ];
@@ -330,7 +425,8 @@ mod tests {
     fn reset_clears() {
         let p = tmp_path("reset");
         let s = Store::open(&p).unwrap();
-        s.write_batch(&[BatchOp::PutNodeStats("A".into(), NodeStatsBlob::default())]).unwrap();
+        s.write_batch(&[BatchOp::PutNodeStats("A".into(), NodeStatsBlob::default())])
+            .unwrap();
         assert_eq!(s.approximate_stats().unwrap().smart_node_stats, 1);
         s.reset().unwrap();
         assert_eq!(s.approximate_stats().unwrap().smart_node_stats, 0);

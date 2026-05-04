@@ -11,15 +11,15 @@ use core_config::model::{SmartGoal, SmartSticky};
 use core_store::{
     blobs::{DomainBestBlob, NegativeBlob},
     schema::{SMART_DOMAIN_BEST, SMART_NEGATIVE, SMART_NODE_STATS, SMART_PIN},
-    AsyncWriter, Store,
     store::BatchOp,
+    AsyncWriter, Store,
 };
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use crate::cache::{DomainBest, NegativeCache};
 use crate::explain::{ChoiceExplain, NodeScore};
-use crate::metrics::{NodeStats, NodeStatSnapshot};
+use crate::metrics::{NodeStatSnapshot, NodeStats};
 
 #[derive(Debug, Clone)]
 pub struct SmartContext {
@@ -173,7 +173,10 @@ impl SmartSelector {
             // 把所有节点统计完整快照入队（保证停机时拥有最新状态）。
             let mut ops: Vec<BatchOp> = Vec::with_capacity(self.nodes.len());
             for entry in self.nodes.iter() {
-                ops.push(BatchOp::PutNodeStats(entry.key().clone(), entry.value().to_blob()));
+                ops.push(BatchOp::PutNodeStats(
+                    entry.key().clone(),
+                    entry.value().to_blob(),
+                ));
             }
             if !ops.is_empty() {
                 let _ = w.enqueue_batch(ops);
@@ -211,7 +214,13 @@ impl SmartSelector {
             let until_secs = unix_now() + 30;
             let _ = w.enqueue_batch(vec![
                 BatchOp::PutNodeStats(node.to_string(), stats.to_blob()),
-                BatchOp::PutNegative(node.to_string(), NegativeBlob { until_secs, reason: r }),
+                BatchOp::PutNegative(
+                    node.to_string(),
+                    NegativeBlob {
+                        until_secs,
+                        reason: r,
+                    },
+                ),
             ]);
         }
     }
@@ -235,7 +244,13 @@ impl SmartSelector {
             let until_secs = unix_now() + 30;
             let _ = w.enqueue_batch(vec![
                 BatchOp::PutNodeStats(node.to_string(), stats.to_blob()),
-                BatchOp::PutNegative(node.to_string(), NegativeBlob { until_secs, reason: r }),
+                BatchOp::PutNegative(
+                    node.to_string(),
+                    NegativeBlob {
+                        until_secs,
+                        reason: r,
+                    },
+                ),
             ]);
         }
     }
@@ -248,7 +263,10 @@ impl SmartSelector {
             let _ = w.enqueue_batch(vec![
                 BatchOp::PutDomainBest(
                     key,
-                    DomainBestBlob { node: node.to_string(), set_at_secs: unix_now() },
+                    DomainBestBlob {
+                        node: node.to_string(),
+                        set_at_secs: unix_now(),
+                    },
                 ),
                 BatchOp::PutPin(format!("{group}|{}", etld), node.to_string()),
             ]);
@@ -274,7 +292,11 @@ impl SmartSelector {
             .iter()
             .map(|name| self.score_node(name, ctx, &weights, cache_hit.as_deref()))
             .collect();
-        scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let picked = scores
             .first()
@@ -286,7 +308,10 @@ impl SmartSelector {
             if let Some(w) = &self.writer {
                 let _ = w.enqueue(BatchOp::PutDomainBest(
                     key.clone(),
-                    DomainBestBlob { node: picked.clone(), set_at_secs: unix_now() },
+                    DomainBestBlob {
+                        node: picked.clone(),
+                        set_at_secs: unix_now(),
+                    },
                 ));
             }
         }
@@ -307,7 +332,10 @@ impl SmartSelector {
             g.push(explain.clone());
         }
 
-        SmartChoice { node: picked, explain }
+        SmartChoice {
+            node: picked,
+            explain,
+        }
     }
 
     pub fn recent_explains(&self) -> Vec<ChoiceExplain> {
@@ -324,8 +352,11 @@ impl SmartSelector {
         let stats = self.ensure_node(name).snapshot();
         let latency_score = clamp((100.0 - stats.p50_latency_ms / 6.0).max(0.0), 0.0, 100.0);
         let success_score = stats.success_rate * 100.0;
-        let stability_score =
-            clamp(100.0 - (stats.jitter_ms / 3.0 + stats.timeout_rate * 100.0), 0.0, 100.0);
+        let stability_score = clamp(
+            100.0 - (stats.jitter_ms / 3.0 + stats.timeout_rate * 100.0),
+            0.0,
+            100.0,
+        );
         let site_memory_score = if cache_hit == Some(name) { 100.0 } else { 50.0 };
         let load_score = clamp(100.0 - (stats.active_conn as f64).min(80.0), 0.0, 100.0);
         let preference_score = if ctx.prefer.iter().any(|p| name.contains(p)) {
@@ -393,7 +424,12 @@ fn etld_plus_one(host: &str) -> String {
     }
 }
 
-fn build_reason(name: &str, s: &NodeStatSnapshot, cache_hit: Option<&str>, prefer: &[String]) -> String {
+fn build_reason(
+    name: &str,
+    s: &NodeStatSnapshot,
+    cache_hit: Option<&str>,
+    prefer: &[String],
+) -> String {
     let mut parts = Vec::new();
     if cache_hit == Some(name) {
         parts.push("命中 domain_best 缓存".to_string());
@@ -436,8 +472,11 @@ mod tests {
     #[tokio::test]
     async fn stats_persist_across_restart() {
         let path = std::env::temp_dir().join(format!(
-            "rpkernel-smart-store-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            "wuthercore-smart-store-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         {
             let store = core_store::Store::open(&path).unwrap();
@@ -453,7 +492,11 @@ mod tests {
         let sel2 = SmartSelector::with_store(SmartGoal::Balanced, SmartSticky::Site, store2);
         let hk_snap = sel2.ensure_node("HK-1").snapshot();
         let us_snap = sel2.ensure_node("US-1").snapshot();
-        assert!(hk_snap.samples >= 2, "samples should persist, got {}", hk_snap.samples);
+        assert!(
+            hk_snap.samples >= 2,
+            "samples should persist, got {}",
+            hk_snap.samples
+        );
         assert!(hk_snap.success_rate > 0.5);
         assert!(us_snap.last_error.is_some());
     }

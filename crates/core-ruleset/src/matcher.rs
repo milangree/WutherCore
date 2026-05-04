@@ -137,33 +137,59 @@ impl RulesetMatcher {
 
     /// 从纯 domain 列表（mihomo behavior=domain）编译：
     /// 项以 `+.` 开头视为后缀，否则视为精确。
-    pub fn compile_domains(name: impl Into<String>, lines: impl IntoIterator<Item = String>) -> Self {
+    pub fn compile_domains(
+        name: impl Into<String>,
+        lines: impl IntoIterator<Item = String>,
+    ) -> Self {
         let entries = lines
             .into_iter()
             .filter_map(|l| {
                 let l = l.trim();
-                if l.is_empty() { return None; }
+                if l.is_empty() {
+                    return None;
+                }
                 if let Some(rest) = l.strip_prefix("+.") {
-                    Some(ClassicalEntry { kind: ClassicalKind::DomainSuffix, value: rest.into(), policy: None })
+                    Some(ClassicalEntry {
+                        kind: ClassicalKind::DomainSuffix,
+                        value: rest.into(),
+                        policy: None,
+                    })
                 } else if l.starts_with('.') {
-                    Some(ClassicalEntry { kind: ClassicalKind::DomainSuffix, value: l[1..].into(), policy: None })
+                    Some(ClassicalEntry {
+                        kind: ClassicalKind::DomainSuffix,
+                        value: l[1..].into(),
+                        policy: None,
+                    })
                 } else if l.starts_with('*') {
                     None // 简化：忽略复杂通配
                 } else {
-                    Some(ClassicalEntry { kind: ClassicalKind::Domain, value: l.into(), policy: None })
+                    Some(ClassicalEntry {
+                        kind: ClassicalKind::Domain,
+                        value: l.into(),
+                        policy: None,
+                    })
                 }
             })
             .collect();
         Self::compile(name, entries)
     }
 
-    pub fn compile_ipcidr(name: impl Into<String>, lines: impl IntoIterator<Item = String>) -> Self {
+    pub fn compile_ipcidr(
+        name: impl Into<String>,
+        lines: impl IntoIterator<Item = String>,
+    ) -> Self {
         let entries = lines
             .into_iter()
             .filter_map(|l| {
                 let l = l.trim();
-                if l.is_empty() { return None; }
-                Some(ClassicalEntry { kind: ClassicalKind::IpCidr, value: l.into(), policy: None })
+                if l.is_empty() {
+                    return None;
+                }
+                Some(ClassicalEntry {
+                    kind: ClassicalKind::IpCidr,
+                    value: l.into(),
+                    policy: None,
+                })
             })
             .collect();
         Self::compile(name, entries)
@@ -171,10 +197,7 @@ impl RulesetMatcher {
 
     /// 把 [`crate::parser::RulesetCompiled`] 编译成 matcher。
     /// `Classical` 走老 [`Self::compile`] 路径；`Mrs` 把预编译产物挂到内部字段。
-    pub fn compile_any(
-        name: impl Into<String>,
-        compiled: crate::parser::RulesetCompiled,
-    ) -> Self {
+    pub fn compile_any(name: impl Into<String>, compiled: crate::parser::RulesetCompiled) -> Self {
         match compiled {
             crate::parser::RulesetCompiled::Classical(entries) => Self::compile(name, entries),
             crate::parser::RulesetCompiled::Mrs(payload) => Self::compile_mrs(name, payload),
@@ -201,21 +224,37 @@ impl RulesetMatcher {
     }
 
     /// 主入口：判断 host/ip/port 是否命中。
-    pub fn matches(&self, host: &str, ip: Option<IpAddr>, port: Option<u16>, process: Option<&str>) -> bool {
+    pub fn matches(
+        &self,
+        host: &str,
+        ip: Option<IpAddr>,
+        port: Option<u16>,
+        process: Option<&str>,
+    ) -> bool {
         // 域名相关
         let host_lc = normalize_domain(host);
         if !host_lc.is_empty() {
-            if self.domains.contains(&host_lc) { return true; }
-            if self.suffix_trie.matches(&host_lc) { return true; }
+            if self.domains.contains(&host_lc) {
+                return true;
+            }
+            if self.suffix_trie.matches(&host_lc) {
+                return true;
+            }
             for k in &self.keywords {
-                if host_lc.contains(k) { return true; }
+                if host_lc.contains(k) {
+                    return true;
+                }
             }
             if let Some(rs) = &self.regex_set {
-                if rs.is_match(&host_lc) { return true; }
+                if rs.is_match(&host_lc) {
+                    return true;
+                }
             }
             // mihomo MRS domain succinct trie（含 wildcard 语义）
             if let Some(set) = &self.mrs_domain_set {
-                if set.has(&host_lc) { return true; }
+                if set.has(&host_lc) {
+                    return true;
+                }
             }
         }
         // IP / CIDR
@@ -223,7 +262,9 @@ impl RulesetMatcher {
         if let Some(ip) = resolved_ip {
             match ip {
                 IpAddr::V4(v) => {
-                    if self.cidr_v4.iter().any(|n| n.contains(&v)) { return true; }
+                    if self.cidr_v4.iter().any(|n| n.contains(&v)) {
+                        return true;
+                    }
                     if !self.mrs_v4_ranges.is_empty()
                         && contains_range_v4(&self.mrs_v4_ranges, u32::from(v))
                     {
@@ -231,7 +272,9 @@ impl RulesetMatcher {
                     }
                 }
                 IpAddr::V6(v) => {
-                    if self.cidr_v6.iter().any(|n| n.contains(&v)) { return true; }
+                    if self.cidr_v6.iter().any(|n| n.contains(&v)) {
+                        return true;
+                    }
                     if !self.mrs_v6_ranges.is_empty()
                         && contains_range_v6(&self.mrs_v6_ranges, u128::from(v))
                     {
@@ -242,11 +285,15 @@ impl RulesetMatcher {
         }
         // port
         if let Some(p) = port {
-            if self.ports.iter().any(|(lo, hi)| p >= *lo && p <= *hi) { return true; }
+            if self.ports.iter().any(|(lo, hi)| p >= *lo && p <= *hi) {
+                return true;
+            }
         }
         // process
         if let Some(name) = process {
-            if self.processes.contains(&name.to_ascii_lowercase()) { return true; }
+            if self.processes.contains(&name.to_ascii_lowercase()) {
+                return true;
+            }
         }
         false
     }
@@ -255,8 +302,12 @@ impl RulesetMatcher {
         // MRS domain set 的"domains"概念不能简单地映射到 self.domains.len()。
         // 我们把 mrs_count（header.count）记到一个独立字段，并在 cidr_* 里
         // 也累计 MRS v4/v6 ranges，便于 dashboard 总数显示。
-        let domains_total =
-            self.domains.len() + self.mrs_domain_set.as_ref().map(|_| self.mrs_count).unwrap_or(0);
+        let domains_total = self.domains.len()
+            + self
+                .mrs_domain_set
+                .as_ref()
+                .map(|_| self.mrs_count)
+                .unwrap_or(0);
         RulesetStats {
             domains: domains_total,
             suffixes: self.suffix_trie.len(),
@@ -321,7 +372,9 @@ pub struct RulesetIndex {
 }
 
 impl RulesetIndex {
-    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
     pub fn insert(&self, m: Arc<RulesetMatcher>) {
         self.inner.write().insert(m.name.clone(), m);
     }
@@ -332,7 +385,11 @@ impl RulesetIndex {
         self.inner.read().keys().cloned().collect()
     }
     pub fn stats(&self) -> Vec<(String, RulesetStats)> {
-        self.inner.read().iter().map(|(k, v)| (k.clone(), v.stats())).collect()
+        self.inner
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.stats()))
+            .collect()
     }
 }
 
@@ -355,7 +412,9 @@ struct TrieNode {
 impl SuffixTrie {
     fn insert(&mut self, suffix: &str) {
         let suffix = suffix.trim_matches('.').to_ascii_lowercase();
-        if suffix.is_empty() { return; }
+        if suffix.is_empty() {
+            return;
+        }
         let mut node = &mut self.root;
         for seg in suffix.rsplit('.') {
             node = node.children.entry(seg.to_string()).or_default();
@@ -365,13 +424,17 @@ impl SuffixTrie {
     }
     fn matches(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.');
-        if host.is_empty() { return false; }
+        if host.is_empty() {
+            return false;
+        }
         let mut node = &self.root;
         // 反向遍历：z.b.a 的后缀 a → b → z
         for seg in host.rsplit('.') {
             match node.children.get(seg) {
                 Some(child) => {
-                    if child.terminal { return true; }
+                    if child.terminal {
+                        return true;
+                    }
                     node = child;
                 }
                 None => return false,
@@ -379,7 +442,9 @@ impl SuffixTrie {
         }
         node.terminal
     }
-    fn len(&self) -> usize { self.count }
+    fn len(&self) -> usize {
+        self.count
+    }
 }
 
 fn normalize_domain(s: &str) -> String {
@@ -400,7 +465,11 @@ mod tests {
     use super::*;
 
     fn entry(kind: ClassicalKind, v: &str) -> ClassicalEntry {
-        ClassicalEntry { kind, value: v.into(), policy: None }
+        ClassicalEntry {
+            kind,
+            value: v.into(),
+            policy: None,
+        }
     }
 
     #[test]

@@ -2,22 +2,22 @@
 //!
 //! Swift / Objective-C 端约定：
 //! ```swift
-//! @_silgen_name("rpkernel_set_packet_tunnel_fd")
-//! func rpkernel_set_packet_tunnel_fd(_ fd: Int32)
+//! @_silgen_name("wuthercore_set_packet_tunnel_fd")
+//! func wuthercore_set_packet_tunnel_fd(_ fd: Int32)
 //!
-//! @_silgen_name("rpkernel_native_start")
-//! func rpkernel_native_start() -> Int32
+//! @_silgen_name("wuthercore_native_start")
+//! func wuthercore_native_start() -> Int32
 //!
-//! @_silgen_name("rpkernel_native_stop")
-//! func rpkernel_native_stop()
+//! @_silgen_name("wuthercore_native_stop")
+//! func wuthercore_native_stop()
 //! ```
 //!
 //! `NEPacketTunnelProvider` 在 `startTunnel(options:)` 中：
 //! 1. 配置 `NEPacketTunnelNetworkSettings`；
 //! 2. 通过 `setTunnelNetworkSettings` 拿到 utun fd（可借助 `dup` + 私有 API 或
 //!    直接走 `packetFlow.readPackets/writePackets`）；
-//! 3. 调用 `rpkernel_set_packet_tunnel_fd(fd)`；
-//! 4. 调用 `rpkernel_native_start()` 让 Rust 接管。
+//! 3. 调用 `wuthercore_set_packet_tunnel_fd(fd)`；
+//! 4. 调用 `wuthercore_native_start()` 让 Rust 接管。
 //!
 //! 为兼容性留两个版本：fd 直注入（需要 entitlement）+ packetFlow 通道。
 
@@ -34,7 +34,7 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static INJECTED_FD: Mutex<Option<RawFd>> = Mutex::new(None);
 
 #[no_mangle]
-pub extern "C" fn rpkernel_set_packet_tunnel_fd(fd: i32) {
+pub extern "C" fn wuthercore_set_packet_tunnel_fd(fd: i32) {
     if fd < 0 {
         return;
     }
@@ -42,13 +42,13 @@ pub extern "C" fn rpkernel_set_packet_tunnel_fd(fd: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn rpkernel_native_start() -> i32 {
+pub extern "C" fn wuthercore_native_start() -> i32 {
     STARTED.store(true, Ordering::SeqCst);
     0
 }
 
 #[no_mangle]
-pub extern "C" fn rpkernel_native_stop() {
+pub extern "C" fn wuthercore_native_stop() {
     STARTED.store(false, Ordering::SeqCst);
 }
 

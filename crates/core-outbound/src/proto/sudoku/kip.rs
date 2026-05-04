@@ -45,8 +45,7 @@ pub const KIP_FEAT_OPEN_TCP: u32 = 1 << 0;
 pub const KIP_FEAT_MUX: u32 = 1 << 1;
 pub const KIP_FEAT_UOT: u32 = 1 << 2;
 pub const KIP_FEAT_KEEPALIVE: u32 = 1 << 4;
-pub const KIP_FEAT_ALL: u32 =
-    KIP_FEAT_OPEN_TCP | KIP_FEAT_MUX | KIP_FEAT_UOT | KIP_FEAT_KEEPALIVE;
+pub const KIP_FEAT_ALL: u32 = KIP_FEAT_OPEN_TCP | KIP_FEAT_MUX | KIP_FEAT_UOT | KIP_FEAT_KEEPALIVE;
 
 pub const KIP_HELLO_USER_HASH_SIZE: usize = 8;
 pub const KIP_HELLO_NONCE_SIZE: usize = 16;
@@ -139,9 +138,8 @@ pub fn parse_server_hello(payload: &[u8]) -> Result<KIPServerHello, String> {
     let mut nonce = [0u8; KIP_HELLO_NONCE_SIZE];
     nonce.copy_from_slice(&payload[..KIP_HELLO_NONCE_SIZE]);
     let mut server_pub = [0u8; KIP_HELLO_PUB_SIZE];
-    server_pub.copy_from_slice(
-        &payload[KIP_HELLO_NONCE_SIZE..KIP_HELLO_NONCE_SIZE + KIP_HELLO_PUB_SIZE],
-    );
+    server_pub
+        .copy_from_slice(&payload[KIP_HELLO_NONCE_SIZE..KIP_HELLO_NONCE_SIZE + KIP_HELLO_PUB_SIZE]);
     let off = KIP_HELLO_NONCE_SIZE + KIP_HELLO_PUB_SIZE;
     let selected_feats = u32::from_be_bytes([
         payload[off],

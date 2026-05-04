@@ -60,7 +60,10 @@ pub struct RejectOptions {
 
 impl Default for RejectOptions {
     fn default() -> Self {
-        Self { method: RejectMethod::Default, no_drop: false }
+        Self {
+            method: RejectMethod::Default,
+            no_drop: false,
+        }
     }
 }
 
@@ -119,9 +122,16 @@ impl DnsRR {
     /// 以及简短形式 `TYPE hostname DATA`。
     pub fn parse(s: &str) -> Option<Self> {
         let line = s.trim();
-        if line.is_empty() { return None; }
-        let toks: Vec<&str> = line.splitn(5, char::is_whitespace).filter(|t| !t.is_empty()).collect();
-        if toks.len() < 3 { return None; }
+        if line.is_empty() {
+            return None;
+        }
+        let toks: Vec<&str> = line
+            .splitn(5, char::is_whitespace)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if toks.len() < 3 {
+            return None;
+        }
 
         // 短写法：TYPE name data...
         let upper0 = toks[0].to_ascii_uppercase();
@@ -146,7 +156,9 @@ impl DnsRR {
         if idx < toks.len() && toks[idx].eq_ignore_ascii_case("IN") {
             idx += 1;
         }
-        if idx + 1 >= toks.len() { return None; }
+        if idx + 1 >= toks.len() {
+            return None;
+        }
         Some(DnsRR {
             name: toks[0].trim_end_matches('.').to_string(),
             class: "IN".into(),
@@ -271,13 +283,20 @@ impl Default for RejectThrottle {
 
 impl RejectThrottle {
     pub fn new(window: Duration, threshold: u32) -> Self {
-        Self { counts: DashMap::new(), window, threshold }
+        Self {
+            counts: DashMap::new(),
+            window,
+            threshold,
+        }
     }
 
     /// 记录一次 reject 触发，返回是否应该升级为 drop。
     pub fn record_should_drop(&self, rule_source: &str) -> bool {
         let now = Instant::now();
-        let entry = self.counts.entry(rule_source.to_string()).or_insert_with(|| Mutex::new((now, 0)));
+        let entry = self
+            .counts
+            .entry(rule_source.to_string())
+            .or_insert_with(|| Mutex::new((now, 0)));
         let mut g = entry.lock();
         if now.duration_since(g.0) > self.window {
             *g = (now, 1);
@@ -302,7 +321,9 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn with_default(mut self, action: DnsAction) -> Self {
         self.default_action = Some(action);
@@ -322,9 +343,9 @@ impl PolicyEngine {
     ///
     /// ```yaml
     /// # 三种合法写法
-    /// - "set:cn -> direct:mainland?ecs=1.2.3.0/24"        # 字符串 DSL
+    /// - "set:cn -> direct:cn-dns?ecs=1.2.3.0/24"          # 字符串 DSL
     /// - { suffix: bad.com, drop: true }                   # mapping：drop
-    /// - { match: "set:gfw", proxy: overseas, ttl: 60 }    # mapping：route 选项
+    /// - { match: "set:gfw", proxy: global-dns, ttl: 60 }  # mapping：route 选项
     /// - { suffix: foo.com, ips: [1.2.3.4, ::1] }          # mapping：accept
     /// - { match_response: 1.1.1.0/24, respond: true }     # mapping：respond
     /// ```
@@ -352,26 +373,39 @@ pub fn parse_rule_value(v: &serde_yaml::Value) -> Option<PolicyRule> {
             .unwrap_or(false)
     };
     let get_u64 = |k: &str| -> Option<u64> {
-        m.get(serde_yaml::Value::String(k.into())).and_then(|x| x.as_u64())
+        m.get(serde_yaml::Value::String(k.into()))
+            .and_then(|x| x.as_u64())
     };
     let get_seq = |k: &str| -> Option<Vec<String>> {
         m.get(serde_yaml::Value::String(k.into()))
             .and_then(|x| x.as_sequence())
-            .map(|seq| seq.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
     };
 
     // ---------- LHS：拼匹配 ----------
-    let matcher = if let Some(s) = get_str("match") { parse_lhs(&s)? }
-        else if let Some(s) = get_str("domain") { HostMatch::Domain(s) }
-        else if let Some(s) = get_str("suffix").or_else(|| get_str("host")) { HostMatch::Suffix(s) }
-        else if let Some(s) = get_str("keyword") { HostMatch::Keyword(s) }
-        else if let Some(s) = get_str("set").or_else(|| get_str("geosite")).or_else(|| get_str("geoip")).or_else(|| get_str("ruleset")) {
-            HostMatch::Set(s)
-        }
-        else if let Some(s) = get_str("match_response").or_else(|| get_str("response")) {
-            HostMatch::ResponseIpCidr(s.parse().ok()?)
-        }
-        else { HostMatch::Any };
+    let matcher = if let Some(s) = get_str("match") {
+        parse_lhs(&s)?
+    } else if let Some(s) = get_str("domain") {
+        HostMatch::Domain(s)
+    } else if let Some(s) = get_str("suffix").or_else(|| get_str("host")) {
+        HostMatch::Suffix(s)
+    } else if let Some(s) = get_str("keyword") {
+        HostMatch::Keyword(s)
+    } else if let Some(s) = get_str("set")
+        .or_else(|| get_str("geosite"))
+        .or_else(|| get_str("geoip"))
+        .or_else(|| get_str("ruleset"))
+    {
+        HostMatch::Set(s)
+    } else if let Some(s) = get_str("match_response").or_else(|| get_str("response")) {
+        HostMatch::ResponseIpCidr(s.parse().ok()?)
+    } else {
+        HostMatch::Any
+    };
 
     // ---------- 选项 ----------
     let opts = QueryOptions {
@@ -399,15 +433,26 @@ pub fn parse_rule_value(v: &serde_yaml::Value) -> Option<PolicyRule> {
             method: RejectMethod::Drop,
             no_drop: get_bool("no_drop"),
         });
-        return Some(PolicyRule { matcher, action, source: format!("{v:?}") });
+        return Some(PolicyRule {
+            matcher,
+            action,
+            source: format!("{v:?}"),
+        });
     }
     if get_bool("reject") || get_bool("refuse") {
         let method = match get_str("method").as_deref() {
             Some("drop") => RejectMethod::Drop,
             _ => RejectMethod::Default,
         };
-        let action = DnsAction::Reject(RejectOptions { method, no_drop: get_bool("no_drop") });
-        return Some(PolicyRule { matcher, action, source: format!("{v:?}") });
+        let action = DnsAction::Reject(RejectOptions {
+            method,
+            no_drop: get_bool("no_drop"),
+        });
+        return Some(PolicyRule {
+            matcher,
+            action,
+            source: format!("{v:?}"),
+        });
     }
     // 2. predefined rcode 快捷
     for (k, code) in [
@@ -420,7 +465,10 @@ pub fn parse_rule_value(v: &serde_yaml::Value) -> Option<PolicyRule> {
         if get_bool(k) {
             return Some(PolicyRule {
                 matcher,
-                action: DnsAction::Predefined(PredefinedResponse { rcode: Some(code), ..Default::default() }),
+                action: DnsAction::Predefined(PredefinedResponse {
+                    rcode: Some(code),
+                    ..Default::default()
+                }),
                 source: format!("{v:?}"),
             });
         }
@@ -430,22 +478,38 @@ pub fn parse_rule_value(v: &serde_yaml::Value) -> Option<PolicyRule> {
         if let Some(seq) = get_seq(k) {
             let ips: Vec<IpAddr> = seq.iter().filter_map(|s| s.parse().ok()).collect();
             if !ips.is_empty() {
-                return Some(PolicyRule { matcher, action: DnsAction::Accept(ips), source: format!("{v:?}") });
+                return Some(PolicyRule {
+                    matcher,
+                    action: DnsAction::Accept(ips),
+                    source: format!("{v:?}"),
+                });
             }
         }
         if let Some(s) = get_str(k) {
             let ips: Vec<IpAddr> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
             if !ips.is_empty() {
-                return Some(PolicyRule { matcher, action: DnsAction::Accept(ips), source: format!("{v:?}") });
+                return Some(PolicyRule {
+                    matcher,
+                    action: DnsAction::Accept(ips),
+                    source: format!("{v:?}"),
+                });
             }
         }
     }
     // 4. fake / respond
     if get_bool("fake") {
-        return Some(PolicyRule { matcher, action: DnsAction::Fake, source: format!("{v:?}") });
+        return Some(PolicyRule {
+            matcher,
+            action: DnsAction::Fake,
+            source: format!("{v:?}"),
+        });
     }
     if get_bool("respond") {
-        return Some(PolicyRule { matcher, action: DnsAction::Respond, source: format!("{v:?}") });
+        return Some(PolicyRule {
+            matcher,
+            action: DnsAction::Respond,
+            source: format!("{v:?}"),
+        });
     }
     // 5. group: direct / proxy / route / evaluate
     if let Some(g) = get_str("evaluate") {
@@ -510,7 +574,12 @@ impl PolicyEngine {
     }
 }
 
-pub fn matches(m: &HostMatch, host: &str, ctx: &EvalContext, idx: Option<&Arc<core_ruleset::RulesetIndex>>) -> bool {
+pub fn matches(
+    m: &HostMatch,
+    host: &str,
+    ctx: &EvalContext,
+    idx: Option<&Arc<core_ruleset::RulesetIndex>>,
+) -> bool {
     match m {
         HostMatch::Any => true,
         HostMatch::Domain(d) => host == d.to_lowercase(),
@@ -523,12 +592,11 @@ pub fn matches(m: &HostMatch, host: &str, ctx: &EvalContext, idx: Option<&Arc<co
             .and_then(|i| i.get(name))
             .map(|m| m.matches(host, None, None, None))
             .unwrap_or(false),
-        HostMatch::ResponseIpCidr(cidr) => {
-            ctx.saved_response
-                .as_ref()
-                .map(|ips| ips.iter().any(|ip| cidr.contains(ip)))
-                .unwrap_or(false)
-        }
+        HostMatch::ResponseIpCidr(cidr) => ctx
+            .saved_response
+            .as_ref()
+            .map(|ips| ips.iter().any(|ip| cidr.contains(ip)))
+            .unwrap_or(false),
         HostMatch::Not(inner) => !matches(inner, host, ctx, idx),
         HostMatch::Or(list) => list.iter().any(|m| matches(m, host, ctx, idx)),
         HostMatch::And(list) => list.iter().all(|m| matches(m, host, ctx, idx)),
@@ -555,16 +623,22 @@ pub fn matches(m: &HostMatch, host: &str, ctx: &EvalContext, idx: Option<&Arc<co
 ///   * **route:GROUP**\[?opts\]        —— 终止（与 direct/proxy 等价但显式）
 ///
 /// per-query opts 紧跟问号：
-///   * `evaluate:overseas?nocache,nooptcache,ttl=60,ecs=1.2.3.0/24`
+///   * `evaluate:global-dns?nocache,nooptcache,ttl=60,ecs=1.2.3.0/24`
 pub fn parse_rule_line(line: &str) -> Option<PolicyRule> {
     let s = line.trim();
-    if s.is_empty() || s.starts_with('#') { return None; }
+    if s.is_empty() || s.starts_with('#') {
+        return None;
+    }
     let (lhs, rhs) = s.split_once("->")?;
     let lhs = lhs.trim();
     let rhs = rhs.trim();
     let matcher = parse_lhs(lhs)?;
     let action = parse_rhs(rhs)?;
-    Some(PolicyRule { matcher, action, source: line.to_string() })
+    Some(PolicyRule {
+        matcher,
+        action,
+        source: line.to_string(),
+    })
 }
 
 fn parse_lhs(lhs: &str) -> Option<HostMatch> {
@@ -614,8 +688,9 @@ fn parse_rhs(rhs: &str) -> Option<DnsAction> {
         let mut ro = RejectOptions::default();
         for kv in rhs.split(['?', ',', '&']).skip(1) {
             let kv = kv.trim();
-            if kv == "no_drop" || kv == "no-drop" { ro.no_drop = true; }
-            else if let Some(v) = kv.strip_prefix("method=") {
+            if kv == "no_drop" || kv == "no-drop" {
+                ro.no_drop = true;
+            } else if let Some(v) = kv.strip_prefix("method=") {
                 match v.to_ascii_lowercase().as_str() {
                     "drop" => ro.method = RejectMethod::Drop,
                     "default" | "" => ro.method = RejectMethod::Default,
@@ -643,12 +718,18 @@ fn parse_rhs(rhs: &str) -> Option<DnsAction> {
         }
         for p in parts {
             let p = p.trim();
-            if p.is_empty() { continue; }
+            if p.is_empty() {
+                continue;
+            }
             // 支持 ns:..., extra:... 前缀；默认进 answer
             if let Some(s) = p.strip_prefix("ns:") {
-                if let Some(rr) = DnsRR::parse(s.trim()) { pre.ns.push(rr); }
+                if let Some(rr) = DnsRR::parse(s.trim()) {
+                    pre.ns.push(rr);
+                }
             } else if let Some(s) = p.strip_prefix("extra:") {
-                if let Some(rr) = DnsRR::parse(s.trim()) { pre.extra.push(rr); }
+                if let Some(rr) = DnsRR::parse(s.trim()) {
+                    pre.extra.push(rr);
+                }
             } else if let Some(rr) = DnsRR::parse(p) {
                 pre.answer.push(rr);
             }
@@ -661,23 +742,31 @@ fn parse_rhs(rhs: &str) -> Option<DnsAction> {
         "fake" => Some(DnsAction::Fake),
         "respond" => Some(DnsAction::Respond),
         // reject 家族（不带任何参数的快捷写法）
-        "drop" => Some(DnsAction::Reject(RejectOptions { method: RejectMethod::Drop, no_drop: false })),
+        "drop" => Some(DnsAction::Reject(RejectOptions {
+            method: RejectMethod::Drop,
+            no_drop: false,
+        })),
         "refuse" | "refused" => Some(DnsAction::Reject(RejectOptions::default())),
         // predefined rcode 快捷
         "nxdomain" => Some(DnsAction::Predefined(PredefinedResponse {
-            rcode: Some(PreRcode::NXDOMAIN), ..Default::default()
+            rcode: Some(PreRcode::NXDOMAIN),
+            ..Default::default()
         })),
         "noerror" | "empty" | "null" => Some(DnsAction::Predefined(PredefinedResponse {
-            rcode: Some(PreRcode::NOERROR), ..Default::default()
+            rcode: Some(PreRcode::NOERROR),
+            ..Default::default()
         })),
         "servfail" => Some(DnsAction::Predefined(PredefinedResponse {
-            rcode: Some(PreRcode::SERVFAIL), ..Default::default()
+            rcode: Some(PreRcode::SERVFAIL),
+            ..Default::default()
         })),
         "formerr" => Some(DnsAction::Predefined(PredefinedResponse {
-            rcode: Some(PreRcode::FORMERR), ..Default::default()
+            rcode: Some(PreRcode::FORMERR),
+            ..Default::default()
         })),
         "notimp" => Some(DnsAction::Predefined(PredefinedResponse {
-            rcode: Some(PreRcode::NOTIMP), ..Default::default()
+            rcode: Some(PreRcode::NOTIMP),
+            ..Default::default()
         })),
         _ => None,
     } {
@@ -685,8 +774,14 @@ fn parse_rhs(rhs: &str) -> Option<DnsAction> {
     }
 
     // ---------- hosts:1.2.3.4 或 hosts:1.2.3.4,::1 ----------
-    if let Some(rest) = head.strip_prefix("hosts:").or_else(|| head.strip_prefix("ip:")) {
-        let ips: Vec<_> = rest.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    if let Some(rest) = head
+        .strip_prefix("hosts:")
+        .or_else(|| head.strip_prefix("ip:"))
+    {
+        let ips: Vec<_> = rest
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
         if !ips.is_empty() {
             return Some(DnsAction::Accept(ips));
         }
@@ -700,15 +795,23 @@ fn parse_rhs(rhs: &str) -> Option<DnsAction> {
                 .split(',')
                 .filter_map(|p| p.trim().parse().ok())
                 .collect();
-            if ips.is_empty() { return None; }
+            if ips.is_empty() {
+                return None;
+            }
             DnsAction::Accept(ips)
         }
         s if s.starts_with("direct:") => DnsAction::Direct(s[7..].into()),
         s if s.starts_with("proxy:") => DnsAction::Proxy(s[6..].into()),
-        s if s.starts_with("evaluate:") => DnsAction::Evaluate { server: s[9..].into(), opts },
-        s if s.starts_with("route:") => DnsAction::Route { server: s[6..].into(), opts },
-        "direct" => DnsAction::Direct("mainland".into()),
-        "proxy" => DnsAction::Proxy("overseas".into()),
+        s if s.starts_with("evaluate:") => DnsAction::Evaluate {
+            server: s[9..].into(),
+            opts,
+        },
+        s if s.starts_with("route:") => DnsAction::Route {
+            server: s[6..].into(),
+            opts,
+        },
+        "direct" => DnsAction::Direct("default".into()),
+        "proxy" => DnsAction::Proxy("default".into()),
         // 兼容：裸 group 名按 Proxy
         other => DnsAction::Proxy(other.into()),
     })
@@ -738,7 +841,9 @@ fn parse_opts(s: &str) -> QueryOptions {
                         IpAddr::V4(_) => format!("{ip}/32"),
                         IpAddr::V6(_) => format!("{ip}/128"),
                     };
-                    if let Ok(parsed) = n.parse() { o.client_subnet = Some(parsed); }
+                    if let Ok(parsed) = n.parse() {
+                        o.client_subnet = Some(parsed);
+                    }
                 }
             }
             _ => {}
@@ -781,6 +886,20 @@ mod tests {
     }
 
     #[test]
+    fn bare_direct_and_proxy_route_to_default_dns_group() {
+        let r = parse_rule_line("any -> direct").unwrap();
+        match r.action {
+            DnsAction::Direct(g) => assert_eq!(g, "default"),
+            other => panic!("expected direct default, got {other:?}"),
+        }
+        let r = parse_rule_line("any -> proxy").unwrap();
+        match r.action {
+            DnsAction::Proxy(g) => assert_eq!(g, "default"),
+            other => panic!("expected proxy default, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn short_lhs_aliases() {
         // *.foo.com / =foo.com / geosite: / geoip:
         let r = parse_rule_line("*.foo.com -> direct:g").unwrap();
@@ -793,12 +912,12 @@ mod tests {
             HostMatch::Domain(s) => assert_eq!(s, "foo.com"),
             _ => panic!(),
         }
-        let r = parse_rule_line("geosite:cn -> direct:mainland").unwrap();
+        let r = parse_rule_line("geosite:cn -> direct:cn-dns").unwrap();
         match r.matcher {
             HostMatch::Set(s) => assert_eq!(s, "cn"),
             _ => panic!(),
         }
-        let r = parse_rule_line("geoip:cn -> direct:mainland").unwrap();
+        let r = parse_rule_line("geoip:cn -> direct:cn-dns").unwrap();
         match r.matcher {
             HostMatch::Set(s) => assert_eq!(s, "cn"),
             _ => panic!(),
@@ -807,9 +926,13 @@ mod tests {
 
     #[test]
     fn yaml_object_form_drop() {
-        let v: serde_yaml::Value = serde_yaml::from_str(r#"{ suffix: bad.com, drop: true }"#).unwrap();
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(r#"{ suffix: bad.com, drop: true }"#).unwrap();
         let r = parse_rule_value(&v).unwrap();
-        match r.matcher { HostMatch::Suffix(s) => assert_eq!(s, "bad.com"), _ => panic!() }
+        match r.matcher {
+            HostMatch::Suffix(s) => assert_eq!(s, "bad.com"),
+            _ => panic!(),
+        }
         match r.action {
             DnsAction::Reject(o) => assert_eq!(o.method, RejectMethod::Drop),
             _ => panic!(),
@@ -819,13 +942,17 @@ mod tests {
     #[test]
     fn yaml_object_form_with_options() {
         let v: serde_yaml::Value = serde_yaml::from_str(
-            r#"{ set: cn-site, direct: mainland, ecs: 1.2.3.0/24, no_cache: true, ttl: 60 }"#,
-        ).unwrap();
+            r#"{ set: cn-site, direct: cn-dns, ecs: 1.2.3.0/24, no_cache: true, ttl: 60 }"#,
+        )
+        .unwrap();
         let r = parse_rule_value(&v).unwrap();
-        match r.matcher { HostMatch::Set(s) => assert_eq!(s, "cn-site"), _ => panic!() }
+        match r.matcher {
+            HostMatch::Set(s) => assert_eq!(s, "cn-site"),
+            _ => panic!(),
+        }
         match r.action {
             DnsAction::Route { server, opts } => {
-                assert_eq!(server, "mainland");
+                assert_eq!(server, "cn-dns");
                 assert!(opts.disable_cache);
                 assert_eq!(opts.rewrite_ttl, Some(60));
                 assert!(opts.client_subnet.is_some());
@@ -836,10 +963,13 @@ mod tests {
 
     #[test]
     fn yaml_object_form_hosts_array() {
-        let v: serde_yaml::Value = serde_yaml::from_str(r#"
+        let v: serde_yaml::Value = serde_yaml::from_str(
+            r#"
 suffix: foo.com
 ips: ["1.2.3.4", "5.6.7.8", "::1"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let r = parse_rule_value(&v).unwrap();
         match r.action {
             DnsAction::Accept(ips) => {
@@ -852,9 +982,8 @@ ips: ["1.2.3.4", "5.6.7.8", "::1"]
 
     #[test]
     fn yaml_object_form_match_response_respond() {
-        let v: serde_yaml::Value = serde_yaml::from_str(
-            r#"{ match_response: 1.1.1.0/24, respond: true }"#,
-        ).unwrap();
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(r#"{ match_response: 1.1.1.0/24, respond: true }"#).unwrap();
         let r = parse_rule_value(&v).unwrap();
         match r.matcher {
             HostMatch::ResponseIpCidr(c) => assert_eq!(c.to_string(), "1.1.1.0/24"),
@@ -907,10 +1036,10 @@ ips: ["1.2.3.4", "5.6.7.8", "::1"]
                 assert_eq!(p.answer[0].data, "1.2.3.4");
                 assert_eq!(p.answer[1].rtype, "AAAA");
                 assert_eq!(p.ns.len(), 1);
-                assert_eq!(p.answer_ips(), vec![
-                    "1.2.3.4".parse::<IpAddr>().unwrap(),
-                    "::1".parse().unwrap(),
-                ]);
+                assert_eq!(
+                    p.answer_ips(),
+                    vec!["1.2.3.4".parse::<IpAddr>().unwrap(), "::1".parse().unwrap(),]
+                );
             }
             _ => panic!(),
         }
@@ -931,21 +1060,27 @@ ips: ["1.2.3.4", "5.6.7.8", "::1"]
         assert_eq!(m3, RejectMethod::Drop, "第三次（threshold=3）开始 drop");
         assert_eq!(m4, RejectMethod::Drop);
         // no_drop 关闭 throttle
-        let opts_nd = RejectOptions { method: RejectMethod::Default, no_drop: true };
+        let opts_nd = RejectOptions {
+            method: RejectMethod::Default,
+            no_drop: true,
+        };
         for _ in 0..10 {
-            assert_eq!(e.apply_reject_throttle(&opts_nd, "rule#nd"), RejectMethod::Default);
+            assert_eq!(
+                e.apply_reject_throttle(&opts_nd, "rule#nd"),
+                RejectMethod::Default
+            );
         }
     }
 
     #[test]
     fn parse_evaluate_with_opts() {
         let r = parse_rule_line(
-            "set:cn-site -> evaluate:overseas?nocache,nooptcache,ttl=60,ecs=1.2.3.0/24",
+            "set:cn-site -> evaluate:global-dns?nocache,nooptcache,ttl=60,ecs=1.2.3.0/24",
         )
         .unwrap();
         match r.action {
             DnsAction::Evaluate { server, opts } => {
-                assert_eq!(server, "overseas");
+                assert_eq!(server, "global-dns");
                 assert!(opts.disable_cache);
                 assert!(opts.disable_optimistic_cache);
                 assert_eq!(opts.rewrite_ttl, Some(60));
@@ -978,7 +1113,10 @@ ips: ["1.2.3.4", "5.6.7.8", "::1"]
 
     #[test]
     fn evaluate_is_non_terminal() {
-        let a = DnsAction::Evaluate { server: "g".into(), opts: Default::default() };
+        let a = DnsAction::Evaluate {
+            server: "g".into(),
+            opts: Default::default(),
+        };
         assert!(!a.is_terminal());
         assert!(DnsAction::Reject(Default::default()).is_terminal());
         assert!(DnsAction::Respond.is_terminal());

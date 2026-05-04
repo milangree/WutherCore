@@ -27,7 +27,7 @@
 //! * UDP relay（datagram + stream 双模式）
 //! * 可选 obfs
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,10 +35,12 @@ use bytes::BufMut;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint};
 use rustls::ClientConfig as RustlsConfig;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
+use crate::adapter::{
+    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    OutboundAdapter,
+};
 
 #[derive(Debug, Clone)]
 pub struct HysteriaOutbound {
@@ -57,12 +59,7 @@ pub struct HysteriaOutbound {
 }
 
 impl HysteriaOutbound {
-    pub fn new(
-        name: impl Into<String>,
-        host: impl Into<String>,
-        port: u16,
-        auth: Vec<u8>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, host: impl Into<String>, port: u16, auth: Vec<u8>) -> Self {
         Self {
             name: name.into(),
             host: host.into(),
@@ -117,8 +114,16 @@ impl HysteriaOutbound {
         } else {
             "0.0.0.0:0".parse().unwrap()
         };
-        let mut endpoint = Endpoint::client(bind_addr)
-            .map_err(|e| io_err(format!("hysteria endpoint: {e}")))?;
+        let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+        let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+        std_socket.set_nonblocking(true)?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| io_err(format!("hysteria endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
         let server_name = self.sni.clone().unwrap_or_else(|| self.host.clone());
@@ -159,16 +164,26 @@ impl HysteriaOutbound {
         Ok(HysteriaSession {
             connection,
             endpoint,
+            _loopback_guard: loopback_guard,
         })
     }
 }
 
 #[async_trait]
 impl OutboundAdapter for HysteriaOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "hysteria" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "hysteria"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -204,6 +219,7 @@ struct HysteriaSession {
     connection: quinn::Connection,
     #[allow(dead_code)]
     endpoint: Endpoint,
+    _loopback_guard: crate::loopback::LoopbackUdpGuard,
 }
 
 impl HysteriaSession {
@@ -455,17 +471,8 @@ impl<'a> MsgpackCursor<'a> {
 /* ---------------- 工具 ---------------- */
 
 async fn resolve_first(host: &str, port: u16) -> std::io::Result<SocketAddr> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    if let Ok(ip) = host.parse::<Ipv6Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| io_err(format!("dns lookup: {e}")))?
-        .collect();
-    addrs
+    resolve_host(host, port)
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| io_err("no addr resolved"))

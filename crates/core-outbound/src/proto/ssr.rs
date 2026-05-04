@@ -75,7 +75,11 @@ impl SsrCipher {
     }
     pub fn iv_len(self) -> usize {
         match self {
-            Self::Aes128Cfb | Self::Aes256Cfb | Self::Aes128Ctr | Self::Aes256Ctr | Self::Rc4Md5 => 16,
+            Self::Aes128Cfb
+            | Self::Aes256Cfb
+            | Self::Aes128Ctr
+            | Self::Aes256Ctr
+            | Self::Rc4Md5 => 16,
             Self::Chacha20Ietf => 12,
             Self::None => 0,
         }
@@ -105,9 +109,15 @@ impl SsrObfs {
     pub fn parse(s: &str, host: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "plain" | "" => Some(Self::Plain),
-            "http_simple" => Some(Self::HttpSimple { host: host.to_string() }),
-            "http_post" => Some(Self::HttpSimple { host: host.to_string() }), // 同一思路
-            "tls1.2_ticket_auth" => Some(Self::Tls12TicketAuth { host: host.to_string() }),
+            "http_simple" => Some(Self::HttpSimple {
+                host: host.to_string(),
+            }),
+            "http_post" => Some(Self::HttpSimple {
+                host: host.to_string(),
+            }), // 同一思路
+            "tls1.2_ticket_auth" => Some(Self::Tls12TicketAuth {
+                host: host.to_string(),
+            }),
             _ => None,
         }
     }
@@ -173,14 +183,25 @@ impl SsrOutbound {
 
 #[async_trait]
 impl OutboundAdapter for SsrOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "ssr" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "ssr"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: false, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut stream = TcpTransport::default().connect(&self.host, self.port).await?;
+        let mut stream = TcpTransport::default()
+            .connect(&self.host, self.port)
+            .await?;
 
         // 1) 生成 IV
         let iv_len = self.cipher.iv_len();
@@ -195,7 +216,13 @@ impl OutboundAdapter for SsrOutbound {
 
         // 4) 计算 protocol 包装：origin = SOCKS5_addr；auth_* = auth_header + addr
         let target = encode_socks_addr(&ctx.host, ctx.port);
-        let proto_payload = wrap_protocol(&self.protocol, &target, &self.key, &iv, &self.protocol_param);
+        let proto_payload = wrap_protocol(
+            &self.protocol,
+            &target,
+            &self.key,
+            &iv,
+            &self.protocol_param,
+        );
 
         // 5) 加密 protocol_payload
         let mut buf = proto_payload;
@@ -275,7 +302,7 @@ fn build_obfs_prefix(obfs: &SsrObfs, _iv: &[u8]) -> Vec<u8> {
             let host_bytes = host.as_bytes();
             let sni_inner_len = (host_bytes.len() + 5) as u16;
             exts.extend_from_slice(&sni_inner_len.to_be_bytes()); // ext data length
-            // SNI inner: list_len(2) + entry_type(1) + name_len(2) + name
+                                                                  // SNI inner: list_len(2) + entry_type(1) + name_len(2) + name
             exts.extend_from_slice(&((host_bytes.len() + 3) as u16).to_be_bytes());
             exts.push(0x00);
             exts.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
@@ -594,7 +621,9 @@ impl AsyncWrite for SsrStream {
         let mut written = 0;
         while written < buf.len() {
             match this.inner.as_mut().poll_write(cx, &buf[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -633,7 +662,10 @@ mod tests {
     fn parse_components() {
         assert_eq!(SsrCipher::parse("aes-256-cfb"), Some(SsrCipher::Aes256Cfb));
         assert_eq!(SsrCipher::parse("aes-128-ctr"), Some(SsrCipher::Aes128Ctr));
-        assert_eq!(SsrCipher::parse("chacha20-ietf"), Some(SsrCipher::Chacha20Ietf));
+        assert_eq!(
+            SsrCipher::parse("chacha20-ietf"),
+            Some(SsrCipher::Chacha20Ietf)
+        );
         assert_eq!(SsrCipher::parse("rc4-md5"), Some(SsrCipher::Rc4Md5));
         assert_eq!(SsrObfs::parse("plain", ""), Some(SsrObfs::Plain));
         assert!(matches!(
@@ -649,7 +681,10 @@ mod tests {
             SsrProtocol::parse("auth_aes128_md5"),
             Some(SsrProtocol::AuthAes128Md5)
         );
-        assert_eq!(SsrProtocol::parse("auth_chain_a"), Some(SsrProtocol::AuthChainA));
+        assert_eq!(
+            SsrProtocol::parse("auth_chain_a"),
+            Some(SsrProtocol::AuthChainA)
+        );
     }
 
     #[test]
@@ -663,7 +698,9 @@ mod tests {
 
     #[test]
     fn http_simple_obfs_well_formed() {
-        let obfs = SsrObfs::HttpSimple { host: "example.com".into() };
+        let obfs = SsrObfs::HttpSimple {
+            host: "example.com".into(),
+        };
         let prefix = build_obfs_prefix(&obfs, &[]);
         let s = std::str::from_utf8(&prefix).unwrap();
         assert!(s.starts_with("GET /"));
@@ -673,7 +710,9 @@ mod tests {
 
     #[test]
     fn tls_obfs_record_header() {
-        let obfs = SsrObfs::Tls12TicketAuth { host: "host.com".into() };
+        let obfs = SsrObfs::Tls12TicketAuth {
+            host: "host.com".into(),
+        };
         let prefix = build_obfs_prefix(&obfs, &[]);
         // 0x16 0x03 0x01 ... 表示 TLS 1.0 record (handshake)
         assert_eq!(prefix[0], 0x16);
@@ -689,7 +728,13 @@ mod tests {
 
     #[test]
     fn protocol_auth_aes128_md5_prepends_header() {
-        let p = wrap_protocol(&SsrProtocol::AuthAes128Md5, b"hello", &[0u8; 16], &[0u8; 16], "");
+        let p = wrap_protocol(
+            &SsrProtocol::AuthAes128Md5,
+            b"hello",
+            &[0u8; 16],
+            &[0u8; 16],
+            "",
+        );
         assert!(p.len() > 5);
         assert_eq!(&p[p.len() - 5..], b"hello");
     }

@@ -37,8 +37,10 @@ impl PreparedRequest {
             .body(body_unit)
             .map_err(|e| format!("request build: {e}"))?;
         // host 头
-        let host_val = HeaderValue::from_str(&self.host).map_err(|e| format!("host header: {e}"))?;
-        req.headers_mut().insert(HeaderName::from_static("host"), host_val);
+        let host_val =
+            HeaderValue::from_str(&self.host).map_err(|e| format!("host header: {e}"))?;
+        req.headers_mut()
+            .insert(HeaderName::from_static("host"), host_val);
         // 普通 headers
         for (k, v) in &self.headers {
             let name = HeaderName::try_from(k.as_str()).map_err(|e| format!("hdr name: {e}"))?;
@@ -54,7 +56,8 @@ impl PreparedRequest {
                 .collect::<Vec<_>>()
                 .join("; ");
             if let Ok(val) = HeaderValue::from_str(&joined) {
-                req.headers_mut().insert(HeaderName::from_static("cookie"), val);
+                req.headers_mut()
+                    .insert(HeaderName::from_static("cookie"), val);
             }
         }
         let _ = url; // url 已被消费
@@ -172,7 +175,8 @@ pub fn apply_x_padding(cfg: &Config, req: &mut PreparedRequest) -> Result<(), St
         PLACEMENT_HEADER => req.add_header(&pcfg.placement.header, &value),
         PLACEMENT_QUERY_IN_HEADER => {
             // 把 padding 放在某 header 里的 url query
-            let mut url = url::Url::parse(&pcfg.placement.raw_url).map_err(|e| format!("url: {e}"))?;
+            let mut url =
+                url::Url::parse(&pcfg.placement.raw_url).map_err(|e| format!("url: {e}"))?;
             url.set_query(Some(&format!("{}={}", pcfg.placement.key, value)));
             req.add_header(&pcfg.placement.header, url.as_str());
         }
@@ -188,13 +192,21 @@ pub fn apply_default_headers(cfg: &Config, req: &mut PreparedRequest) {
     for (k, v) in &cfg.headers {
         req.add_header(k, v);
     }
-    if !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+    if !req
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+    {
         req.add_header(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         );
     }
-    if !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+    if !req
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
+    {
         req.add_header("Accept", "*/*");
     }
 }
@@ -251,7 +263,12 @@ pub fn fill_packet_request(
     Ok(())
 }
 
-fn apply_uplink_data_to_header(cfg: &Config, req: &mut PreparedRequest, data: &[u8], chunk_size: Range) {
+fn apply_uplink_data_to_header(
+    cfg: &Config,
+    req: &mut PreparedRequest,
+    data: &[u8],
+    chunk_size: Range,
+) {
     let key = if cfg.uplink_data_key.is_empty() {
         "X-Data"
     } else {
@@ -272,7 +289,12 @@ fn apply_uplink_data_to_header(cfg: &Config, req: &mut PreparedRequest, data: &[
     }
 }
 
-fn apply_uplink_data_to_cookie(cfg: &Config, req: &mut PreparedRequest, data: &[u8], chunk_size: Range) {
+fn apply_uplink_data_to_cookie(
+    cfg: &Config,
+    req: &mut PreparedRequest,
+    data: &[u8],
+    chunk_size: Range,
+) {
     let key = if cfg.uplink_data_key.is_empty() {
         "x_data"
     } else {
@@ -323,7 +345,10 @@ mod tests {
         cfg.seq_placement = "header".into();
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         apply_meta(&cfg, &mut req, "ABC", "99");
-        assert!(req.headers.iter().any(|(k, v)| k == "X-Session" && v == "ABC"));
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "X-Session" && v == "ABC"));
         assert!(req.headers.iter().any(|(k, v)| k == "X-Seq" && v == "99"));
     }
 
@@ -332,7 +357,10 @@ mod tests {
         let cfg = Config::default(); // obfs off → 默认 queryInHeader/Referer
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         apply_x_padding(&cfg, &mut req).unwrap();
-        assert!(req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Referer")));
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Referer")));
     }
 
     #[test]
@@ -354,7 +382,10 @@ mod tests {
         let cfg = Config::default();
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         fill_stream_request(&cfg, &mut req, "sess").unwrap();
-        assert!(req.headers.iter().any(|(k, v)| k == "Content-Type" && v == "application/grpc"));
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Content-Type" && v == "application/grpc"));
     }
 
     #[test]
@@ -374,7 +405,11 @@ mod tests {
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         fill_packet_request(&cfg, &mut req, "s", "0", b"hello world").unwrap();
         assert!(req.body.is_none());
-        let count = req.headers.iter().filter(|(k, _)| k.starts_with("X-Data-")).count();
+        let count = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.starts_with("X-Data-"))
+            .count();
         assert!(count >= 1);
     }
 }

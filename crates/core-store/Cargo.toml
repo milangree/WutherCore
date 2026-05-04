@@ -3,7 +3,7 @@ name = "core-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RPKernel 持久化层 —— redb 嵌入式 KV"
+description = "WutherCore 持久化层 —— redb 嵌入式 KV"
 
 [dependencies]
 redb        = { workspace = true }

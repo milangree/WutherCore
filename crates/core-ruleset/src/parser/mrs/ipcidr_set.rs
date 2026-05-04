@@ -63,7 +63,10 @@ impl MrsIpCidrSet {
         }
         v4.sort_unstable_by_key(|p| p.0);
         v6.sort_unstable_by_key(|p| p.0);
-        Ok(Self { v4_ranges: v4, v6_ranges: v6 })
+        Ok(Self {
+            v4_ranges: v4,
+            v6_ranges: v6,
+        })
     }
 
     /// 包含查询：根据 IP 类型走对应 Vec 的二分。
@@ -114,9 +117,8 @@ fn contains_range<T: Copy + Ord>(ranges: &[(T, T)], ip: T) -> bool {
 }
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), ParseError> {
-    r.read_exact(buf).map_err(|e| {
-        ParseError::Other(format!("MRS read_exact failed ({} bytes): {e}", buf.len()))
-    })
+    r.read_exact(buf)
+        .map_err(|e| ParseError::Other(format!("MRS read_exact failed ({} bytes): {e}", buf.len())))
 }
 
 fn read_i64_be<R: Read>(r: &mut R) -> Result<i64, ParseError> {
@@ -132,8 +134,14 @@ mod tests {
     #[test]
     fn binary_search_v4_hit_and_miss() {
         let r: Vec<(u32, u32)> = vec![
-            (u32::from(Ipv4Addr::new(10, 0, 0, 0)), u32::from(Ipv4Addr::new(10, 255, 255, 255))),
-            (u32::from(Ipv4Addr::new(192, 168, 0, 0)), u32::from(Ipv4Addr::new(192, 168, 255, 255))),
+            (
+                u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+                u32::from(Ipv4Addr::new(10, 255, 255, 255)),
+            ),
+            (
+                u32::from(Ipv4Addr::new(192, 168, 0, 0)),
+                u32::from(Ipv4Addr::new(192, 168, 255, 255)),
+            ),
         ];
         assert!(contains_range(&r, u32::from(Ipv4Addr::new(10, 1, 2, 3))));
         assert!(contains_range(&r, u32::from(Ipv4Addr::new(192, 168, 1, 1))));

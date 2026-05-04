@@ -2,7 +2,7 @@
 chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 
-REM RPKernel one-shot multi-platform build entry (Windows).
+REM WutherCore one-shot multi-platform build entry (Windows).
 REM Usage:
 REM   build.cmd                              default target matrix
 REM   build.cmd x86_64-pc-windows-msvc       single target

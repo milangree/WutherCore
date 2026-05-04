@@ -53,7 +53,9 @@ impl FeedMeta {
             // 时钟回拨：当作"刚刚刷新"处理，避免 every 内反复拉取。
             return Some(Duration::from_millis(0));
         }
-        Some(Duration::from_millis(now_ms.saturating_sub(self.last_refreshed_ms)))
+        Some(Duration::from_millis(
+            now_ms.saturating_sub(self.last_refreshed_ms),
+        ))
     }
 }
 
@@ -128,7 +130,13 @@ impl FeedDiskCache {
 
 fn safe_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
 }
 
@@ -147,8 +155,11 @@ mod tests {
 
     fn tmp() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "rpkernel-feeds-cache-test-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            "wuthercore-feeds-cache-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ))
     }
 

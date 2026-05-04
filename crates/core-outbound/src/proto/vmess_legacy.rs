@@ -30,10 +30,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::vmess::{
-    build_legacy_header_payload, VmessSecurity, VMESS_OPTION_CHUNK_STREAM,
+use crate::proto::vmess::{build_legacy_header_payload, VmessSecurity, VMESS_OPTION_CHUNK_STREAM};
+use crate::transport::{
+    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, TlsOptions, Transport, WsOptions,
 };
-use crate::transport::{tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, TlsOptions, Transport, WsOptions};
 
 type HmacMd5 = Hmac<Md5>;
 
@@ -78,15 +78,26 @@ impl VmessLegacyOutbound {
 
 #[async_trait]
 impl OutboundAdapter for VmessLegacyOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "vmess-legacy" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "vmess-legacy"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: true, ipv6: true, multiplex: false }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: false,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
         let mut stream: BoxedStream = if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
-            WsTransport::new(ws.clone(), self.tls).connect(&self.host, self.port).await?
+            WsTransport::new(ws.clone(), self.tls)
+                .connect(&self.host, self.port)
+                .await?
         } else if self.tls {
             TlsTransport::new(TlsOptions {
                 enabled: true,
@@ -94,9 +105,12 @@ impl OutboundAdapter for VmessLegacyOutbound {
                 insecure: self.insecure,
                 alpn: self.alpn.clone(),
             })
-            .connect(&self.host, self.port).await?
+            .connect(&self.host, self.port)
+            .await?
         } else {
-            TcpTransport::default().connect(&self.host, self.port).await?
+            TcpTransport::default()
+                .connect(&self.host, self.port)
+                .await?
         };
 
         // 1) Compute AuthInfo + cmd_key + header_iv
@@ -116,7 +130,13 @@ impl OutboundAdapter for VmessLegacyOutbound {
 
         let cmd = if ctx.network == "udp" { 0x02 } else { 0x01 };
         let mut header_payload = build_legacy_header_payload(
-            &iv, &req_key, resp_auth[0], self.security.select(), cmd, ctx.port, &ctx.host,
+            &iv,
+            &req_key,
+            resp_auth[0],
+            self.security.select(),
+            cmd,
+            ctx.port,
+            &ctx.host,
         );
         // AES-128-CFB encrypt in place
         let enc = CfbEnc::<aes::Aes128>::new_from_slices(&cmd_key, &header_iv)

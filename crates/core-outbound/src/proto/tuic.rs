@@ -47,7 +47,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
+use crate::adapter::{
+    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    OutboundAdapter,
+};
 
 const TUIC_VERSION: u8 = 0x05;
 const CMD_AUTHENTICATE: u8 = 0x00;
@@ -170,8 +173,16 @@ impl TuicOutbound {
             "0.0.0.0:0".parse().unwrap()
         };
 
-        let mut endpoint = Endpoint::client(bind_addr)
-            .map_err(|e| io_err(format!("tuic endpoint: {e}")))?;
+        let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+        let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+        std_socket.set_nonblocking(true)?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| io_err(format!("tuic endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
         let server_name = if self.disable_sni {
@@ -199,7 +210,10 @@ impl TuicOutbound {
         auth_frame.push(CMD_AUTHENTICATE);
         auth_frame.extend_from_slice(self.uuid.as_bytes());
         auth_frame.extend_from_slice(&token);
-        auth_stream.write_all(&auth_frame).await.map_err(|e| io_err(format!("tuic write auth: {e}")))?;
+        auth_stream
+            .write_all(&auth_frame)
+            .await
+            .map_err(|e| io_err(format!("tuic write auth: {e}")))?;
         auth_stream
             .finish()
             .map_err(|e| io_err(format!("tuic finish auth: {e}")))?;
@@ -208,16 +222,26 @@ impl TuicOutbound {
             connection,
             endpoint,
             udp_mode: self.udp_relay_mode,
+            _loopback_guard: loopback_guard,
         })
     }
 }
 
 #[async_trait]
 impl OutboundAdapter for TuicOutbound {
-    fn name(&self) -> &str { &self.name }
-    fn protocol(&self) -> &'static str { "tuic" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn protocol(&self) -> &'static str {
+        "tuic"
+    }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { tcp: true, udp: self.udp, ipv6: true, multiplex: true }
+        Capabilities {
+            tcp: true,
+            udp: false,
+            ipv6: true,
+            multiplex: true,
+        }
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
@@ -247,6 +271,7 @@ struct TuicSession {
     #[allow(dead_code)]
     endpoint: Endpoint,
     udp_mode: TuicUdpMode,
+    _loopback_guard: crate::loopback::LoopbackUdpGuard,
 }
 
 impl TuicSession {
@@ -335,17 +360,8 @@ fn derive_token(password: &str, uuid: Uuid) -> [u8; 32] {
 }
 
 async fn resolve_first(host: &str, port: u16) -> std::io::Result<SocketAddr> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    if let Ok(ip) = host.parse::<Ipv6Addr>() {
-        return Ok(SocketAddr::new(ip.into(), port));
-    }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| io_err(format!("dns lookup: {e}")))?
-        .collect();
-    addrs
+    resolve_host(host, port)
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| io_err("no addr resolved"))

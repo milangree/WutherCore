@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    let store = Store::open("data/state/rpkernel.redb").unwrap();
+    let store = Store::open("data/state/wuthercore.redb").unwrap();
     let writer = AsyncWriter::spawn(store.clone());
     for i in 0..5 {
         let mut blob = NodeStatsBlob::default();

@@ -9,7 +9,7 @@ name: "with-real-feed"
 # 启动后 main 分组的 members 会自动从 feed 占位符替换为真实节点名。
 feeds:
   airport:
-    url: "file://D:/RustProjects/RPKernel/data/feeds-test/airport.b64"
+    url: "file://D:/RustProjects/WutherCore/data/feeds-test/airport.b64"
     every: 5m
     keep:
       name_has: [HK, JP, SG, US]

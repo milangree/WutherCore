@@ -28,15 +28,21 @@ type WintunSessionHandle = *mut c_void;
 
 #[allow(non_snake_case)]
 struct Funcs {
-    WintunCreateAdapter:
-        unsafe extern "system" fn(name: *const u16, tunnel_type: *const u16, guid: *const u8) -> WintunAdapterHandle,
+    WintunCreateAdapter: unsafe extern "system" fn(
+        name: *const u16,
+        tunnel_type: *const u16,
+        guid: *const u8,
+    ) -> WintunAdapterHandle,
     WintunCloseAdapter: unsafe extern "system" fn(adapter: WintunAdapterHandle),
-    WintunStartSession:
-        unsafe extern "system" fn(adapter: WintunAdapterHandle, capacity: u32) -> WintunSessionHandle,
+    WintunStartSession: unsafe extern "system" fn(
+        adapter: WintunAdapterHandle,
+        capacity: u32,
+    ) -> WintunSessionHandle,
     WintunEndSession: unsafe extern "system" fn(session: WintunSessionHandle),
     WintunReceivePacket:
         unsafe extern "system" fn(session: WintunSessionHandle, size: *mut u32) -> *mut u8,
-    WintunReleaseReceivePacket: unsafe extern "system" fn(session: WintunSessionHandle, packet: *mut u8),
+    WintunReleaseReceivePacket:
+        unsafe extern "system" fn(session: WintunSessionHandle, packet: *mut u8),
     WintunAllocateSendPacket:
         unsafe extern "system" fn(session: WintunSessionHandle, size: u32) -> *mut u8,
     WintunSendPacket: unsafe extern "system" fn(session: WintunSessionHandle, packet: *mut u8),
@@ -87,7 +93,9 @@ impl Wintun {
     /// 探测并加载 wintun.dll（PWD 优先，其次 SYSTEM32）。
     pub fn load() -> Option<Arc<Self>> {
         let candidates: Vec<std::path::PathBuf> = [
-            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("wintun.dll"))),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("wintun.dll"))),
             Some(std::path::PathBuf::from(r"C:\Windows\System32\wintun.dll")),
         ]
         .into_iter()
@@ -126,12 +134,16 @@ impl Wintun {
         let ttype_w = utf16(ttype);
         let guid = stable_guid(name);
         // SAFETY: 调用 wintun.dll 导出函数；指针为有效 NUL 结尾 UTF-16。
-        let h =
-            unsafe { (self.funcs.WintunCreateAdapter)(name_w.as_ptr(), ttype_w.as_ptr(), guid.as_ptr()) };
+        let h = unsafe {
+            (self.funcs.WintunCreateAdapter)(name_w.as_ptr(), ttype_w.as_ptr(), guid.as_ptr())
+        };
         if h.is_null() {
             None
         } else {
-            Some(WintunAdapter { wintun: self.clone(), handle: h })
+            Some(WintunAdapter {
+                wintun: self.clone(),
+                handle: h,
+            })
         }
     }
 }
@@ -199,7 +211,8 @@ impl WintunSession {
         // SAFETY: WintunReceivePacket 返回内部缓冲指针；返回 NULL 表示无包，
         // 此时调用 WaitForSingleObject 在 ReadWaitEvent 上阻塞。
         loop {
-            let p = unsafe { (self.adapter.wintun.funcs.WintunReceivePacket)(self.handle, &mut size) };
+            let p =
+                unsafe { (self.adapter.wintun.funcs.WintunReceivePacket)(self.handle, &mut size) };
             if !p.is_null() {
                 // SAFETY: p..p+size 是 wintun 内部环形缓冲 read-only 视图；
                 // 拷贝出来后立刻 release 还给 wintun。
@@ -220,8 +233,9 @@ impl WintunSession {
     /// 发送一个包。失败时返回 false（环形缓冲已满）。
     pub fn send(&self, pkt: &[u8]) -> bool {
         // SAFETY: 通过 ABI 拿一个长度匹配的 send 缓冲；写完调用 SendPacket 让 wintun 发出。
-        let p =
-            unsafe { (self.adapter.wintun.funcs.WintunAllocateSendPacket)(self.handle, pkt.len() as u32) };
+        let p = unsafe {
+            (self.adapter.wintun.funcs.WintunAllocateSendPacket)(self.handle, pkt.len() as u32)
+        };
         if p.is_null() {
             return false;
         }
@@ -234,7 +248,10 @@ impl WintunSession {
 }
 
 fn utf16(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 #[cfg(test)]

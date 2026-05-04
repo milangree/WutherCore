@@ -39,7 +39,9 @@ pub async fn bind_with_fallback(
         Ok(l) => return Ok(l),
         Err(e) => {
             let reason = match e.kind() {
-                std::io::ErrorKind::PermissionDenied if desired.port() < 1024 && !report.can_bind_low_ports => {
+                std::io::ErrorKind::PermissionDenied
+                    if desired.port() < 1024 && !report.can_bind_low_ports =>
+                {
                     "low-port permission denied"
                 }
                 std::io::ErrorKind::AddrInUse => "address in use",
@@ -103,7 +105,9 @@ mod tests {
         let report = PrivilegeReport::detect();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         // 应当 fallback 到高位端口段
-        let l = bind_with_fallback(addr, &report, Some(20000..=20100)).await.unwrap();
+        let l = bind_with_fallback(addr, &report, Some(20000..=20100))
+            .await
+            .unwrap();
         let bound_port = l.local_addr().unwrap().port();
         assert_ne!(bound_port, port, "应当 fallback 到不同端口");
         assert!((20000..=20100).contains(&bound_port));

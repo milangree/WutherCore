@@ -14,7 +14,7 @@ pub enum RulesetFormat {
     Mrs,
     /// sing-box binary（SRS）—— 嗅探后回退错误
     Srs,
-    /// **RPKernel 自研二进制**：magic "RRS\0" + CRC32
+    /// **WutherCore 自研二进制**：magic "RRS\0" + CRC32
     Rrs,
     Unknown,
 }
@@ -41,7 +41,7 @@ fn parse_hint(s: &str) -> Option<RulesetFormat> {
         "json" | "singbox" | "sing-box" => RulesetFormat::SingboxJson,
         "mrs" | "mihomo-binary" => RulesetFormat::Mrs,
         "srs" | "singbox-binary" => RulesetFormat::Srs,
-        "rrs" | "rpkernel" | "rpkernel-binary" => RulesetFormat::Rrs,
+        "rrs" | "wuthercore" | "wuthercore-binary" => RulesetFormat::Rrs,
         _ => return None,
     })
 }
@@ -63,7 +63,7 @@ fn sniff(body: &[u8]) -> RulesetFormat {
     if body.is_empty() {
         return RulesetFormat::Unknown;
     }
-    // RPKernel RRS：magic = "RRS\0"
+    // WutherCore RRS：magic = "RRS\0"
     if body.starts_with(&crate::rrs::MAGIC) {
         return RulesetFormat::Rrs;
     }
@@ -88,7 +88,8 @@ fn sniff(body: &[u8]) -> RulesetFormat {
         return RulesetFormat::Yaml;
     }
     // 含 "DOMAIN," 或 "IP-CIDR," 关键字 → 文本
-    if trimmed.contains("DOMAIN") || trimmed.contains("IP-CIDR") || trimmed.contains("PROCESS-NAME") {
+    if trimmed.contains("DOMAIN") || trimmed.contains("IP-CIDR") || trimmed.contains("PROCESS-NAME")
+    {
         return RulesetFormat::Text;
     }
     // 默认按 text 试一次

@@ -12,4 +12,6 @@ pub mod privilege;
 
 pub use listener::{bind_with_fallback, select_bind_addr};
 pub use mixed::{run_mixed, MixedListener};
-pub use privilege::{ensure_best_effort_privilege, try_request_root_android, PrivilegeLevel, PrivilegeReport};
+pub use privilege::{
+    ensure_best_effort_privilege, try_request_root_android, PrivilegeLevel, PrivilegeReport,
+};

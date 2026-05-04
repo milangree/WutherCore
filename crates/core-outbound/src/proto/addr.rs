@@ -3,6 +3,7 @@
 //! 三个协议都用同一种格式：ATYP(1) + ADDR(变长) + PORT(2 BE)。
 
 use bytes::BufMut;
+use std::io;
 
 #[derive(Debug, Clone)]
 pub enum Address<'a> {
@@ -57,4 +58,49 @@ pub fn encode_socks_addr(host: &str, port: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(a.encoded_len());
     a.encode(port, &mut buf);
     buf
+}
+
+pub fn decode_socks_addr(buf: &[u8]) -> io::Result<(String, u16, usize)> {
+    if buf.is_empty() {
+        return Err(io_err("missing socks address type"));
+    }
+    match buf[0] {
+        0x01 => {
+            if buf.len() < 1 + 4 + 2 {
+                return Err(io_err("truncated ipv4 socks address"));
+            }
+            let ip = std::net::Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Ok((ip.to_string(), port, 7))
+        }
+        0x03 => {
+            if buf.len() < 2 {
+                return Err(io_err("truncated domain socks address"));
+            }
+            let len = buf[1] as usize;
+            if buf.len() < 2 + len + 2 {
+                return Err(io_err("truncated domain socks address body"));
+            }
+            let host = std::str::from_utf8(&buf[2..2 + len])
+                .map_err(|_| io_err("invalid domain socks address"))?
+                .to_string();
+            let port = u16::from_be_bytes([buf[2 + len], buf[3 + len]]);
+            Ok((host, port, 2 + len + 2))
+        }
+        0x04 => {
+            if buf.len() < 1 + 16 + 2 {
+                return Err(io_err("truncated ipv6 socks address"));
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[1..17]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            Ok((ip.to_string(), port, 19))
+        }
+        _ => Err(io_err("unsupported socks address type")),
+    }
+}
+
+fn io_err(s: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, s)
 }

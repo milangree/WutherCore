@@ -81,8 +81,8 @@ impl AeadInst {
             AeadMethod::None => Ok(Self::None),
             AeadMethod::Aes128Gcm => {
                 let key = derive_epoch_key(base, epoch, "aes-128-gcm");
-                let cipher = Aes128Gcm::new_from_slice(&key[..16])
-                    .map_err(|_| io_err("aes128gcm key"))?;
+                let cipher =
+                    Aes128Gcm::new_from_slice(&key[..16]).map_err(|_| io_err("aes128gcm key"))?;
                 Ok(Self::Aes128(cipher))
             }
             AeadMethod::Chacha20Poly1305 => {
@@ -324,13 +324,12 @@ impl RecordCryptor {
             }
             cipher_buf.advance(2);
             let body = cipher_buf.split_to(body_len).to_vec();
-            let header: [u8; RECORD_HEADER_SIZE] = body[..RECORD_HEADER_SIZE]
-                .try_into()
-                .expect("header size");
+            let header: [u8; RECORD_HEADER_SIZE] =
+                body[..RECORD_HEADER_SIZE].try_into().expect("header size");
             let epoch = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             let seq = u64::from_be_bytes([
-                header[4], header[5], header[6], header[7],
-                header[8], header[9], header[10], header[11],
+                header[4], header[5], header[6], header[7], header[8], header[9], header[10],
+                header[11],
             ]);
 
             // 验证位置
@@ -351,11 +350,11 @@ impl RecordCryptor {
                 recv.aead = Some(aead);
                 recv.aead_epoch = epoch;
             }
-            let pt = recv
-                .aead
-                .as_ref()
-                .unwrap()
-                .open(&header, &header, &body[RECORD_HEADER_SIZE..])?;
+            let pt =
+                recv.aead
+                    .as_ref()
+                    .unwrap()
+                    .open(&header, &header, &body[RECORD_HEADER_SIZE..])?;
             recv.epoch = epoch;
             recv.seq = seq.wrapping_add(1);
             recv.initialized = true;
@@ -474,7 +473,9 @@ impl AsyncWrite for RecordStream {
         let mut written = 0;
         while written < frames.len() {
             match this.inner.as_mut().poll_write(cx, &frames[written..]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -501,7 +502,10 @@ mod tests {
     #[test]
     fn aead_method_parse() {
         assert_eq!(AeadMethod::parse("").unwrap(), AeadMethod::Chacha20Poly1305);
-        assert_eq!(AeadMethod::parse("aes-128-gcm").unwrap(), AeadMethod::Aes128Gcm);
+        assert_eq!(
+            AeadMethod::parse("aes-128-gcm").unwrap(),
+            AeadMethod::Aes128Gcm
+        );
         assert_eq!(AeadMethod::parse("none").unwrap(), AeadMethod::None);
         assert!(AeadMethod::parse("invalid").is_err());
     }

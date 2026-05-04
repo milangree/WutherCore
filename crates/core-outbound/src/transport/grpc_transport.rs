@@ -167,7 +167,7 @@ impl HyperBody for GrpcBody {
 struct GrpcStream {
     tx: mpsc::Sender<Vec<u8>>,
     rx_body: Incoming,
-    recv_buf: BytesMut, // 来自网络的原始 gRPC frame 字节
+    recv_buf: BytesMut,  // 来自网络的原始 gRPC frame 字节
     plain_buf: BytesMut, // 已解析的明文 payload
 }
 

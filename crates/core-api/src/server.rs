@@ -59,7 +59,7 @@ impl ApiServer {
         // 1. 路由
         let mut app = Router::new()
             .route("/", get(hello))           // mihomo `hello` —— dashboard 连通性探测
-            .route("/healthz", get(hello));    // 友好别名
+            .route("/healthz", get(hello)); // 友好别名
 
         app = app.nest("/v1", crate::native::router(state.clone()));
         if self.clash_compat {
@@ -195,10 +195,7 @@ async fn check_secret(
 
 /// Chrome PNA：`Access-Control-Allow-Private-Network: true`。
 /// 仅在 OPTIONS 预检上需要；其它响应也加上无害。
-async fn add_private_network_header(
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+async fn add_private_network_header(req: Request<axum::body::Body>, next: Next) -> Response {
     let mut resp = next.run(req).await;
     resp.headers_mut().insert(
         HeaderName::from_static("access-control-allow-private-network"),

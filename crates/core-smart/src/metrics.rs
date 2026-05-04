@@ -73,7 +73,10 @@ impl NodeStats {
         g.success = ewma(g.success, 1.0, 0.2);
         g.timeout_rate = ewma(g.timeout_rate, 0.0, 0.2);
         g.last_used = Some(Instant::now());
-        g.history.push_back(HistoryEntry { time_ms: now_ms, delay_ms: lat_ms });
+        g.history.push_back(HistoryEntry {
+            time_ms: now_ms,
+            delay_ms: lat_ms,
+        });
         while g.history.len() > HISTORY_CAP {
             g.history.pop_front();
         }
@@ -93,7 +96,10 @@ impl NodeStats {
         g.timeout_rate = ewma(g.timeout_rate, 1.0, 0.2);
         g.last_failure = Some(Instant::now());
         g.last_error = Some(r);
-        g.history.push_back(HistoryEntry { time_ms: now_ms, delay_ms: 0 });
+        g.history.push_back(HistoryEntry {
+            time_ms: now_ms,
+            delay_ms: 0,
+        });
         while g.history.len() > HISTORY_CAP {
             g.history.pop_front();
         }

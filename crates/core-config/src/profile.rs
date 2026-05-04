@@ -72,21 +72,31 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
     if cfg.resolver.is_none() {
         cfg.resolver = Some(Resolver {
             mode: match profile {
-                Profile::Server => ResolverMode::Secure,
-                _ => ResolverMode::Smart,
+                Profile::Server => ResolverMode::Normal,
+                _ => ResolverMode::Normal,
             },
             ..Resolver::default()
         });
     }
     let resolver = cfg.resolver.as_mut().unwrap();
     if resolver.servers.is_empty() {
+        // 与 mihomo 默认一致：IP-host DoH，SNI 默认 = host（rustls IpAddress 验证）。
         resolver
             .servers
-            .insert("ali".into(), "https://dns.alidns.com/dns-query".into());
+            .insert("ali".into(), "https://223.5.5.5/dns-query".into());
         resolver
             .servers
             .insert("cloudflare".into(), "https://1.1.1.1/dns-query".into());
-        resolver.servers.insert("local".into(), "system".into());
+    }
+    if resolver.nameserver.is_empty() {
+        if resolver.servers.contains_key("ali") {
+            resolver.nameserver.push("ali".into());
+        } else if let Some(first) = resolver.servers.keys().next().cloned() {
+            resolver.nameserver.push(first);
+        }
+    }
+    if resolver.fallback.is_empty() && resolver.servers.contains_key("cloudflare") {
+        resolver.fallback.push("cloudflare".into());
     }
 
     // capture
@@ -131,7 +141,7 @@ mod tests {
         assert_eq!(cfg.route.as_ref().unwrap().preset, "cn_smart");
         assert!(matches!(
             cfg.resolver.as_ref().unwrap().mode,
-            ResolverMode::Smart
+            ResolverMode::Normal
         ));
         assert!(cfg.smart.as_ref().unwrap().on);
     }

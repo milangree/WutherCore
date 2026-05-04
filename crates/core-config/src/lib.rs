@@ -11,14 +11,14 @@
 #![deny(rust_2018_idioms)]
 
 pub mod error;
+pub mod loader;
+pub mod migrate;
 pub mod model;
 pub mod node_uri;
 pub mod profile;
-pub mod loader;
-pub mod migrate;
 pub mod runtime_plan;
 
 pub use error::{ConfigError, ConfigErrorKind, ConfigResult};
-pub use loader::{load_from_str, load_from_path};
+pub use loader::{load_from_path, load_from_str};
 pub use model::*;
 pub use runtime_plan::RuntimePlan;

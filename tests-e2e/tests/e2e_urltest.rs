@@ -27,7 +27,9 @@ async fn spawn_204() -> u16 {
     let port = l.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
-            let Ok((mut s, _)) = l.accept().await else { return };
+            let Ok((mut s, _)) = l.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 let _ = s.read(&mut buf).await;
@@ -49,6 +51,7 @@ async fn urltest_direct_succeeds() {
         default_url: format!("http://127.0.0.1:{port}/generate_204"),
         default_timeout: Duration::from_secs(2),
         max_parallel: 8,
+        ..UrlTestConfig::default()
     });
     let ms = tester
         .test_node(&runtime, "DIRECT", None, None)
@@ -69,10 +72,9 @@ async fn urltest_unknown_node_yields_error() {
         default_url: format!("http://127.0.0.1:{port}/generate_204"),
         default_timeout: Duration::from_secs(2),
         max_parallel: 8,
+        ..UrlTestConfig::default()
     });
-    let r = tester
-        .test_node(&runtime, "ghost-node", None, None)
-        .await;
+    let r = tester.test_node(&runtime, "ghost-node", None, None).await;
     assert!(r.is_err());
 }
 
@@ -85,6 +87,7 @@ async fn urltest_test_many_concurrent() {
         default_url: format!("http://127.0.0.1:{port}/generate_204"),
         default_timeout: Duration::from_secs(2),
         max_parallel: 8,
+        ..UrlTestConfig::default()
     });
     let nodes = vec!["DIRECT".to_string(); 16];
     let res = tester.test_many(&runtime, &nodes, None, None).await;

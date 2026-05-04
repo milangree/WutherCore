@@ -1,6 +1,6 @@
 //! 多格式 → 统一 [`ClassicalEntry`] 列表 / 预编译 succinct 结构。
 //!
-//! 大部分文本格式（yaml / txt / sing-box JSON / RPKernel RRS）在解析后产出
+//! 大部分文本格式（yaml / txt / sing-box JSON / WutherCore RRS）在解析后产出
 //! 统一的 `Vec<ClassicalEntry>`，再交给 [`crate::matcher::RulesetMatcher::compile`]
 //! 编入 trie/regex/cidr 等实际索引。
 //!
@@ -15,11 +15,11 @@ use thiserror::Error;
 use crate::format::RulesetFormat;
 use crate::matcher::ClassicalEntry;
 
-pub mod yaml;
-pub mod txt;
-pub mod sb_json;
 pub mod binary;
 pub mod mrs;
+pub mod sb_json;
+pub mod txt;
+pub mod yaml;
 
 pub use mrs::MrsPayload;
 
@@ -47,7 +47,10 @@ pub enum RulesetCompiled {
 
 /// 旧 API：把所有格式都当成"文本→entries"。MRS 因为不可展开，会返回错误。
 /// 仍保留是为了让单元测试和 yaml/txt fast-path 兼容。
-pub fn parse_ruleset(format: RulesetFormat, body: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
+pub fn parse_ruleset(
+    format: RulesetFormat,
+    body: &[u8],
+) -> Result<Vec<ClassicalEntry>, ParseError> {
     match format {
         RulesetFormat::Yaml => yaml::parse(body),
         RulesetFormat::Text => txt::parse(body),

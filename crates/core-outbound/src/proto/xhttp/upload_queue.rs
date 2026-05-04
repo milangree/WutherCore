@@ -114,8 +114,16 @@ mod tests {
     #[test]
     fn push_pop_in_order() {
         let q = UploadQueue::new(16);
-        q.push(Packet { seq: 0, payload: b"hello ".to_vec() }).unwrap();
-        q.push(Packet { seq: 1, payload: b"world".to_vec() }).unwrap();
+        q.push(Packet {
+            seq: 0,
+            payload: b"hello ".to_vec(),
+        })
+        .unwrap();
+        q.push(Packet {
+            seq: 1,
+            payload: b"world".to_vec(),
+        })
+        .unwrap();
         let mut out = vec![0u8; 16];
         let n = q.read(&mut out).unwrap();
         assert_eq!(&out[..n], b"hello ");
@@ -126,9 +134,21 @@ mod tests {
     #[test]
     fn out_of_order_reassembly() {
         let q = UploadQueue::new(16);
-        q.push(Packet { seq: 2, payload: b"!".to_vec() }).unwrap();
-        q.push(Packet { seq: 0, payload: b"hi".to_vec() }).unwrap();
-        q.push(Packet { seq: 1, payload: b" there".to_vec() }).unwrap();
+        q.push(Packet {
+            seq: 2,
+            payload: b"!".to_vec(),
+        })
+        .unwrap();
+        q.push(Packet {
+            seq: 0,
+            payload: b"hi".to_vec(),
+        })
+        .unwrap();
+        q.push(Packet {
+            seq: 1,
+            payload: b" there".to_vec(),
+        })
+        .unwrap();
         let mut combined = Vec::new();
         let mut out = vec![0u8; 16];
         for _ in 0..3 {

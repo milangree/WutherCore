@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  RPKernel 一键多平台构建脚本（Windows 主机）。
+  WutherCore 一键多平台构建脚本（Windows 主机）。
 
 .DESCRIPTION
   在 Windows 11 上完成以下工作：

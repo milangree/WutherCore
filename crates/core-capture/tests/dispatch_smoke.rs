@@ -6,11 +6,14 @@ use std::time::Duration;
 use core_capture::eim_nat::EimNatTable;
 use core_capture::engine::CapturePlan;
 use core_capture::nat::NatTable;
+use core_capture::noop_ipset_provider;
 use core_capture::tun_dispatch::TunDispatcher;
 use core_config::model::{
     Capture, CaptureExclude, CaptureMethod, CaptureResolver, CaptureStack, CaptureTraffic,
     TunInboundOptions,
 };
+use core_resolver::fake_ip::FakeIpConfig;
+use core_resolver::{DnsService, FakeIpPool};
 
 fn capture() -> Capture {
     Capture {
@@ -34,5 +37,14 @@ fn dispatcher_constructs_with_smoltcp_stack() {
     let plan = CapturePlan::from_config(&capture()).unwrap();
     let nat = Arc::new(NatTable::default());
     let eim = Arc::new(EimNatTable::new(Duration::from_secs(60)));
-    let _disp = TunDispatcher::new(plan, nat, eim);
+    let fake_pool = Arc::new(FakeIpPool::new(FakeIpConfig::default()));
+    let dns_service = Arc::new(DnsService::fake_only(fake_pool.clone()));
+    let _disp = TunDispatcher::new(
+        plan,
+        nat,
+        eim,
+        fake_pool,
+        dns_service,
+        noop_ipset_provider(),
+    );
 }

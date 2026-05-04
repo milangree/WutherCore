@@ -44,7 +44,10 @@ pub async fn send_one(
     payload: &[u8],
 ) -> std::io::Result<Arc<UdpSocket>> {
     let outbound = if cfg.endpoint_independent_nat {
-        let key = EimKey { network: "udp", inner_src: src };
+        let key = EimKey {
+            network: "udp",
+            inner_src: src,
+        };
         let bind = match dst.ip() {
             IpAddr::V4(_) => "0.0.0.0:0",
             IpAddr::V6(_) => "[::]:0",
@@ -210,7 +213,8 @@ mod tests {
             L4::Udp(u) => assert_eq!(u.payload_len, b"answer".len()),
             _ => panic!("expected udp"),
         }
-        let payload = &buf[p.l4_payload_offset(&p.l4)..p.l4_payload_offset(&p.l4) + p.l4_payload_len(&p.l4)];
+        let payload =
+            &buf[p.l4_payload_offset(&p.l4)..p.l4_payload_offset(&p.l4) + p.l4_payload_len(&p.l4)];
         assert_eq!(payload, b"answer");
     }
 

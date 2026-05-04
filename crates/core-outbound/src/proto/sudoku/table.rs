@@ -39,11 +39,7 @@ impl Table {
         Self::new_with_custom(key, mode, "")
     }
 
-    pub fn new_with_custom(
-        key: &str,
-        mode: &str,
-        custom_pattern: &str,
-    ) -> Result<Self, String> {
+    pub fn new_with_custom(key: &str, mode: &str, custom_pattern: &str) -> Result<Self, String> {
         let layout = resolve_layout(mode, custom_pattern)?;
         let hint = table_hint_fingerprint(key, mode, custom_pattern, custom_pattern);
 
