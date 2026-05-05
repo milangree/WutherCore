@@ -237,6 +237,20 @@ impl ListenerHandler {
     }
 
     pub async fn dial_tcp(&self, metadata: &InboundMetadata) -> io::Result<DialResult> {
+        if metadata.is_inner {
+            // INNER 连接（resolver / ruleset fetcher / health-check 等内部 RPC）
+            // 一律 DIRECT。即便策略链里有 reject / 节点匹配也忽略 —— 内部流量被
+            // 代理劫持会触发引导循环（resolver 解析节点又要查 DNS，DNS 又被劫持）。
+            // 此分支只在 bind_outbound_socket 失败、流量被 TUN 重新捕获时才命中
+            // （正常路径根本不进 listener）。
+            return self
+                .runtime
+                .dial_direct_with_context(
+                    metadata.flow_context(),
+                    "inner-connection".to_string(),
+                )
+                .await;
+        }
         if metadata.force_direct {
             return self
                 .runtime
@@ -254,6 +268,13 @@ impl ListenerHandler {
     pub async fn dial_udp(&self, metadata: &InboundMetadata) -> io::Result<UdpDialResult> {
         let mut ctx = metadata.flow_context();
         ctx.network = NetworkKind::Udp;
+        if metadata.is_inner {
+            // 同 dial_tcp，UDP 内部流量也强制 DIRECT。
+            return self
+                .runtime
+                .dial_udp_direct_with_context(ctx, "inner-connection".to_string())
+                .await;
+        }
         if metadata.force_direct {
             return self
                 .runtime
