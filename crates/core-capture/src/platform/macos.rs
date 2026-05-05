@@ -108,26 +108,22 @@ impl CaptureEngine for MacUtun {
         if g.started {
             return Ok(());
         }
-        // 探物理默认网卡 ifindex —— 必须在 utun 创建之前。一旦 utun 起来并接管
-        // 默认路由，再探就拿到 utun 自己 → 出站 socket 反而绑回 TUN，形成死循环。
-        // 探到的 ifindex 写到 core-outbound 全局态，TCP/UDP 出站 socket 通过
-        // `bind_outbound_socket` 走 IP_BOUND_IF / IPV6_BOUND_IF 绑定到物理接口，
-        // darwin 内核选路时跳过 utun，让代理出站包真正走以太网/Wi-Fi。
-        let (v4_idx, v6_idx) = probe_default_interface_indices(&self.plan);
-        if v4_idx.is_some() || v6_idx.is_some() {
-            core_outbound::set_outbound_interface_index(v4_idx, v6_idx);
-            info!(
-                target: "capture::macos",
-                v4 = ?v4_idx,
-                v6 = ?v6_idx,
-                "physical outbound interface index probed for IP_BOUND_IF bind"
-            );
-        } else {
+        // 探物理默认网卡 (name + v4/v6 ifindex) —— 必须在 utun 创建之前。
+        // BSD route 表只允许一条 default：route add 0.0.0.0/0 -interface utunN
+        // 之后物理 default 会被替换，再探就拿到 utun 自己（被 exclude 后变空），
+        // 此时 net_monitor::submit() 的 is_empty() 短路确保不会把已存的物理
+        // ifindex 清零，让 IP_BOUND_IF 仍指向真实出口。
+        let exclude = crate::default_iface::ExcludeList::from_plan_iface(
+            self.plan.interface_name.clone(),
+        );
+        let snap = crate::default_iface::probe(&exclude);
+        if snap.is_empty() {
             warn!(
                 target: "capture::macos",
-                "default interface ifindex probe returned nothing — outbound dials may loop through utun"
+                "pre-utun default interface probe returned empty — outbound dials may loop through utun until net_monitor catches up"
             );
         }
+        crate::net_monitor::notify_network_changed_full(snap);
         let device: std::sync::Arc<dyn crate::tun_io::TunIo> = {
             #[cfg(target_os = "ios")]
             if let Some(fd) = crate::platform::ios_bridge::take_injected_fd() {
@@ -265,96 +261,3 @@ async fn packet_loop(
     }
 }
 
-/* ---------------- 默认物理接口 ifindex 探测 ---------------- */
-
-/// `route -n get [-inet6] default` 解析 + `if_nametoindex` —— BSD route 工具是
-/// macOS / iOS 上唯一稳健的查询入口（getifaddrs 没有"默认路由"概念）。
-///
-/// 必须在 utun 创建前调用，否则系统默认路由会切到 utun，结果就拿到自己。
-fn probe_default_interface_indices(plan: &CapturePlan) -> (Option<u32>, Option<u32>) {
-    let v4 = probe_default_interface_index_for("inet", &plan.interface_name);
-    let v6 = probe_default_interface_index_for("inet6", &plan.interface_name);
-    (v4, v6)
-}
-
-fn probe_default_interface_index_for(family: &str, our_iface: &str) -> Option<u32> {
-    let args: &[&str] = match family {
-        "inet6" => &["-n", "get", "-inet6", "default"],
-        _ => &["-n", "get", "default"],
-    };
-    let out = std::process::Command::new("route").args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let iface = parse_route_default_interface(&stdout)?;
-    // 已经创建过的旧 utun / lo0 不算物理出口，跳过。
-    if iface.is_empty()
-        || iface == our_iface
-        || iface == "lo0"
-        || iface.starts_with("utun")
-    {
-        return None;
-    }
-    nametoindex(iface)
-}
-
-/// 从 `route -n get default` 的输出里抓 `interface: <name>` 行的值。
-/// 抽出来便于在非 macOS 主机做单元测试。
-fn parse_route_default_interface(stdout: &str) -> Option<&str> {
-    stdout.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        trimmed
-            .strip_prefix("interface:")
-            .map(|rest| rest.trim())
-            .filter(|s| !s.is_empty())
-    })
-}
-
-fn nametoindex(name: &str) -> Option<u32> {
-    nix::net::if_::if_nametoindex(name)
-        .ok()
-        .filter(|&v| v != 0)
-        .map(|v| v as u32)
-}
-
-#[cfg(test)]
-mod ifindex_probe_tests {
-    use super::parse_route_default_interface;
-
-    #[test]
-    fn parses_typical_macos_route_output() {
-        let stdout = "   route to: default\n\
-                      destination: default\n\
-                             mask: default\n\
-                          gateway: 192.168.1.1\n\
-                        interface: en0\n\
-                            flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
-        assert_eq!(parse_route_default_interface(stdout), Some("en0"));
-    }
-
-    #[test]
-    fn parses_with_extra_whitespace_and_tabs() {
-        let stdout = "interface:\t  en7  \n";
-        assert_eq!(parse_route_default_interface(stdout), Some("en7"));
-    }
-
-    #[test]
-    fn returns_none_when_interface_line_missing() {
-        let stdout = "route to: default\nstatus: error\n";
-        assert_eq!(parse_route_default_interface(stdout), None);
-    }
-
-    #[test]
-    fn returns_none_for_empty_value() {
-        let stdout = "interface:   \n";
-        assert_eq!(parse_route_default_interface(stdout), None);
-    }
-
-    #[test]
-    fn picks_first_interface_line_when_multiple() {
-        // 异常情况：route 输出多段（不应发生但要兜底）。取第一段。
-        let stdout = "interface: en0\ninterface: en1\n";
-        assert_eq!(parse_route_default_interface(stdout), Some("en0"));
-    }
-}

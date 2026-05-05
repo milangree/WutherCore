@@ -141,28 +141,22 @@ impl CaptureEngine for WindowsTun {
         if g.started {
             return Ok(());
         }
-        // **关键**：在 TUN 创建之前先探物理默认网卡 ifindex —— 一旦 TUN 起来，
-        // 系统默认路由会切到 TUN（metric 最低），再探就拿到 TUN 自己 → 出站 socket
-        // 反而绑回 TUN 形成死循环。
-        //
-        // 探到的 ifindex 写到 core-outbound 全局态，TCP/UDP 出站 socket 通过
-        // `bind_outbound_socket` 走 IP_UNICAST_IF / IPV6_UNICAST_IF 强绑物理接口，
-        // 内核选路时跳过 TUN，让代理出站包真正走物理网卡。
-        let (v4_idx, v6_idx) = probe_default_interface_indices();
-        if v4_idx.is_some() || v6_idx.is_some() {
-            core_outbound::set_outbound_interface_index(v4_idx, v6_idx);
-            info!(
-                target: "capture::windows",
-                v4 = ?v4_idx,
-                v6 = ?v6_idx,
-                "physical outbound interface index probed for IP_UNICAST_IF bind"
-            );
-        } else {
+        // 在 TUN 创建之前先探物理默认网卡（name + v4/v6 ifindex）—— Windows
+        // 上 TUN 起来后默认路由仍可能与物理共存（metric 不同），但提前探一次
+        // 给 outbound 全局态注入一个明确的初值更稳妥；后续 net_monitor watcher
+        // 会持续追踪变化。submit() 内部会同时刷新 set_outbound_interface 和
+        // set_outbound_interface_index。
+        let exclude = crate::default_iface::ExcludeList::from_plan_iface(
+            self.plan.interface_name.clone(),
+        );
+        let snap = crate::default_iface::probe(&exclude);
+        if snap.is_empty() {
             warn!(
                 target: "capture::windows",
-                "default interface ifindex probe returned nothing — outbound dials may loop through TUN"
+                "pre-TUN default interface probe returned empty — outbound dials may loop through TUN until net_monitor catches up"
             );
         }
+        crate::net_monitor::notify_network_changed_full(snap);
         Self::configure(&self.plan)?;
         // hijack_dns：保存当前所有接口的 DNS，统一切到 127.0.0.1（fake-dns 监听）。
         if self.plan.hijack_dns {
@@ -251,44 +245,6 @@ impl CaptureEngine for WindowsTun {
         info!(target: "capture", iface = %self.plan.interface_name, "windows tun stopped");
         Ok(())
     }
-}
-
-/* ---------------- 默认物理接口 ifindex 探测 ---------------- */
-
-/// 通过 `Get-NetRoute` 找出 metric 最低的 0.0.0.0/0 / ::/0 路由，再用
-/// `Get-NetIPInterface` 把 InterfaceAlias 转成 InterfaceIndex。
-///
-/// PowerShell 解析比 `route print` 解析稳健（后者有本地化、列宽可变等问题），
-/// 同时沿用 Windows 已经为我们做好的"按 metric 排序"逻辑。
-fn probe_default_interface_indices() -> (Option<u32>, Option<u32>) {
-    let v4 = probe_default_interface_index_for("IPv4");
-    let v6 = probe_default_interface_index_for("IPv6");
-    (v4, v6)
-}
-
-fn probe_default_interface_index_for(family: &str) -> Option<u32> {
-    let prefix = if family == "IPv6" { "::/0" } else { "0.0.0.0/0" };
-    // 单行脚本 —— 拿 metric 最低的默认路由的 InterfaceIndex；缺省时输出空。
-    let script = format!(
-        "$r = Get-NetRoute -AddressFamily {family} -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue \
-         | Where-Object {{ $_.NextHop -ne '::' -and $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -notmatch '^(WutherCore|Meta|tun|wintun)' }} \
-         | Sort-Object -Property RouteMetric \
-         | Select-Object -First 1; \
-         if ($r) {{ $r.InterfaceIndex }}"
-    );
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<u32>().ok().filter(|&v| v != 0)
 }
 
 /* ---------------- DNS hijack helpers ---------------- */

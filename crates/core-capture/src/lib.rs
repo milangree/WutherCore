@@ -21,6 +21,7 @@
 
 pub mod android_caps;
 pub mod android_vpn_config;
+pub mod default_iface;
 pub mod dial_meta;
 pub mod doctor;
 pub mod eim_nat;

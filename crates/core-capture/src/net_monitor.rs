@@ -1,26 +1,42 @@
-//! Network interface change monitor — detects physical NIC state changes
-//! and triggers outbound socket rebinding + DNS connection reset.
+//! 默认物理网卡变化监听 + 自动重新绑定。
 //!
-//! ## Detection
+//! ## 探测层 vs 监听层
+//! * 探测层 [`crate::default_iface::probe`] —— 跨平台单次拉取当前默认出口
+//!   `(name, v4_index, v6_index)`。
+//! * 监听层（本模块）—— 周期/事件触发探测，对比上次结果，发生变化时：
+//!   1. 把新的 name 写进 [`core_outbound::set_outbound_interface`]
+//!      （Linux/Android `SO_BINDTODEVICE` 名字绑定）
+//!   2. 把新的 v4/v6 ifindex 写进 [`core_outbound::set_outbound_interface_index`]
+//!      （Windows `IP_UNICAST_IF`、Darwin `IP_BOUND_IF`）
+//!   3. 广播 [`NetworkChangeEvent`]，supervisor 拿来重置 DNS 持久连接 + 缓存
 //!
-//! - **Linux/Android root TUN**: polls `/proc/net/route` for default route changes.
-//!   Uses `/sys/class/net/<iface>/operstate` for link up/down detection.
-//! - **Android VpnService**: Java app calls `notifyNetworkChanged()` via JNI
-//!   from `ConnectivityManager.NetworkCallback`.
-//! - **Manual**: any code can call `notify_network_changed()`.
+//! ## 触发源
+//! * 跨平台 polling watcher：每 [`POLL_INTERVAL`] 重新探测，对比变化。低开销
+//!   兜底，所有平台可用。
+//! * Linux/Android：netlink RTMGRP_IPV4_ROUTE / RTMGRP_LINK 订阅（事件驱动，
+//!   后续迭代）。
+//! * Windows：`NotifyRouteChange2` + `NotifyIpInterfaceChange` 回调（事件驱动，
+//!   后续迭代）。
+//! * Android VpnService：上层 `ConnectivityManager.NetworkCallback` 经 JNI
+//!   调 [`notify_network_changed_full`] / [`notify_network_changed`]。
+//! * 任意手动触发：[`notify_network_changed`] 兼容旧调用。
 //!
-//! ## Actions on network change
-//!
-//! 1. `core_outbound::set_outbound_interface(new_iface)` — new sockets `SO_BINDTODEVICE`.
-//! 2. Broadcast `NetworkChangeEvent` — supervisor calls `resolver.reset_connections()`
-//!    which tears down DoT pools + DoQ sessions, clears DNS cache.
-//! 3. Next outbound connection automatically binds to the new physical interface.
+//! ## 排除 TUN
+//! 探测时通过 [`crate::default_iface::ExcludeList`] 把 plan.interface_name +
+//! `utun*` / `tun*` / `wintun*` / `WutherCore` / `Meta` 一律剔除，
+//! 避免 TUN 抢了默认路由后再探拿到自己 → 自循环。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+
+use crate::default_iface::{probe, DefaultInterface, ExcludeList};
+
+/// 跨平台 polling 间隔。事件驱动 watcher 会更快，但 polling 是兜底。
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 static MONITOR: once_cell::sync::Lazy<NetworkMonitor> =
     once_cell::sync::Lazy::new(NetworkMonitor::new);
@@ -28,13 +44,19 @@ static MONITOR: once_cell::sync::Lazy<NetworkMonitor> =
 pub struct NetworkMonitor {
     generation: AtomicU64,
     tx: broadcast::Sender<NetworkChangeEvent>,
-    default_interface: RwLock<Option<String>>,
+    last: RwLock<DefaultInterface>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkChangeEvent {
     pub generation: u64,
-    pub new_interface: Option<String>,
+    pub interface: DefaultInterface,
+}
+
+impl NetworkChangeEvent {
+    pub fn new_interface(&self) -> Option<&str> {
+        self.interface.name.as_deref()
+    }
 }
 
 impl NetworkMonitor {
@@ -43,29 +65,57 @@ impl NetworkMonitor {
         Self {
             generation: AtomicU64::new(0),
             tx,
-            default_interface: RwLock::new(None),
+            last: RwLock::new(DefaultInterface::default()),
         }
     }
 
-    pub fn notify_changed(&self, new_interface: Option<String>) {
-        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        *self.default_interface.write() = new_interface.clone();
-        info!(
-            target: "capture::net_monitor",
-            generation = gen,
-            interface = ?new_interface,
-            "network interface changed — rebinding outbound"
-        );
-
-        // Rebind all future outbound sockets to the new interface
-        core_outbound::set_outbound_interface(new_interface.clone());
-
-        // Broadcast to listeners (DNS reset, connection teardown)
-        let event = NetworkChangeEvent {
-            generation: gen,
-            new_interface,
+    /// 接收当前最新的探测结果，与上次对比；若有差异则同步全局态 + 广播事件。
+    /// 返回 `true` 表示发生了变化（被广播）。
+    ///
+    /// 一种特殊情况：`current.is_empty()`（探测不到任何默认接口）时，依然
+    /// 更新内部 last 缓存 + 广播事件，但 **不** 覆盖 `core_outbound` 的全局
+    /// 接口状态。常见触发场景是 macOS / BSD 的 utun 在 `route add 0.0.0.0/0
+    /// -interface utunN` 后吃掉了物理默认路由，watcher 排除 TUN 后探到空 ——
+    /// 这时把物理 ifindex 置 0 反而让出站 socket fall back 到系统默认（即
+    /// TUN）形成自循环。保留 last-known-good 让现有 socket 继续可用，等用户
+    /// 切回有效物理网络后再覆盖。
+    pub fn submit(&self, current: DefaultInterface) -> bool {
+        let changed = {
+            let last = self.last.read();
+            *last != current
         };
-        let _ = self.tx.send(event);
+        if !changed {
+            return false;
+        }
+        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.last.write() = current.clone();
+        if current.is_empty() {
+            warn!(
+                target: "capture::net_monitor",
+                generation = gen,
+                "no default interface detected — keeping last known outbound bind"
+            );
+        } else {
+            info!(
+                target: "capture::net_monitor",
+                generation = gen,
+                interface = ?current.name,
+                v4_index = ?current.v4_index,
+                v6_index = ?current.v6_index,
+                "default interface changed — rebinding outbound (name + ifindex)"
+            );
+            // (1) name —— Linux/Android SO_BINDTODEVICE
+            core_outbound::set_outbound_interface(current.name.clone());
+            // (2) ifindex —— Windows IP_UNICAST_IF / Darwin IP_BOUND_IF
+            core_outbound::set_outbound_interface_index(current.v4_index, current.v6_index);
+        }
+        // 广播 —— supervisor 收到后 reset DNS 持久连接 + 缓存。即便 current
+        // 为空也广播，让订阅方知道发生了变化（例如把 DNS 置空闲态）。
+        let _ = self.tx.send(NetworkChangeEvent {
+            generation: gen,
+            interface: current,
+        });
+        true
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<NetworkChangeEvent> {
@@ -76,18 +126,12 @@ impl NetworkMonitor {
         self.generation.load(Ordering::Relaxed)
     }
 
-    pub fn default_interface(&self) -> Option<String> {
-        self.default_interface.read().clone()
+    pub fn current(&self) -> DefaultInterface {
+        self.last.read().clone()
     }
 
-    pub fn set_default_interface(&self, iface: Option<String>) {
-        let changed = {
-            let current = self.default_interface.read();
-            *current != iface
-        };
-        if changed {
-            self.notify_changed(iface);
-        }
+    pub fn default_interface(&self) -> Option<String> {
+        self.last.read().name.clone()
     }
 }
 
@@ -95,110 +139,114 @@ pub fn global() -> &'static NetworkMonitor {
     &MONITOR
 }
 
-pub fn notify_network_changed(new_interface: Option<String>) {
-    global().set_default_interface(new_interface);
-}
-
 pub fn subscribe() -> broadcast::Receiver<NetworkChangeEvent> {
     global().subscribe()
 }
 
-/// Start the platform-native network interface watcher.
-/// Linux/Android: polls /proc/net/route every 2s for default route changes.
-pub fn start_watcher() {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        tokio::spawn(route_poll_watcher());
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        debug!(target: "capture::net_monitor", "no native network watcher on this platform");
-    }
+/// 上层（如 Android JNI ConnectivityManager.NetworkCallback）拿到新接口名后
+/// 调本入口；本模块自动跑一次完整探测，把 ifindex 一起更新。
+pub fn notify_network_changed(_iface_hint: Option<String>) {
+    // 即便上层只给了名字，我们也走完整 probe —— 顺便把 ifindex 校准。exclude
+    // 在这条路径上拿不到 plan.interface_name（jni 直接调），用空 exclude，
+    // 反正上层自己调本接口就意味着系统层确实切了，不会拿到 TUN。
+    let exclude = ExcludeList {
+        names: Default::default(),
+        prefixes: vec![
+            "utun".into(),
+            "tun".into(),
+            "tap".into(),
+            "wintun".into(),
+            "wuthercore".into(),
+            "meta".into(),
+        ],
+    };
+    let cur = probe(&exclude);
+    global().submit(cur);
 }
 
-// ──── Linux/Android: poll /proc/net/route ────
+/// 上层完整提交 (name, v4, v6) —— 用于 JNI 等已经拿到全部信息的场景，
+/// 跳过本地探测。
+pub fn notify_network_changed_full(snapshot: DefaultInterface) {
+    global().submit(snapshot);
+}
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-async fn route_poll_watcher() {
-    use std::time::Duration;
+/// 启动跨平台 polling watcher。`exclude` 通常由 supervisor 传入：
+/// 至少包含 plan.interface_name，本函数会再叠加常见 TUN 前缀。
+pub fn start_watcher(exclude: ExcludeList) {
+    tokio::spawn(poll_watcher(exclude));
+}
 
-    let mut last_iface = detect_default_interface();
-
-    // Set initial interface
-    if let Some(ref iface) = last_iface {
-        debug!(target: "capture::net_monitor", interface = %iface, "initial default interface");
-        core_outbound::set_outbound_interface(Some(iface.clone()));
-        *global().default_interface.write() = Some(iface.clone());
+async fn poll_watcher(exclude: ExcludeList) {
+    // 立即跑一次拉初值 + 同步全局态。
+    let initial = probe(&exclude);
+    if !initial.is_empty() {
+        info!(
+            target: "capture::net_monitor",
+            interface = ?initial.name,
+            v4_index = ?initial.v4_index,
+            v6_index = ?initial.v6_index,
+            "initial default interface"
+        );
+        global().submit(initial);
+    } else {
+        debug!(target: "capture::net_monitor", "initial probe returned empty");
     }
 
-    info!(target: "capture::net_monitor", "route poll watcher started (2s interval)");
+    info!(
+        target: "capture::net_monitor",
+        interval_ms = POLL_INTERVAL.as_millis() as u64,
+        "default-interface poll watcher started"
+    );
 
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
-
-        let current_iface = detect_default_interface();
-        if current_iface != last_iface {
-            info!(
-                target: "capture::net_monitor",
-                old = ?last_iface,
-                new = ?current_iface,
-                "default route interface changed"
-            );
-            last_iface = current_iface.clone();
-            global().notify_changed(current_iface);
-        }
-
-        // Also check link operstate for the current interface
-        if let Some(ref iface) = last_iface {
-            if !is_interface_up(iface) {
-                debug!(
-                    target: "capture::net_monitor",
-                    interface = %iface,
-                    "interface link down, waiting for new default route"
-                );
-            }
-        }
+        tick.tick().await;
+        let cur = probe(&exclude);
+        global().submit(cur);
     }
 }
 
-/// Read /proc/net/route to find the default route interface.
-/// Default route = destination 00000000, mask 00000000.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn detect_default_interface() -> Option<String> {
-    let content = std::fs::read_to_string("/proc/net/route").ok()?;
-    // Find lowest-metric default route
-    let mut best: Option<(String, u32)> = None;
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 11 {
-            continue;
-        }
-        let destination = fields[1];
-        let mask = fields[7];
-        if destination == "00000000" && mask == "00000000" {
-            let iface = fields[0].to_string();
-            let metric = fields[6].parse::<u32>().unwrap_or(u32::MAX);
-            match &best {
-                Some((_, m)) if metric < *m => best = Some((iface, metric)),
-                None => best = Some((iface, metric)),
-                _ => {}
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_iface(name: &str, v4: u32, v6: u32) -> DefaultInterface {
+        DefaultInterface {
+            name: Some(name.into()),
+            v4_index: Some(v4),
+            v6_index: Some(v6),
         }
     }
-    best.map(|(iface, _)| iface)
-}
 
-/// Check if an interface is operationally up via /sys/class/net/<iface>/operstate.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn is_interface_up(iface: &str) -> bool {
-    let path = format!("/sys/class/net/{iface}/operstate");
-    std::fs::read_to_string(path)
-        .map(|s| {
-            let state = s.trim();
-            state == "up" || state == "unknown"
-        })
-        .unwrap_or(false)
+    #[test]
+    fn submit_returns_false_when_unchanged() {
+        let m = NetworkMonitor::new();
+        let snap = fresh_iface("eth0", 2, 2);
+        assert!(m.submit(snap.clone()));
+        assert!(!m.submit(snap));
+    }
+
+    #[test]
+    fn submit_increments_generation_on_change() {
+        let m = NetworkMonitor::new();
+        assert_eq!(m.generation(), 0);
+        m.submit(fresh_iface("a", 1, 1));
+        assert_eq!(m.generation(), 1);
+        m.submit(fresh_iface("b", 2, 2));
+        assert_eq!(m.generation(), 2);
+        m.submit(fresh_iface("b", 2, 2)); // unchanged
+        assert_eq!(m.generation(), 2);
+    }
+
+    #[test]
+    fn submit_broadcasts_event_on_change() {
+        let m = NetworkMonitor::new();
+        let mut rx = m.subscribe();
+        m.submit(fresh_iface("eth0", 3, 3));
+        let evt = rx.try_recv().expect("event must fire");
+        assert_eq!(evt.generation, 1);
+        assert_eq!(evt.new_interface(), Some("eth0"));
+        assert_eq!(evt.interface.v4_index, Some(3));
+    }
 }

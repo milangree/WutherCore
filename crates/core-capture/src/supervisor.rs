@@ -337,18 +337,24 @@ impl CaptureSupervisor {
                     info!(
                         target: "capture::net_monitor",
                         generation = event.generation,
-                        interface = ?event.new_interface,
+                        interface = ?event.interface.name,
+                        v4_index = ?event.interface.v4_index,
+                        v6_index = ?event.interface.v6_index,
                         "network changed: resetting DNS connections + clearing cache"
                     );
                     // Tear down all persistent DNS connections (DoT pool, DoQ)
-                    // so they reconnect with SO_BINDTODEVICE on the new interface.
+                    // so they reconnect with SO_BINDTODEVICE / IP_UNICAST_IF /
+                    // IP_BOUND_IF 走新的物理接口。
                     resolver.reset_connections().await;
                 }
             });
         }
 
-        // Start platform-native netlink watcher (Linux/Android root TUN mode)
-        crate::net_monitor::start_watcher();
+        // 启动跨平台默认网卡监听 watcher —— 把 plan.interface_name + 常见
+        // TUN 前缀作为 exclude，防止 TUN 抢默认路由后被自己探到。
+        let exclude =
+            crate::default_iface::ExcludeList::from_plan_iface(self.plan.interface_name.clone());
+        crate::net_monitor::start_watcher(exclude);
 
         info!(
             target: "capture",
