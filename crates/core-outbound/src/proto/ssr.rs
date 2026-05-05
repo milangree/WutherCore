@@ -49,7 +49,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 use crate::proto::addr::encode_socks_addr;
-use crate::transport::{tcp::TcpTransport, Transport};
+use crate::transport::{Transport, tcp::TcpTransport};
 
 type HmacMd5 = Hmac<Md5>;
 type HmacSha1 = Hmac<Sha1>;
@@ -302,7 +302,7 @@ fn build_obfs_prefix(obfs: &SsrObfs, _iv: &[u8]) -> Vec<u8> {
             let host_bytes = host.as_bytes();
             let sni_inner_len = (host_bytes.len() + 5) as u16;
             exts.extend_from_slice(&sni_inner_len.to_be_bytes()); // ext data length
-                                                                  // SNI inner: list_len(2) + entry_type(1) + name_len(2) + name
+            // SNI inner: list_len(2) + entry_type(1) + name_len(2) + name
             exts.extend_from_slice(&((host_bytes.len() + 3) as u16).to_be_bytes());
             exts.push(0x00);
             exts.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
@@ -622,7 +622,7 @@ impl AsyncWrite for SsrStream {
         while written < buf.len() {
             match this.inner.as_mut().poll_write(cx, &buf[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

@@ -21,8 +21,8 @@ pub mod manager;
 pub mod parser;
 pub mod userinfo;
 
-pub use cache::{url_digest, FeedDiskCache, FeedMeta};
-pub use fetcher::{fetch_feed, FetchError, FetchResult};
+pub use cache::{FeedDiskCache, FeedMeta, url_digest};
+pub use fetcher::{FetchError, FetchResult, fetch_feed};
 pub use manager::{FeedManager, FeedSink, FeedStatus, FeedUpdate};
-pub use parser::{apply_filter_rename, parse_feed_payload, FormatHint};
+pub use parser::{FormatHint, apply_filter_rename, parse_feed_payload};
 pub use userinfo::SubscriptionUserinfo;

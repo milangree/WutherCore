@@ -21,15 +21,15 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use core_config::model::{
     FakeMode, Resolver as ResolverCfg, ResolverFallbackFilter as ResolverFallbackFilterCfg,
     ResolverMode,
 };
-use core_store::{store::BatchOp, AsyncWriter, Store};
+use core_store::{AsyncWriter, Store, store::BatchOp};
 use hickory_resolver::proto::rr::{Record, RecordType};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -38,8 +38,8 @@ use crate::cache::{CacheConfig, DnsCache, Hit, QType};
 use crate::fake_ip::{AddressFamily, FakeIpPool};
 use crate::group::{DnsGroup, GroupStrategy};
 use crate::policy::{
-    matches, parse_rule_value, DnsAction, EvalContext, HostMatch, PolicyEngine, QueryOptions,
-    RejectMethod,
+    DnsAction, EvalContext, HostMatch, PolicyEngine, QueryOptions, RejectMethod, matches,
+    parse_rule_value,
 };
 use crate::upstream::DnsError;
 
@@ -668,10 +668,7 @@ impl Resolver {
         self.resolve_dual_with_timeout(host).await
     }
 
-    async fn resolve_dual_with_timeout(
-        &self,
-        host: &str,
-    ) -> Result<Vec<IpAddr>, ResolveError> {
+    async fn resolve_dual_with_timeout(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
         let host_owned = host.to_string();
         let self_clone = self.clone();
         let ipv6_handle = tokio::spawn({
@@ -866,7 +863,12 @@ impl Resolver {
                     if let Some(filter) = &self.fake_filter {
                         if filter.should_skip(host_lc) {
                             return self
-                                .lookup_via_qtype(host_lc, "default", &QueryOptions::default(), qtype)
+                                .lookup_via_qtype(
+                                    host_lc,
+                                    "default",
+                                    &QueryOptions::default(),
+                                    qtype,
+                                )
                                 .await;
                         }
                     }
@@ -1884,19 +1886,25 @@ fn configured_upstream(
         // - host 是域名 → 用域名做 SNI，按域名验证 cert。
         // 用户可通过 `?sni=...` 或 `#sni=...` 显式覆盖。
         let (host, port, sni) = parse_server_endpoint(spec, "https://", 443)?;
-        let sni_name = sni.filter(|s| !s.is_empty()).unwrap_or_else(|| host.clone());
+        let sni_name = sni
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.clone());
         let params = extract_upstream_params(spec);
         let upstream: Arc<dyn crate::upstream::DnsUpstream> = Arc::new(
             crate::upstream::hickory::HickoryUpstream::doh(name, &host, port, Some(sni_name))
                 .map_err(|e| e.to_string())?,
         );
-        return Ok(crate::upstream::FilteredUpstream::wrap_if_needed(upstream, &params));
+        return Ok(crate::upstream::FilteredUpstream::wrap_if_needed(
+            upstream, &params,
+        ));
     }
     if lower.starts_with("tls://") {
         // DoT: SNI 默认 host（IP 走 IP-SAN cert，域名走 DnsName）。
         let (host, port, sni) = parse_server_endpoint(spec, "tls://", 853)?;
         let addr = resolve_host_to_socket(&host, port, "DoT")?;
-        let sni_name = sni.filter(|s| !s.is_empty()).unwrap_or_else(|| host.clone());
+        let sni_name = sni
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.clone());
         let params = extract_upstream_params(spec);
         let upstream: Arc<dyn crate::upstream::DnsUpstream> = if params.disable_reuse {
             Arc::new(crate::upstream::marked::MarkedTcpDnsUpstream::dot_no_pool(
@@ -1907,18 +1915,28 @@ fn configured_upstream(
                 name, addr, sni_name,
             ))
         };
-        return Ok(crate::upstream::FilteredUpstream::wrap_if_needed(upstream, &params));
+        return Ok(crate::upstream::FilteredUpstream::wrap_if_needed(
+            upstream, &params,
+        ));
     }
     if lower.starts_with("quic://") {
         // DoQ: SNI 默认 host。
         let (host, port, sni) = parse_server_endpoint(spec, "quic://", 853)?;
         let addr = resolve_host_to_socket(&host, port, "DoQ")?;
-        let sni_name = sni.filter(|s| !s.is_empty()).unwrap_or_else(|| host.clone());
+        let sni_name = sni
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.clone());
         let params = extract_upstream_params(spec);
-        let upstream: Arc<dyn crate::upstream::DnsUpstream> = Arc::new(
-            crate::upstream::quic::QuicDnsUpstream::new(name, addr, sni_name, params.skip_cert_verify),
-        );
-        return Ok(crate::upstream::FilteredUpstream::wrap_if_needed(upstream, &params));
+        let upstream: Arc<dyn crate::upstream::DnsUpstream> =
+            Arc::new(crate::upstream::quic::QuicDnsUpstream::new(
+                name,
+                addr,
+                sni_name,
+                params.skip_cert_verify,
+            ));
+        return Ok(crate::upstream::FilteredUpstream::wrap_if_needed(
+            upstream, &params,
+        ));
     }
     if lower.starts_with("udp://") {
         let (host, port, _) = parse_server_endpoint(spec, "udp://", 53)?;
@@ -1945,12 +1963,10 @@ fn configured_upstream(
     let ip: IpAddr = spec
         .parse()
         .map_err(|_| format!("unsupported resolver server: {spec}"))?;
-    Ok(
-        Arc::new(crate::upstream::marked::MarkedDnsUpstream::new(
-            name,
-            SocketAddr::new(ip, 53),
-        )) as Arc<dyn crate::upstream::DnsUpstream>,
-    )
+    Ok(Arc::new(crate::upstream::marked::MarkedDnsUpstream::new(
+        name,
+        SocketAddr::new(ip, 53),
+    )) as Arc<dyn crate::upstream::DnsUpstream>)
 }
 
 fn parse_server_endpoint(

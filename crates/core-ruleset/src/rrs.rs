@@ -633,14 +633,17 @@ mod tests {
         let json = entries_to_singbox_json(&out);
         // 用 sing-box parser 反解
         let back = crate::parser::sb_json::parse(json.as_bytes()).unwrap();
-        assert!(back
-            .iter()
-            .any(|e| e.kind == ClassicalKind::DomainSuffix && e.value == "example.com"));
-        assert!(back
-            .iter()
-            .any(|e| e.kind == ClassicalKind::DstPort && e.value == "443"));
-        assert!(back
-            .iter()
-            .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000"));
+        assert!(
+            back.iter()
+                .any(|e| e.kind == ClassicalKind::DomainSuffix && e.value == "example.com")
+        );
+        assert!(
+            back.iter()
+                .any(|e| e.kind == ClassicalKind::DstPort && e.value == "443")
+        );
+        assert!(
+            back.iter()
+                .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000")
+        );
     }
 }

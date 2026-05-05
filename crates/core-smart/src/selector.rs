@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use core_config::model::{SmartGoal, SmartSticky};
 use core_store::{
+    AsyncWriter, Store,
     blobs::{DomainBestBlob, NegativeBlob},
     schema::{SMART_DOMAIN_BEST, SMART_NEGATIVE, SMART_NODE_STATS, SMART_PIN},
     store::BatchOp,
-    AsyncWriter, Store,
 };
 use dashmap::DashMap;
 use parking_lot::RwLock;

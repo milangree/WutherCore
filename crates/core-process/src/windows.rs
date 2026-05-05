@@ -16,7 +16,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
     MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
@@ -24,9 +26,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows_sys::Win32::System::ProcessStatus::GetProcessImageFileNameW;
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use crate::{NetworkProto, ProcessFinder, ProcessInfo};
 
@@ -54,11 +54,7 @@ impl ProcessFinder for WindowsFinder {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Some(ProcessInfo {
-            name,
-            path,
-            uid: 0,
-        })
+        Some(ProcessInfo { name, path, uid: 0 })
     }
 }
 
@@ -97,21 +93,12 @@ fn row_port_eq(dw_port: u32, want: u16) -> bool {
 fn find_tcp_pid_v4(addr: Ipv4Addr, port: u16) -> Option<u32> {
     unsafe {
         let buf = fetch_table(AF_INET as i32, |ptr, size, fam| {
-            GetExtendedTcpTable(
-                ptr,
-                size,
-                0,
-                fam as u32,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
+            GetExtendedTcpTable(ptr, size, 0, fam as u32, TCP_TABLE_OWNER_PID_ALL, 0)
         })?;
         let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
         let count = table.dwNumEntries as usize;
-        let rows = std::slice::from_raw_parts(
-            table.table.as_ptr() as *const MIB_TCPROW_OWNER_PID,
-            count,
-        );
+        let rows =
+            std::slice::from_raw_parts(table.table.as_ptr() as *const MIB_TCPROW_OWNER_PID, count);
         let target_addr = u32::from(addr).to_be();
         for row in rows {
             if row.dwLocalAddr == target_addr && row_port_eq(row.dwLocalPort, port) {
@@ -130,21 +117,12 @@ fn find_tcp_pid_v4(addr: Ipv4Addr, port: u16) -> Option<u32> {
 fn find_tcp_pid_v6(addr: Ipv6Addr, port: u16) -> Option<u32> {
     unsafe {
         let buf = fetch_table(AF_INET6 as i32, |ptr, size, fam| {
-            GetExtendedTcpTable(
-                ptr,
-                size,
-                0,
-                fam as u32,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
+            GetExtendedTcpTable(ptr, size, 0, fam as u32, TCP_TABLE_OWNER_PID_ALL, 0)
         })?;
         let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
         let count = table.dwNumEntries as usize;
-        let rows = std::slice::from_raw_parts(
-            table.table.as_ptr() as *const MIB_TCP6ROW_OWNER_PID,
-            count,
-        );
+        let rows =
+            std::slice::from_raw_parts(table.table.as_ptr() as *const MIB_TCP6ROW_OWNER_PID, count);
         let target_octets = addr.octets();
         for row in rows {
             if row.ucLocalAddr == target_octets && row_port_eq(row.dwLocalPort, port) {
@@ -163,21 +141,12 @@ fn find_tcp_pid_v6(addr: Ipv6Addr, port: u16) -> Option<u32> {
 fn find_udp_pid_v4(addr: Ipv4Addr, port: u16) -> Option<u32> {
     unsafe {
         let buf = fetch_table(AF_INET as i32, |ptr, size, fam| {
-            GetExtendedUdpTable(
-                ptr,
-                size,
-                0,
-                fam as u32,
-                UDP_TABLE_OWNER_PID,
-                0,
-            )
+            GetExtendedUdpTable(ptr, size, 0, fam as u32, UDP_TABLE_OWNER_PID, 0)
         })?;
         let table = &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
         let count = table.dwNumEntries as usize;
-        let rows = std::slice::from_raw_parts(
-            table.table.as_ptr() as *const MIB_UDPROW_OWNER_PID,
-            count,
-        );
+        let rows =
+            std::slice::from_raw_parts(table.table.as_ptr() as *const MIB_UDPROW_OWNER_PID, count);
         let target_addr = u32::from(addr).to_be();
         for row in rows {
             if row.dwLocalAddr == target_addr && row_port_eq(row.dwLocalPort, port) {
@@ -196,21 +165,12 @@ fn find_udp_pid_v4(addr: Ipv4Addr, port: u16) -> Option<u32> {
 fn find_udp_pid_v6(addr: Ipv6Addr, port: u16) -> Option<u32> {
     unsafe {
         let buf = fetch_table(AF_INET6 as i32, |ptr, size, fam| {
-            GetExtendedUdpTable(
-                ptr,
-                size,
-                0,
-                fam as u32,
-                UDP_TABLE_OWNER_PID,
-                0,
-            )
+            GetExtendedUdpTable(ptr, size, 0, fam as u32, UDP_TABLE_OWNER_PID, 0)
         })?;
         let table = &*(buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID);
         let count = table.dwNumEntries as usize;
-        let rows = std::slice::from_raw_parts(
-            table.table.as_ptr() as *const MIB_UDP6ROW_OWNER_PID,
-            count,
-        );
+        let rows =
+            std::slice::from_raw_parts(table.table.as_ptr() as *const MIB_UDP6ROW_OWNER_PID, count);
         let target_octets = addr.octets();
         for row in rows {
             if row.ucLocalAddr == target_octets && row_port_eq(row.dwLocalPort, port) {

@@ -153,16 +153,34 @@ pub(crate) fn format_session_line(
         outbound.to_string()
     };
     if rule.is_empty() {
-        format!("[{}] {} --> {}:{} using {}", network.to_uppercase(), src_label, host, port, proxy)
+        format!(
+            "[{}] {} --> {}:{} using {}",
+            network.to_uppercase(),
+            src_label,
+            host,
+            port,
+            proxy
+        )
     } else if rule_payload.is_empty() {
         format!(
             "[{}] {} --> {}:{} match {} using {}",
-            network.to_uppercase(), src_label, host, port, rule, proxy
+            network.to_uppercase(),
+            src_label,
+            host,
+            port,
+            rule,
+            proxy
         )
     } else {
         format!(
             "[{}] {} --> {}:{} match {}({}) using {}",
-            network.to_uppercase(), src_label, host, port, rule, rule_payload, proxy
+            network.to_uppercase(),
+            src_label,
+            host,
+            port,
+            rule,
+            rule_payload,
+            proxy
         )
     }
 }

@@ -16,7 +16,7 @@ use crate::adapter::{
     BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
 };
 use crate::proto::addr::encode_socks_addr;
-use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
 
 const TROJAN_CMD_TCP: u8 = 0x01;
 const TROJAN_CMD_UDP: u8 = 0x03;
@@ -264,9 +264,10 @@ mod tests {
         h.update(b"hello");
         let s = hex_encode(&h.finalize());
         assert_eq!(s.len(), 56);
-        assert!(s
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

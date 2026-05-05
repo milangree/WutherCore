@@ -25,9 +25,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::cache::{url_digest, FeedDiskCache, FeedMeta};
+use crate::cache::{FeedDiskCache, FeedMeta, url_digest};
 use crate::fetcher::fetch_feed;
-use crate::parser::{apply_filter_rename, parse_feed_payload, FormatHint};
+use crate::parser::{FormatHint, apply_filter_rename, parse_feed_payload};
 use crate::userinfo::SubscriptionUserinfo;
 
 /// 一次刷新结果。

@@ -25,15 +25,9 @@ const DNS_MAX_RESPONSE: usize = 4096;
 /// `core-runtime` 启动时把 `core-outbound` 的 dialer 桥接进来，
 /// `core-resolver` 本身不依赖 `core-outbound`。
 pub trait DnsSocketFactory: Send + Sync + 'static {
-    fn create_udp(
-        &self,
-        peer: SocketAddr,
-    ) -> std::io::Result<std::net::UdpSocket>;
+    fn create_udp(&self, peer: SocketAddr) -> std::io::Result<std::net::UdpSocket>;
 
-    fn create_tcp(
-        &self,
-        peer: SocketAddr,
-    ) -> std::io::Result<std::net::TcpStream>;
+    fn create_tcp(&self, peer: SocketAddr) -> std::io::Result<std::net::TcpStream>;
 }
 
 static SOCKET_FACTORY: std::sync::OnceLock<Arc<dyn DnsSocketFactory>> = std::sync::OnceLock::new();
@@ -85,8 +79,7 @@ fn build_query(host: &str, qtype: RecordType) -> Result<Vec<u8>, DnsError> {
 }
 
 fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr>, DnsError> {
-    let msg = Message::from_bytes(buf)
-        .map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
+    let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
     let mut ips = Vec::new();
     for answer in msg.answers() {
         match (qtype, answer.data()) {
@@ -103,8 +96,7 @@ fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr>, DnsError
 }
 
 fn parse_records(buf: &[u8]) -> Result<Vec<Record>, DnsError> {
-    let msg = Message::from_bytes(buf)
-        .map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
+    let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
     let records = msg.answers().to_vec();
     if records.is_empty() {
         Err(DnsError::Empty)
@@ -367,7 +359,11 @@ impl MarkedTcpDnsUpstream {
         self.exchange_on_stream(&mut stream, &query_buf).await
     }
 
-    async fn exchange_on_stream<S>(&self, stream: &mut S, query_buf: &[u8]) -> Result<Vec<u8>, DnsError>
+    async fn exchange_on_stream<S>(
+        &self,
+        stream: &mut S,
+        query_buf: &[u8],
+    ) -> Result<Vec<u8>, DnsError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {

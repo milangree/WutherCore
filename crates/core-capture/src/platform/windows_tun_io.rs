@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
 use super::wintun_abi::{Wintun, WintunSession};

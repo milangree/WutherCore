@@ -84,11 +84,7 @@ impl HostsTable {
                 .chain(entry.ipv6.iter().copied().map(IpAddr::V6))
                 .collect(),
         };
-        if ips.is_empty() {
-            None
-        } else {
-            Some(ips)
-        }
+        if ips.is_empty() { None } else { Some(ips) }
     }
 
     pub fn is_empty(&self) -> bool {

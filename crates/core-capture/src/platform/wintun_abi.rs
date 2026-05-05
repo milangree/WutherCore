@@ -14,7 +14,7 @@
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
-use std::ffi::{c_void, CString, OsStr};
+use std::ffi::{CString, OsStr, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -62,11 +62,7 @@ fn load_library(path: &Path) -> Option<HMODULE> {
     // SAFETY: LoadLibraryA 平凡调用；返回 NULL 表示失败。
     let path_c = CString::new(path.to_string_lossy().as_bytes()).ok()?;
     let h = unsafe { LoadLibraryA(path_c.as_ptr()) };
-    if h.is_null() {
-        None
-    } else {
-        Some(h)
-    }
+    if h.is_null() { None } else { Some(h) }
 }
 
 #[allow(unsafe_code)]

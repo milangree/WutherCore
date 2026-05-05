@@ -18,8 +18,8 @@
 //! ```
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -225,7 +225,10 @@ mod tests {
     /// 这是 mihomo / clash / sing-box 的一致行为。
     #[test]
     fn classify_unexpected_eof_is_clean_eof() {
-        let err = io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed without close_notify");
+        let err = io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed without close_notify",
+        );
         assert!(matches!(classify_read(Err(err)), ReadOutcome::Eof));
     }
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use core_capture::eim_nat::EimNatTable;
-use core_capture::udp_forwarder::{send_one, UdpForwarderConfig};
+use core_capture::udp_forwarder::{UdpForwarderConfig, send_one};
 use tokio::net::UdpSocket;
 
 async fn echo_server() -> (Arc<UdpSocket>, std::net::SocketAddr) {

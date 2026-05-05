@@ -181,15 +181,24 @@ impl CapturePlan {
         }
         let auto_redirect_marks = AutoRedirectMarks {
             input: Some(nonzero_or(
-                c.tun.auto_redirect_input_mark.as_deref().and_then(parse_hex_mark),
+                c.tun
+                    .auto_redirect_input_mark
+                    .as_deref()
+                    .and_then(parse_hex_mark),
                 core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK,
             )),
             output: Some(nonzero_or(
-                c.tun.auto_redirect_output_mark.as_deref().and_then(parse_hex_mark),
+                c.tun
+                    .auto_redirect_output_mark
+                    .as_deref()
+                    .and_then(parse_hex_mark),
                 core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
             )),
             reset: Some(nonzero_or(
-                c.tun.auto_redirect_reset_mark.as_deref().and_then(parse_hex_mark),
+                c.tun
+                    .auto_redirect_reset_mark
+                    .as_deref()
+                    .and_then(parse_hex_mark),
                 core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK,
             )),
             nfqueue: Some(nonzero_or(
@@ -494,7 +503,10 @@ mod tests {
         assert_eq!(plan.mtu, 9000);
         // ipnet 解析时保留 host bits；Display 显示 host/prefix。
         assert_eq!(plan.tun_v4_cidr.to_string(), "172.18.0.1/30");
-        assert_eq!(plan.tun_v6_cidr.unwrap().to_string(), "fdfe:dcba:9876::1/126");
+        assert_eq!(
+            plan.tun_v6_cidr.unwrap().to_string(),
+            "fdfe:dcba:9876::1/126"
+        );
         assert_eq!(plan.iproute2_table_index, 2022);
         assert!(plan.auto_redirect);
         assert_eq!(plan.auto_redirect_marks.input, Some(0x2023));

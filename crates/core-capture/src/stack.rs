@@ -26,8 +26,8 @@
 //! * SpliceManager 跟踪每个 SocketHandle 的 outbound 任务，graceful close。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use parking_lot::Mutex;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};

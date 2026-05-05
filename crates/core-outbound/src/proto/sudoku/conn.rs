@@ -21,7 +21,7 @@ use pin_project_lite::pin_project;
 use rand::{Rng, RngCore};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::table::{pack_hints_to_key, Table};
+use super::table::{Table, pack_hints_to_key};
 use crate::adapter::BoxedStream;
 
 const PROB_ONE: u64 = 1u64 << 32;
@@ -245,7 +245,7 @@ impl AsyncWrite for ObfsStream {
         while written < encoded.len() {
             match this.inner.as_mut().poll_write(cx, &encoded[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -297,7 +297,7 @@ mod tests {
         let table = Table::new("test-key", "ascii").unwrap();
         let payload = b"Hello, Sudoku Obfs!";
         let encoded = encode_payload(&table, payload, 0); // 无 padding
-                                                          // 直接走解码逻辑
+        // 直接走解码逻辑
         let mut hint_buf = [0u8; 4];
         let mut count = 0usize;
         let mut decoded = Vec::new();

@@ -116,7 +116,11 @@ impl ProcessFinder for NoopFinder {
 /// （1024 条 / 10s TTL），调用方不必再加 cache。
 pub fn create_finder() -> Arc<dyn ProcessFinder> {
     let inner = create_finder_uncached();
-    Arc::new(cache::CachedFinder::new(inner, 1024, std::time::Duration::from_secs(10)))
+    Arc::new(cache::CachedFinder::new(
+        inner,
+        1024,
+        std::time::Duration::from_secs(10),
+    ))
 }
 
 /// 不带 cache 的工厂 —— 测试用。
@@ -155,7 +159,10 @@ mod tests {
     #[test]
     fn noop_finder_returns_none() {
         let f = NoopFinder;
-        assert!(f.find(NetworkProto::Tcp, "127.0.0.1".parse().unwrap(), 1).is_none());
+        assert!(
+            f.find(NetworkProto::Tcp, "127.0.0.1".parse().unwrap(), 1)
+                .is_none()
+        );
     }
 
     #[test]

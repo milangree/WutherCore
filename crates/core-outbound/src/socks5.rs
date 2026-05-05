@@ -10,8 +10,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info};
 
 use crate::adapter::{
-    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, BoxedUdp, Capabilities, DialContext,
-    OutboundAdapter, UdpSocketLike,
+    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+    prepare_outbound_udp_socket_for_addr, resolve_host,
 };
 use crate::proto::addr::{decode_socks_addr, encode_socks_addr};
 use crate::transport::Transport;

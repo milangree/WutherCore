@@ -243,7 +243,11 @@ mod tests {
             let r = cached.find(NetworkProto::Tcp, ip("10.0.0.1"), 1234);
             assert_eq!(r.unwrap().name, "x");
         }
-        assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "cached miss expected once");
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            1,
+            "cached miss expected once"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::packet::{encode_tun_ip_frame, parse_ip_packet, FrameFormat, ParsedPacket, L4};
+use crate::packet::{FrameFormat, L4, ParsedPacket, encode_tun_ip_frame, parse_ip_packet};
 use crate::tun_io::{TunIo, TunIoError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -226,7 +226,7 @@ pub async fn write_ip_packets_to_tun_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{encode_tun_ip_frame, parse_tun_frame, IpHeader, IpVersion, UdpSummary};
+    use crate::packet::{IpHeader, IpVersion, UdpSummary, encode_tun_ip_frame, parse_tun_frame};
     use std::net::IpAddr;
 
     #[test]

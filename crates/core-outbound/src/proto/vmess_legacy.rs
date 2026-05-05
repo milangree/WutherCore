@@ -30,9 +30,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::vmess::{build_legacy_header_payload, VmessSecurity, VMESS_OPTION_CHUNK_STREAM};
+use crate::proto::vmess::{VMESS_OPTION_CHUNK_STREAM, VmessSecurity, build_legacy_header_payload};
 use crate::transport::{
-    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, TlsOptions, Transport, WsOptions,
+    TlsOptions, Transport, WsOptions, tcp::TcpTransport, tls::TlsTransport, ws::WsTransport,
 };
 
 type HmacMd5 = Hmac<Md5>;

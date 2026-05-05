@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 

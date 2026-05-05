@@ -261,11 +261,7 @@ fn make_inet_socket_addr<'local>(
 /// `PackageManager.getNameForUid(int) -> String?`。
 /// API 26+ 返回 `"package_name:uid"` 形式 —— 用 `:` 切断只取前缀。
 /// 老 API 直接返回 `package_name`。
-fn jni_name_for_uid(
-    env: &mut JNIEnv<'_>,
-    pm: &GlobalRef,
-    uid: u32,
-) -> jni::errors::Result<String> {
+fn jni_name_for_uid(env: &mut JNIEnv<'_>, pm: &GlobalRef, uid: u32) -> jni::errors::Result<String> {
     let result = env
         .call_method(
             pm,

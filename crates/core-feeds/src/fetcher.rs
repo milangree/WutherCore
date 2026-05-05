@@ -107,9 +107,7 @@ pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, Fet
     };
 
     let userinfo = SubscriptionUserinfo::from_headers(
-        resp.headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str())),
+        resp.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
     );
     let etag = resp.headers.get("etag").cloned();
     let content_type = resp.headers.get("content-type").cloned();

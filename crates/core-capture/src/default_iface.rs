@@ -116,7 +116,9 @@ fn default_tun_prefixes() -> Vec<String> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_probe(exclude: &ExcludeList) -> DefaultInterface {
     let name = parse_proc_net_route_default(
-        std::fs::read_to_string("/proc/net/route").unwrap_or_default().as_str(),
+        std::fs::read_to_string("/proc/net/route")
+            .unwrap_or_default()
+            .as_str(),
         exclude,
     );
     let (v4, v6) = match name.as_deref() {
@@ -126,7 +128,9 @@ fn linux_probe(exclude: &ExcludeList) -> DefaultInterface {
             // 单 NIC 主机上是对的；多家庭 / 多 NIC 这里可能不准，但 setsockopt
             // 用 ifindex=0 表示"系统默认"，所以 None 也是安全 fallback。
             let v6_name = parse_proc_net_ipv6_route_default(
-                std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default().as_str(),
+                std::fs::read_to_string("/proc/net/ipv6_route")
+                    .unwrap_or_default()
+                    .as_str(),
                 exclude,
             );
             let v6 = v6_name.as_deref().and_then(nametoindex);
@@ -199,7 +203,12 @@ pub(crate) fn parse_proc_net_ipv6_route_default(
     best.map(|(i, _)| i)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 fn nametoindex(name: &str) -> Option<u32> {
     nix::net::if_::if_nametoindex(name)
         .ok()
@@ -226,7 +235,11 @@ fn windows_probe(exclude: &ExcludeList) -> DefaultInterface {
 
 #[cfg(target_os = "windows")]
 fn windows_probe_family(family: &str, exclude: &ExcludeList) -> Option<(u32, String)> {
-    let prefix = if family == "IPv6" { "::/0" } else { "0.0.0.0/0" };
+    let prefix = if family == "IPv6" {
+        "::/0"
+    } else {
+        "0.0.0.0/0"
+    };
     // 取 metric 最低的 5 条默认路由（按 InterfaceIndex|InterfaceAlias 输出），
     // Rust 侧再用 exclude 过滤——这样用户自定义 TUN 名字也能被排除。
     let script = format!(
@@ -261,7 +274,9 @@ pub(crate) fn parse_windows_route_lines(
         }
         let mut parts = line.splitn(2, '|');
         let Some(idx_s) = parts.next() else { continue };
-        let Some(alias_raw) = parts.next() else { continue };
+        let Some(alias_raw) = parts.next() else {
+            continue;
+        };
         let alias = alias_raw.trim().to_string();
         // ifindex == 0 是哨兵值（"系统默认"），跳过当前行而不是终止整个迭代 ——
         // 否则一行无效输出就会让后续合法行也被丢弃。
@@ -296,7 +311,10 @@ fn darwin_probe_family(family: &str, exclude: &ExcludeList) -> Option<String> {
         "inet6" => &["-n", "get", "-inet6", "default"],
         _ => &["-n", "get", "default"],
     };
-    let out = std::process::Command::new("route").args(args).output().ok()?;
+    let out = std::process::Command::new("route")
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

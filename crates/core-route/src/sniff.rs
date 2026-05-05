@@ -267,8 +267,8 @@ mod tests {
         v.extend_from_slice(&[0x00, 0x00]); // type
         let inner_off = v.len();
         v.extend_from_slice(&[0, 0]); // length placeholder
-                                      // server_name list:
-                                      //   list_length(2)  name_type(1)  name_length(2)  name
+        // server_name list:
+        //   list_length(2)  name_type(1)  name_length(2)  name
         let list_payload_len = 1 + 2 + h.len();
         v.extend_from_slice(&(list_payload_len as u16).to_be_bytes());
         v.push(0x00); // host_name

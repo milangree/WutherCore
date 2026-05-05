@@ -63,8 +63,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
 use aes::Aes128;
+use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
 use async_trait::async_trait;
@@ -74,22 +74,22 @@ use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
 use rand::RngCore;
 use sha3::{
-    digest::{ExtendableOutput, XofReader},
     Shake128,
+    digest::{ExtendableOutput, XofReader},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 use crate::proto::vmess_kdf::{
-    kdf_n, KDF_AEAD_KEY, KDF_AEAD_KEY_LEN, KDF_AEAD_NONCE, KDF_AEAD_NONCE_LEN,
+    KDF_AEAD_KEY, KDF_AEAD_KEY_LEN, KDF_AEAD_NONCE, KDF_AEAD_NONCE_LEN,
     KDF_AEAD_RESP_HEADER_LEN_IV, KDF_AEAD_RESP_HEADER_LEN_KEY, KDF_AEAD_RESP_HEADER_PAYLOAD_IV,
-    KDF_AEAD_RESP_HEADER_PAYLOAD_KEY, KDF_AUTH_ID,
+    KDF_AEAD_RESP_HEADER_PAYLOAD_KEY, KDF_AUTH_ID, kdf_n,
 };
 use crate::transport::{
+    GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
     grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
     tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
-    GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
 };
 
 pub const VMESS_OPTION_CHUNK_STREAM: u8 = 0x01;
@@ -762,11 +762,7 @@ impl ChunkCryptor {
     }
 
     fn length_field_size(&self) -> usize {
-        if self.auth_len_aead.is_some() {
-            18
-        } else {
-            2
-        }
+        if self.auth_len_aead.is_some() { 18 } else { 2 }
     }
 
     fn tag_len(&self) -> usize {
@@ -902,7 +898,7 @@ impl AsyncWrite for VmessStream {
         while written < packet.len() {
             match this.inner.as_mut().poll_write(cx, &packet[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

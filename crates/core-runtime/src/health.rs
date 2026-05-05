@@ -21,14 +21,14 @@
 //!   TLS。`tokio::sync::Semaphore` 限并发，避免压垮上游。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use core_outbound::adapter::{BoxedStream, DialContext};
 use parking_lot::{Mutex, RwLock};
-use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;

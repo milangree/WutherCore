@@ -12,12 +12,12 @@ pub mod health;
 pub mod int_ranges;
 pub mod listener_handler;
 
-pub use dns_listener::{spawn_dns_listener, DnsListener, DnsListenerError};
+pub use dns_listener::{DnsListener, DnsListenerError, spawn_dns_listener};
 pub use engine::{DialResult, RoutePick, Runtime, RuntimeError, UdpDialResult};
 pub use group_selector::{FlowMeta, GroupOptions, GroupSelector, LbStrategy};
 pub use health::{
-    spawn_periodic, DelayError, HistoryEntry, NodeUrlStats, UrlTestConfig, UrlTestOpts, UrlTester,
-    DEAD_DELAY, FAST_PICK_TTL,
+    DEAD_DELAY, DelayError, FAST_PICK_TTL, HistoryEntry, NodeUrlStats, UrlTestConfig, UrlTestOpts,
+    UrlTester, spawn_periodic,
 };
 pub use int_ranges::{IntRanges, Range};
 pub use listener_handler::{InboundMetadata, ListenerHandler, PreparedTcp, PreparedUdpPacket};

@@ -284,7 +284,10 @@ enum FilterMatcher {
 
 impl FakeIpFilter {
     pub fn new(patterns: Vec<String>, mode: FakeIpFilterMode) -> Self {
-        let matchers = patterns.into_iter().map(|p| parse_filter_pattern(&p)).collect();
+        let matchers = patterns
+            .into_iter()
+            .map(|p| parse_filter_pattern(&p))
+            .collect();
         Self { matchers, mode }
     }
 
@@ -296,9 +299,7 @@ impl FakeIpFilter {
                 domain_lc == *suffix || domain_lc.ends_with(&format!(".{suffix}"))
             }
             FilterMatcher::Keyword(kw) => domain_lc.contains(kw.as_str()),
-            FilterMatcher::Wildcard(base) => {
-                domain_lc.ends_with(base.as_str())
-            }
+            FilterMatcher::Wildcard(base) => domain_lc.ends_with(base.as_str()),
         });
         match self.mode {
             FakeIpFilterMode::Blacklist => matched,
@@ -315,7 +316,10 @@ fn parse_filter_pattern(p: &str) -> FilterMatcher {
     let p = p.trim().to_lowercase();
     if p.starts_with('+') || p.starts_with("*.") {
         // +.example.com or *.example.com -> suffix match
-        let base = p.trim_start_matches('+').trim_start_matches('*').trim_start_matches('.');
+        let base = p
+            .trim_start_matches('+')
+            .trim_start_matches('*')
+            .trim_start_matches('.');
         FilterMatcher::Suffix(base.to_string())
     } else if p.starts_with("keyword:") {
         FilterMatcher::Keyword(p.trim_start_matches("keyword:").to_string())

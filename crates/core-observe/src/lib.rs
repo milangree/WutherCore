@@ -17,16 +17,16 @@ pub mod tracing_init;
 pub mod watchdog;
 
 pub use connections::{
-    log_connection_summary, string_list_from, ConnectionAccounting, ConnectionEntry,
-    ConnectionGuard, ConnectionInfo, ConnectionManagerSnapshot, ConnectionMeta,
-    ConnectionSnapshot, ConnectionSummary, ConnectionTable, LongLivedEntry, RateSample,
-    StringList,
+    ConnectionAccounting, ConnectionEntry, ConnectionGuard, ConnectionInfo,
+    ConnectionManagerSnapshot, ConnectionMeta, ConnectionSnapshot, ConnectionSummary,
+    ConnectionTable, LongLivedEntry, RateSample, StringList, log_connection_summary,
+    string_list_from,
 };
 pub use copy_counted::{copy_bidirectional_counted, copy_bidirectional_tracked};
 pub use log_bus::{LogBus, LogEvent};
-pub use metrics::{current_rss_bytes, Metrics};
+pub use metrics::{Metrics, current_rss_bytes};
 pub use tracing_init::{
-    attach_log_bus, init_tracing, init_tracing_with_bus, init_tracing_with_config, TracingConfig,
-    TracingFileConfig, TracingFormat,
+    TracingConfig, TracingFileConfig, TracingFormat, attach_log_bus, init_tracing,
+    init_tracing_with_bus, init_tracing_with_config,
 };
 pub use watchdog::{Watchdog, WatchdogConfig};

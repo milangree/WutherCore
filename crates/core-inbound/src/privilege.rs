@@ -56,7 +56,7 @@ impl PrivilegeReport {
     target_os = "freebsd"
 ))]
 fn detect_unix() -> PrivilegeReport {
-    use nix::unistd::{geteuid, User};
+    use nix::unistd::{User, geteuid};
 
     let euid = geteuid();
     let uid = euid.as_raw();

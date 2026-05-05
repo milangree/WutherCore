@@ -8,8 +8,8 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use async_trait::async_trait;
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::tun_io::{TunIo, TunIoError};
 

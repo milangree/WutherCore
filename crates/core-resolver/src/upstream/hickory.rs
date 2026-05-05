@@ -4,11 +4,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{
     NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts,
 };
 use hickory_resolver::proto::rr::{Record, RecordType};
-use hickory_resolver::TokioAsyncResolver;
 
 use super::{DnsError, DnsUpstream};
 
@@ -222,11 +222,7 @@ mod tests {
     #[test]
     fn doh_accepts_ipv6_literal_host() {
         let up = HickoryUpstream::doh("v6", "2606:4700:4700::1111", 443, None);
-        assert!(
-            up.is_ok(),
-            "DoH IPv6 host should construct: {:?}",
-            up.err()
-        );
+        assert!(up.is_ok(), "DoH IPv6 host should construct: {:?}", up.err());
     }
 
     #[test]

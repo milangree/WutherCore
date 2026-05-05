@@ -34,11 +34,11 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket, resolve_host, BoxedStream, BoxedUdp, Capabilities, DialContext,
-    OutboundAdapter, UdpSocketLike,
+    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+    prepare_outbound_udp_socket, resolve_host,
 };
 use crate::proto::addr::{decode_socks_addr, encode_socks_addr};
-use crate::transport::{tcp::TcpTransport, Transport};
+use crate::transport::{Transport, tcp::TcpTransport};
 
 const PAYLOAD_MAX: usize = 0x3fff;
 
@@ -453,7 +453,7 @@ impl AsyncWrite for SsStream {
         while written < packet.len() {
             match this.inner.as_mut().poll_write(cx, &packet[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

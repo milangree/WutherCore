@@ -46,19 +46,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{
-    ws::{Message, WebSocket, WebSocketUpgrade},
     Path, Query, State,
+    ws::{Message, WebSocket, WebSocketUpgrade},
 };
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use core_runtime::Runtime;
 use futures::Stream;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::compat_security::WsConnectionLimiter;
 use crate::native::NativeState;
@@ -154,7 +154,11 @@ async fn traffic(
     if let Some(ws) = ws {
         // 取 hub receiver；连接上限保护避免 fd 耗尽。
         let Some(permit) = ws_limiter().try_acquire() else {
-            return (StatusCode::SERVICE_UNAVAILABLE, "ws connection limit reached").into_response();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ws connection limit reached",
+            )
+                .into_response();
         };
         let rx = s.ws_hubs.traffic.subscribe();
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
@@ -171,7 +175,11 @@ async fn memory(
 ) -> axum::response::Response {
     if let Some(ws) = ws {
         let Some(permit) = ws_limiter().try_acquire() else {
-            return (StatusCode::SERVICE_UNAVAILABLE, "ws connection limit reached").into_response();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ws connection limit reached",
+            )
+                .into_response();
         };
         let rx = s.ws_hubs.memory.subscribe();
         return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
@@ -267,8 +275,8 @@ fn log_event_stream(
     s: NativeState,
     level_filter: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    use tokio_stream::wrappers::BroadcastStream;
     use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
 
     // 与 WS 路径同因——保持 snapshot/subscribe 原子化避免事件双发。
     let (snapshot, rx) = s.runtime.logs.subscribe_with_history();
@@ -321,7 +329,10 @@ async fn connections(
         // 为了向后兼容，但忽略。
         let _ = q.interval;
         let Some(permit) = ws_limiter().try_acquire() else {
-            return (StatusCode::SERVICE_UNAVAILABLE, "ws connection limit reached")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ws connection limit reached",
+            )
                 .into_response();
         };
         let rx = s.ws_hubs.connections.subscribe();
@@ -626,7 +637,7 @@ async fn group_delay(
                 StatusCode::NOT_FOUND,
                 Json(json!({"message": "group not found"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let to = q.timeout.map(Duration::from_millis);
@@ -1080,8 +1091,7 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
             .nodes
             .iter()
             .filter(|n| {
-                n.name.starts_with(&format!("{}/", name))
-                    || n.name.contains(&format!("[{}]", name))
+                n.name.starts_with(&format!("{}/", name)) || n.name.contains(&format!("[{}]", name))
             })
             .map(|n| {
                 let history = Value::Array(
@@ -1240,7 +1250,10 @@ fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Valu
 
 async fn rules(State(s): State<NativeState>) -> axum::response::Response {
     let runtime = s.runtime.clone();
-    let bytes = s.caches.rules.fetch_bytes(move || build_rules_value(&runtime));
+    let bytes = s
+        .caches
+        .rules
+        .fetch_bytes(move || build_rules_value(&runtime));
     json_bytes(bytes)
 }
 

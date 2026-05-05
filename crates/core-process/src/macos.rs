@@ -12,7 +12,7 @@
 //! `proc_*` 系列 API 在 macOS 10.5 之后稳定；非特权进程能扫所有进程的 socket 列表
 //! （内核只过滤了 ptrace / process_kernel 类的访问）。
 
-use std::ffi::{c_int, c_void, CStr};
+use std::ffi::{CStr, c_int, c_void};
 use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -57,12 +57,12 @@ union InsiAddr4Or6 {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct InSockInfo {
-    insi_fport: i32,    // foreign port (network byte order in low 16)
-    insi_lport: i32,    // local port (network byte order in low 16)
+    insi_fport: i32, // foreign port (network byte order in low 16)
+    insi_lport: i32, // local port (network byte order in low 16)
     insi_gencnt: u64,
     insi_flags: u32,
     insi_flow: u32,
-    insi_vflag: u8,     // INI_IPV4 / INI_IPV6
+    insi_vflag: u8, // INI_IPV4 / INI_IPV6
     insi_ip_ttl: u8,
     rfu_1: u32,
     insi_faddr: InsiAddr4Or6,
@@ -133,12 +133,7 @@ struct SocketFdInfo {
 }
 
 unsafe extern "C" {
-    fn proc_listpids(
-        type_: u32,
-        typeinfo: u32,
-        buffer: *mut c_void,
-        buffersize: c_int,
-    ) -> c_int;
+    fn proc_listpids(type_: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int) -> c_int;
     fn proc_pidinfo(
         pid: c_int,
         flavor: c_int,
@@ -176,11 +171,7 @@ impl ProcessFinder for MacosFinder {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Some(ProcessInfo {
-            name,
-            path,
-            uid: 0,
-        })
+        Some(ProcessInfo { name, path, uid: 0 })
     }
 }
 
@@ -192,12 +183,7 @@ unsafe fn find_pid(proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option
     }
     let count = needed_bytes as usize / size_of::<i32>();
     let mut pids = vec![0i32; count];
-    let got = proc_listpids(
-        PROC_ALL_PIDS,
-        0,
-        pids.as_mut_ptr().cast(),
-        needed_bytes,
-    );
+    let got = proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), needed_bytes);
     if got <= 0 {
         return None;
     }
@@ -212,25 +198,19 @@ unsafe fn find_pid(proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option
             continue;
         }
         // 2) 列出 PID 的 fd
-        let fdsize = proc_pidinfo(
-            pid,
-            PROC_PIDLISTFDS,
-            0,
-            std::ptr::null_mut(),
-            0,
-        );
+        let fdsize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
         if fdsize <= 0 {
             continue;
         }
         let fd_count = fdsize as usize / size_of::<ProcFdInfo>();
-        let mut fds = vec![ProcFdInfo { proc_fd: 0, proc_fdtype: 0 }; fd_count];
-        let got_fd = proc_pidinfo(
-            pid,
-            PROC_PIDLISTFDS,
-            0,
-            fds.as_mut_ptr().cast(),
-            fdsize,
-        );
+        let mut fds = vec![
+            ProcFdInfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            fd_count
+        ];
+        let got_fd = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), fdsize);
         if got_fd <= 0 {
             continue;
         }
@@ -283,9 +263,7 @@ unsafe fn find_pid(proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option
                         let bytes = ini.insi_laddr.insi_v6;
                         if bytes == [0u8; 16] {
                             None // 视为 wildcard
-                        } else if bytes[..10] == [0u8; 10]
-                            && bytes[10] == 0xff
-                            && bytes[11] == 0xff
+                        } else if bytes[..10] == [0u8; 10] && bytes[10] == 0xff && bytes[11] == 0xff
                         {
                             Some(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]))
                         } else {
@@ -337,9 +315,11 @@ mod tests {
     #[test]
     fn missing_port_returns_none() {
         let finder = MacosFinder::new();
-        assert!(finder
-            .find(NetworkProto::Tcp, "127.0.0.1".parse().unwrap(), 64999)
-            .is_none());
+        assert!(
+            finder
+                .find(NetworkProto::Tcp, "127.0.0.1".parse().unwrap(), 64999)
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post},
-    Json, Router,
 };
 use core_route::{FlowContext, NetworkKind};
 use core_runtime::{Runtime, UrlTester};
@@ -303,7 +303,7 @@ async fn smart_why(
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "unknown group"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let ctx = core_smart::SmartContext {

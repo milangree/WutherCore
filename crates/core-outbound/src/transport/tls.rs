@@ -9,9 +9,9 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::adapter::{resolve_host, BoxedStream};
+use crate::adapter::{BoxedStream, resolve_host};
 use crate::loopback::TrackedTcpStream;
-use crate::transport::{tcp::marked_connect, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tcp::marked_connect};
 
 #[derive(Debug, Clone)]
 pub struct TlsTransport {

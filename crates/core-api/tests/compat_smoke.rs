@@ -144,9 +144,11 @@ async fn rules_serialize_steps() {
         "rules should not be empty (preset cn_smart)"
     );
     // 至少有一条 MATCH/兜底
-    assert!(rules
-        .iter()
-        .any(|r| r["type"] == "MATCH" || r["type"] == "GEOIP"));
+    assert!(
+        rules
+            .iter()
+            .any(|r| r["type"] == "MATCH" || r["type"] == "GEOIP")
+    );
 }
 
 #[tokio::test]
@@ -254,8 +256,7 @@ route:
 "#;
     let plan = load_from_str(cfg).unwrap();
     let runtime = Arc::new(Runtime::build(plan));
-    let state =
-        NativeState::for_tests(runtime.clone(), UrlTester::new(Default::default()), None);
+    let state = NativeState::for_tests(runtime.clone(), UrlTester::new(Default::default()), None);
     let app = core_api::compat::router(state);
     let resp = app
         .oneshot(

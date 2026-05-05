@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hickory_resolver::proto::rr::{
-    rdata::{A, AAAA},
     Name, RData, Record, RecordType,
+    rdata::{A, AAAA},
 };
 use thiserror::Error;
 
@@ -151,7 +151,10 @@ impl FilteredUpstream {
         Self { inner, params }
     }
 
-    pub fn wrap_if_needed(inner: Arc<dyn DnsUpstream>, params: &UpstreamParams) -> Arc<dyn DnsUpstream> {
+    pub fn wrap_if_needed(
+        inner: Arc<dyn DnsUpstream>,
+        params: &UpstreamParams,
+    ) -> Arc<dyn DnsUpstream> {
         if params.has_filters() {
             Arc::new(Self::new(inner, params.clone()))
         } else {
@@ -197,7 +200,9 @@ impl DnsUpstream for FilteredUpstream {
     }
 
     fn default_client_subnet(&self) -> Option<ipnet::IpNet> {
-        self.params.ecs.or_else(|| self.inner.default_client_subnet())
+        self.params
+            .ecs
+            .or_else(|| self.inner.default_client_subnet())
     }
 
     async fn reset_connections(&self) {

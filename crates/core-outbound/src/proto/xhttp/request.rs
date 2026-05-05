@@ -8,10 +8,10 @@ use base64::Engine;
 use http::{HeaderName, HeaderValue, Request as HttpRequest};
 
 use super::config::{
-    Config, Range, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
-    PLACEMENT_PATH, PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER,
+    Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_PATH,
+    PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER, Range,
 };
-use super::xpadding::{generate_padding, PaddingMethod, XPaddingConfig, XPaddingPlacement};
+use super::xpadding::{PaddingMethod, XPaddingConfig, XPaddingPlacement, generate_padding};
 
 pub struct PreparedRequest {
     pub method: String,
@@ -345,10 +345,11 @@ mod tests {
         cfg.seq_placement = "header".into();
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         apply_meta(&cfg, &mut req, "ABC", "99");
-        assert!(req
-            .headers
-            .iter()
-            .any(|(k, v)| k == "X-Session" && v == "ABC"));
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "X-Session" && v == "ABC")
+        );
         assert!(req.headers.iter().any(|(k, v)| k == "X-Seq" && v == "99"));
     }
 
@@ -357,10 +358,11 @@ mod tests {
         let cfg = Config::default(); // obfs off → 默认 queryInHeader/Referer
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         apply_x_padding(&cfg, &mut req).unwrap();
-        assert!(req
-            .headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("Referer")));
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("Referer"))
+        );
     }
 
     #[test]
@@ -382,10 +384,11 @@ mod tests {
         let cfg = Config::default();
         let mut req = PreparedRequest::new("POST", "https://e.com/p/", "e.com");
         fill_stream_request(&cfg, &mut req, "sess").unwrap();
-        assert!(req
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Content-Type" && v == "application/grpc"));
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Type" && v == "application/grpc")
+        );
     }
 
     #[test]

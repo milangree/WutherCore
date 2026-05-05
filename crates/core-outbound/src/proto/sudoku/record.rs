@@ -474,7 +474,7 @@ impl AsyncWrite for RecordStream {
         while written < frames.len() {
             match this.inner.as_mut().poll_write(cx, &frames[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

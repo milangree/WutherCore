@@ -10,15 +10,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tracing::{debug, trace};
 
+use crate::Resolver;
 use crate::cache::QType;
 use crate::fake_ip::{AddressFamily, FakeIpFilter, FakeIpPool};
 use crate::hosts::HostsTable;
 use crate::mapping::IpHostMapping;
 use crate::packet::{
-    build_empty_response, build_ip_response, parse_first_question, DnsQuestion, TYPE_A,
-    TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB,
+    DnsQuestion, TYPE_A, TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, build_empty_response, build_ip_response,
+    parse_first_question,
 };
-use crate::Resolver;
 
 pub enum MiddlewareResult {
     Response(Vec<u8>),
@@ -195,12 +195,10 @@ impl DnsMiddleware for FakeIpMiddleware {
                 let resp = build_ip_response(&ctx.raw_request, &ctx.question, &ips, ttl_secs);
                 MiddlewareResult::Response(resp)
             }
-            TYPE_SVCB | TYPE_HTTPS => {
-                MiddlewareResult::Response(build_empty_response(
-                    &ctx.raw_request,
-                    Some(&ctx.question),
-                ))
-            }
+            TYPE_SVCB | TYPE_HTTPS => MiddlewareResult::Response(build_empty_response(
+                &ctx.raw_request,
+                Some(&ctx.question),
+            )),
             _ => MiddlewareResult::Continue,
         }
     }
@@ -274,7 +272,11 @@ impl DnsMiddleware for ResolverMiddleware {
                 } else {
                     QType::AAAA
                 };
-                match self.resolver.resolve_qtype_answer(&ctx.question.name, qtype).await {
+                match self
+                    .resolver
+                    .resolve_qtype_answer(&ctx.question.name, qtype)
+                    .await
+                {
                     Ok(answer) => {
                         let ttl = if answer.stale {
                             self.resolver.cache().config().stale_answer_ttl
@@ -283,7 +285,12 @@ impl DnsMiddleware for ResolverMiddleware {
                         };
                         // Store IP→host mapping for redir-host mode
                         let ttl_for_mapping = ttl.max(Duration::from_secs(1));
-                        for ip in answer.ips.iter().copied().filter(|ip| is_global_unicast(*ip)) {
+                        for ip in answer
+                            .ips
+                            .iter()
+                            .copied()
+                            .filter(|ip| is_global_unicast(*ip))
+                        {
                             self.mapping.insert(ip, &ctx.question.name, ttl_for_mapping);
                             if let Some(pool) = &self.fake_pool {
                                 pool.insert_mapping(ip, &ctx.question.name, ttl_for_mapping);
@@ -298,8 +305,12 @@ impl DnsMiddleware for ResolverMiddleware {
                             "resolver response"
                         );
                         let ttl_secs = ttl.as_secs().min(u32::MAX as u64) as u32;
-                        let resp =
-                            build_ip_response(&ctx.raw_request, &ctx.question, &answer.ips, ttl_secs);
+                        let resp = build_ip_response(
+                            &ctx.raw_request,
+                            &ctx.question,
+                            &answer.ips,
+                            ttl_secs,
+                        );
                         MiddlewareResult::Response(resp)
                     }
                     Err(e) => {

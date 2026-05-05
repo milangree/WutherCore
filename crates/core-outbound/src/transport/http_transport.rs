@@ -16,7 +16,7 @@ use rand::seq::SliceRandom;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::adapter::BoxedStream;
-use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
 
 #[derive(Debug, Clone, Default)]
 pub struct HttpOptions {

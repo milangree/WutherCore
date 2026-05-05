@@ -27,10 +27,10 @@ use tracing::{debug, info, warn};
 
 use crate::eim_nat::EimNatTable;
 use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::ipset::{noop, IpSetProvider};
+use crate::ipset::{IpSetProvider, noop};
 use crate::nat::{NatEntry, NatTable};
-use crate::sys_proxy::SystemProxyGuard;
 use crate::netstack_dispatch::{NetstackDispatcher, NetstackDispatcherHandles};
+use crate::sys_proxy::SystemProxyGuard;
 use crate::system_dispatch::{SystemDispatcher, SystemDispatcherHandles};
 
 /// 跨 stack 的 dispatcher 句柄 —— supervisor 内部使用。
@@ -588,7 +588,11 @@ mod tests {
 
     #[tokio::test]
     async fn virtual_nic_native_or_system_stack_starts_tun_dispatcher() {
-        for stack in [CaptureStack::Native, CaptureStack::System, CaptureStack::Mixed] {
+        for stack in [
+            CaptureStack::Native,
+            CaptureStack::System,
+            CaptureStack::Mixed,
+        ] {
             let mut c = capture();
             c.stack = stack;
             let mut plan = CapturePlan::from_config(&c).unwrap();

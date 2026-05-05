@@ -29,15 +29,11 @@ impl LinuxFinder {
 impl ProcessFinder for LinuxFinder {
     fn find(&self, proto: NetworkProto, src_ip: IpAddr, src_port: u16) -> Option<ProcessInfo> {
         let inode = match (proto, src_ip) {
-            (NetworkProto::Tcp, IpAddr::V4(v4)) => {
-                find_inode_v4("/proc/net/tcp", v4, src_port)
-                    .or_else(|| find_inode_v6("/proc/net/tcp6", Ipv6Addr::UNSPECIFIED, src_port))
-            }
+            (NetworkProto::Tcp, IpAddr::V4(v4)) => find_inode_v4("/proc/net/tcp", v4, src_port)
+                .or_else(|| find_inode_v6("/proc/net/tcp6", Ipv6Addr::UNSPECIFIED, src_port)),
             (NetworkProto::Tcp, IpAddr::V6(v6)) => find_inode_v6("/proc/net/tcp6", v6, src_port),
-            (NetworkProto::Udp, IpAddr::V4(v4)) => {
-                find_inode_v4("/proc/net/udp", v4, src_port)
-                    .or_else(|| find_inode_v6("/proc/net/udp6", Ipv6Addr::UNSPECIFIED, src_port))
-            }
+            (NetworkProto::Udp, IpAddr::V4(v4)) => find_inode_v4("/proc/net/udp", v4, src_port)
+                .or_else(|| find_inode_v6("/proc/net/udp6", Ipv6Addr::UNSPECIFIED, src_port)),
             (NetworkProto::Udp, IpAddr::V6(v6)) => find_inode_v6("/proc/net/udp6", v6, src_port),
         }?;
         let (pid, uid) = find_pid_for_inode(inode)?;
@@ -176,7 +172,9 @@ fn find_pid_for_inode(inode: u64) -> Option<(u32, u32)> {
 }
 
 fn read_link(path: &str) -> Option<String> {
-    fs::read_link(path).ok().map(|p| p.to_string_lossy().into_owned())
+    fs::read_link(path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn read_status_uid(pid: u32) -> Option<u32> {
@@ -204,10 +202,7 @@ mod tests {
 
     #[test]
     fn parse_v4_hex_unspecified() {
-        assert_eq!(
-            parse_v4_hex("00000000").unwrap(),
-            Ipv4Addr::UNSPECIFIED
-        );
+        assert_eq!(parse_v4_hex("00000000").unwrap(), Ipv4Addr::UNSPECIFIED);
     }
 
     #[test]
@@ -232,11 +227,7 @@ mod tests {
     fn missing_inode_returns_none() {
         let finder = LinuxFinder::new();
         // 用一个肯定没人监听的高端口
-        let res = finder.find(
-            NetworkProto::Tcp,
-            "127.0.0.1".parse().unwrap(),
-            64999,
-        );
+        let res = finder.find(NetworkProto::Tcp, "127.0.0.1".parse().unwrap(), 64999);
         // 在不是 Linux 的 CI 上 read /proc/net/tcp 会 fail → None；
         // 在 Linux 上 64999 没人监听 → None。
         assert!(res.is_none());

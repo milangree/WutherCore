@@ -128,7 +128,9 @@ impl TunIo for TunRsDevice {
                 Ok(n) => {
                     let total_bytes: u64 = sizes[..n].iter().map(|&s| s as u64).sum();
                     self.stats.rx_packets.fetch_add(n as u64, Ordering::Relaxed);
-                    self.stats.rx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+                    self.stats
+                        .rx_bytes
+                        .fetch_add(total_bytes, Ordering::Relaxed);
                     return Ok(n);
                 }
                 Err(e) => {
@@ -168,8 +170,12 @@ impl TunIo for TunRsDevice {
             let mut owned = pkts;
             match self.inner.send_multiple(&mut gro, &mut owned, 0).await {
                 Ok(n) => {
-                    self.stats.tx_packets.fetch_add(count as u64, Ordering::Relaxed);
-                    self.stats.tx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+                    self.stats
+                        .tx_packets
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    self.stats
+                        .tx_bytes
+                        .fetch_add(total_bytes, Ordering::Relaxed);
                     return Ok(n);
                 }
                 Err(e) => {
@@ -195,8 +201,12 @@ impl TunIo for TunRsDevice {
                     }
                 }
             }
-            self.stats.tx_packets.fetch_add(count as u64, Ordering::Relaxed);
-            self.stats.tx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+            self.stats
+                .tx_packets
+                .fetch_add(count as u64, Ordering::Relaxed);
+            self.stats
+                .tx_bytes
+                .fetch_add(total_bytes, Ordering::Relaxed);
             Ok(count)
         }
     }

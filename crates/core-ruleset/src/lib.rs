@@ -39,9 +39,9 @@ pub mod parser;
 pub mod rrs;
 pub mod spec;
 
-pub use fetch::{fetch_ruleset, FetchError};
-pub use format::{detect_format, RulesetFormat};
+pub use fetch::{FetchError, fetch_ruleset};
+pub use format::{RulesetFormat, detect_format};
 pub use manager::{RulesetManager, RulesetSink, RulesetUpdate};
 pub use matcher::{ClassicalEntry, RulesetIndex, RulesetMatcher};
-pub use parser::{parse_ruleset, parse_ruleset_compiled, ParseError, RulesetCompiled};
+pub use parser::{ParseError, RulesetCompiled, parse_ruleset, parse_ruleset_compiled};
 pub use spec::{RulesetSpec, RulesetType};

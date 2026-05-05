@@ -40,4 +40,4 @@ pub mod xpadding;
 
 pub use client::XhttpClient;
 pub use config::{Config, Range, ReuseConfig};
-pub use xpadding::{generate_padding, PaddingMethod};
+pub use xpadding::{PaddingMethod, generate_padding};

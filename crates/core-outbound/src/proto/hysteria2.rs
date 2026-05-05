@@ -35,8 +35,8 @@ use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, Capabilities, DialContext,
-    OutboundAdapter,
+    BoxedStream, Capabilities, DialContext, OutboundAdapter, prepare_outbound_udp_socket_for_addr,
+    resolve_host,
 };
 
 #[derive(Debug, Clone)]

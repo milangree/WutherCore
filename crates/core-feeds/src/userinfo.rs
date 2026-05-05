@@ -82,11 +82,7 @@ impl SubscriptionUserinfo {
             }
             // 其它未知 key（如 reset_day、plan_id 等机场扩展）静默忽略。
         }
-        if found {
-            Some(info)
-        } else {
-            None
-        }
+        if found { Some(info) } else { None }
     }
 
     /// 从一组 (name, value) 头里寻找已知用量头并解析。任何匹配项命中即返回。
@@ -146,7 +142,8 @@ mod tests {
 
     #[test]
     fn parse_full_header() {
-        let h = "upload=455727930049; download=2056703039619; total=805306368000; expire=1738742400";
+        let h =
+            "upload=455727930049; download=2056703039619; total=805306368000; expire=1738742400";
         let info = SubscriptionUserinfo::parse(h).expect("parse should succeed");
         assert_eq!(info.upload, 455_727_930_049);
         assert_eq!(info.download, 2_056_703_039_619);

@@ -30,17 +30,17 @@
 //!    `?token=` 不再被接受（防止凭证写入 access log / Referer）。
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
+    Json,
     body::Body,
     extract::Request,
-    http::{header, HeaderName, HeaderValue, Method, StatusCode},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -128,12 +128,7 @@ pub fn body_limit_layer() -> axum::extract::DefaultBodyLimit {
 
 /* ====================== 3. 请求超时 ====================== */
 
-const STREAMING_PATHS: &[&str] = &[
-    "/logs",
-    "/traffic",
-    "/memory",
-    "/connections",
-];
+const STREAMING_PATHS: &[&str] = &["/logs", "/traffic", "/memory", "/connections"];
 
 /// 30 s 请求级超时。WS / SSE / 流式端点豁免。
 pub async fn request_timeout(req: Request<Body>, next: Next) -> Response {
@@ -169,7 +164,10 @@ pub async fn security_headers(req: Request<Body>, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     if !h.contains_key("x-content-type-options") {
-        h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+        h.insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
     }
     if !h.contains_key("x-frame-options") {
         h.insert("x-frame-options", HeaderValue::from_static("DENY"));
@@ -228,7 +226,9 @@ impl WsConnectionLimiter {
             );
             None
         } else {
-            Some(WsPermit { limiter: self.clone() })
+            Some(WsPermit {
+                limiter: self.clone(),
+            })
         }
     }
 

@@ -12,4 +12,4 @@ pub mod engine;
 pub mod sniff;
 
 pub use engine::{FlowContext, NetworkKind, RouteDecision, RouteEngine};
-pub use sniff::{proto_name_matches, sniff_tcp, sniff_udp, L7Proto};
+pub use sniff::{L7Proto, proto_name_matches, sniff_tcp, sniff_udp};

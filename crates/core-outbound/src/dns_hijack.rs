@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::debug;
 
 use crate::adapter::{
@@ -125,8 +125,8 @@ impl OutboundAdapter for DnsHijackOutbound {
 }
 
 /* ============================================================
-   UDP hijack —— 每个 send_to 是一个 DNS 请求，answer 排队给 recv_from。
-   ============================================================ */
+UDP hijack —— 每个 send_to 是一个 DNS 请求，answer 排队给 recv_from。
+============================================================ */
 
 struct DnsUdpHijack {
     responder: Arc<dyn DnsResponder>,
@@ -196,9 +196,9 @@ impl UdpSocketLike for DnsUdpHijack {
 }
 
 /* ============================================================
-   TCP hijack —— 把 (read, write) 端点用 channel 串起来，后台 task 读
-   length-prefixed DNS 消息，调 responder，写回响应。
-   ============================================================ */
+TCP hijack —— 把 (read, write) 端点用 channel 串起来，后台 task 读
+length-prefixed DNS 消息，调 responder，写回响应。
+============================================================ */
 
 struct DnsTcpHijack {
     /// 调用方 → 后台 task 的请求字节流。
@@ -315,10 +315,7 @@ impl AsyncWrite for DnsTcpHijack {
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // 关闭请求通道 → worker 收到 None → 自然退出 → resp_rx 也会被关。
         self.req_tx = None;
         Poll::Ready(Ok(()))

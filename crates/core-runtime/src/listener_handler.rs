@@ -7,11 +7,11 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use compact_str::ToCompactString;
-use core_observe::{copy_bidirectional_tracked, ConnectionGuard, ConnectionMeta};
+use core_observe::{ConnectionGuard, ConnectionMeta, copy_bidirectional_tracked};
 use core_route::{FlowContext, L7Proto, NetworkKind};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
@@ -245,10 +245,7 @@ impl ListenerHandler {
             // （正常路径根本不进 listener）。
             return self
                 .runtime
-                .dial_direct_with_context(
-                    metadata.flow_context(),
-                    "inner-connection".to_string(),
-                )
+                .dial_direct_with_context(metadata.flow_context(), "inner-connection".to_string())
                 .await;
         }
         if metadata.force_direct {
@@ -582,13 +579,18 @@ fn udp_connection_meta(metadata: &InboundMetadata, result: &UdpDialResult) -> Co
     }
 }
 
-fn inbound_parts(addr: Option<SocketAddr>) -> (compact_str::CompactString, compact_str::CompactString) {
+fn inbound_parts(
+    addr: Option<SocketAddr>,
+) -> (compact_str::CompactString, compact_str::CompactString) {
     match addr {
         Some(addr) => (
             addr.ip().to_compact_string(),
             addr.port().to_compact_string(),
         ),
-        None => (compact_str::CompactString::default(), compact_str::CompactString::default()),
+        None => (
+            compact_str::CompactString::default(),
+            compact_str::CompactString::default(),
+        ),
     }
 }
 

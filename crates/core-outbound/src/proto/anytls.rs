@@ -35,8 +35,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
@@ -49,7 +49,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 use crate::proto::addr::encode_socks_addr;
-use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
 
 const CMD_SYN: u8 = 0x00;
 const CMD_PSH: u8 = 0x01;

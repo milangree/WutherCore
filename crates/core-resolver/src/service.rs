@@ -10,14 +10,14 @@ use std::time::Duration;
 use core_config::model::FakeMode;
 use tracing::{debug, trace};
 
+use crate::Resolver;
 use crate::cache::QType;
 use crate::fake_ip::{AddressFamily, FakeIpFilter, FakeIpPool};
 use crate::mapping::IpHostMapping;
 use crate::packet::{
-    build_empty_response, build_ip_response, build_record_response, parse_first_question, TYPE_A,
-    TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB,
+    TYPE_A, TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, build_empty_response, build_ip_response,
+    build_record_response, parse_first_question,
 };
-use crate::Resolver;
 
 #[derive(Clone)]
 pub struct DnsService {
@@ -464,9 +464,10 @@ mod tests {
         let resp = service.serve_packet(&query("txt.example.com", 16)).await;
 
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1);
-        assert!(resp
-            .windows(b"normal-mode-real-dns".len())
-            .any(|w| w == b"normal-mode-real-dns"));
+        assert!(
+            resp.windows(b"normal-mode-real-dns".len())
+                .any(|w| w == b"normal-mode-real-dns")
+        );
     }
 
     #[tokio::test]

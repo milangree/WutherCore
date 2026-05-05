@@ -10,8 +10,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -19,15 +19,15 @@ use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame};
 use parking_lot::Mutex as PlMutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use super::config::Config;
-use super::conn::{new_session_id, PipeWriter, WaitReader, WaitReaderHandle, XConn};
+use super::conn::{PipeWriter, WaitReader, WaitReaderHandle, XConn, new_session_id};
 use super::request::{
-    fill_download_request, fill_packet_request, fill_stream_request, PreparedRequest,
+    PreparedRequest, fill_download_request, fill_packet_request, fill_stream_request,
 };
 use crate::adapter::BoxedStream;
-use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
 
 /// 统一 body：支持流式（mpsc）或一次性（单 chunk）
 pub enum XhttpBody {

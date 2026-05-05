@@ -15,9 +15,9 @@ use clap::{Parser, Subcommand};
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
+use core_inbound::MixedListener;
 use core_inbound::ensure_best_effort_privilege;
 use core_inbound::run_mixed;
-use core_inbound::MixedListener;
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
@@ -217,7 +217,14 @@ async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
                             let s = m.stats();
                             println!(
                                 "    domains={} suffixes={} keywords={} regex={} cidr_v4={} cidr_v6={} ports={} processes={}",
-                                s.domains, s.suffixes, s.keywords, s.regex, s.cidr_v4, s.cidr_v6, s.ports, s.processes
+                                s.domains,
+                                s.suffixes,
+                                s.keywords,
+                                s.regex,
+                                s.cidr_v4,
+                                s.cidr_v6,
+                                s.ports,
+                                s.processes
                             );
                         }
                     }

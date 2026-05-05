@@ -14,8 +14,8 @@
 use serde::Deserialize;
 
 use crate::matcher::ClassicalEntry;
-use crate::parser::txt::parse_line;
 use crate::parser::ParseError;
+use crate::parser::txt::parse_line;
 
 #[derive(Deserialize)]
 struct Doc {

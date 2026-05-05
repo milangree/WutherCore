@@ -7,7 +7,7 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 
 use crate::log_bus::LogBus;
 
@@ -95,7 +95,9 @@ pub fn init_tracing_with_config(config: TracingConfig, bus: Option<Arc<LogBus>>)
     let filter_directive = configured_filter_directive(&config);
     let fallback_directive = config.level.trim().to_ascii_lowercase();
     let filter = EnvFilter::try_new(&filter_directive).unwrap_or_else(|e| {
-        eprintln!("invalid log filter `{filter_directive}`: {e}; fallback to level `{fallback_directive}`");
+        eprintln!(
+            "invalid log filter `{filter_directive}`: {e}; fallback to level `{fallback_directive}`"
+        );
         EnvFilter::try_new(&fallback_directive).unwrap_or_else(|_| EnvFilter::new(DEFAULT_RP_LOG))
     });
     let file_writer = prepare_file_writer(config.file.as_ref());

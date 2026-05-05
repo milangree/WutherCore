@@ -19,8 +19,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,8 +36,8 @@ use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, Capabilities, DialContext,
-    OutboundAdapter,
+    BoxedStream, Capabilities, DialContext, OutboundAdapter, prepare_outbound_udp_socket_for_addr,
+    resolve_host,
 };
 
 /* ---------------- 协议常量 ---------------- */

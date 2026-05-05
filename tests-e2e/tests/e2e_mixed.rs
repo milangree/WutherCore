@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use core_inbound::{run_mixed, MixedListener};
+use core_inbound::{MixedListener, run_mixed};
 use core_runtime::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

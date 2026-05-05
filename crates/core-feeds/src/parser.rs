@@ -2,7 +2,7 @@
 
 use base64::Engine;
 use core_config::model::FeedDetail;
-use core_config::node_uri::{parse_uri, NodeProtocol, ParsedNode};
+use core_config::node_uri::{NodeProtocol, ParsedNode, parse_uri};
 use serde::Deserialize;
 use tracing::{debug, warn};
 

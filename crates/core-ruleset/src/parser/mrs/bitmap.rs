@@ -110,7 +110,7 @@ pub fn select32_r64(bm: &[u64], selects: &[i32], ranks: &[i32], i: i32) -> i32 {
     }
     let bucket = (i / 64) as usize;
     let _inside = (i % 64) as u32; // 暂未使用：select_within_word 在 word 内重新定位
-                                   // 起点：第 bucket 个 64-step 采样位置
+    // 起点：第 bucket 个 64-step 采样位置
     let start_bit = if bucket < selects.len() {
         selects[bucket] as usize
     } else {

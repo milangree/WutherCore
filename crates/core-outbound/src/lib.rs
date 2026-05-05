@@ -26,21 +26,20 @@ pub mod proto;
 pub mod transport;
 
 pub use adapter::{
-    apply_outbound_mark, apply_outbound_mark_for_addr, bind_outbound_socket, bind_to_device,
-    create_outbound_udp_socket, global_dial_resolver,
-    has_socket_protector, next_dial_id, outbound_fwmark, outbound_interface,
+    BoxedStream, BoxedUdp, Capabilities, DialContext, DialResolver, OutboundAdapter,
+    ProtectedSocket, ProxyStream, SocketProtector, UdpSocketLike, apply_outbound_mark,
+    apply_outbound_mark_for_addr, bind_outbound_socket, bind_to_device, create_outbound_udp_socket,
+    global_dial_resolver, has_socket_protector, next_dial_id, outbound_fwmark, outbound_interface,
     outbound_interface_index_v4, outbound_interface_index_v6, prepare_outbound_udp_socket,
     prepare_outbound_udp_socket_for_addr, protect_socket, resolve_host, set_global_dial_resolver,
     set_outbound_fwmark, set_outbound_interface, set_outbound_interface_index,
-    set_socket_protector, should_mark_outbound_addr, BoxedStream, BoxedUdp, Capabilities,
-    DialContext, DialResolver, OutboundAdapter, ProtectedSocket, ProxyStream, SocketProtector,
-    UdpSocketLike,
+    set_socket_protector, should_mark_outbound_addr,
 };
 pub use dns_hijack::{
-    global_dns_responder, set_global_dns_responder, DnsHijackOutbound, DnsResponder,
+    DnsHijackOutbound, DnsResponder, global_dns_responder, set_global_dns_responder,
 };
 pub use loopback::{
-    is_loopback_tcp_source, is_loopback_udp_source, register_tcp, register_udp, LoopbackTcpGuard,
-    LoopbackUdpGuard, TrackedTcpStream,
+    LoopbackTcpGuard, LoopbackUdpGuard, TrackedTcpStream, is_loopback_tcp_source,
+    is_loopback_udp_source, register_tcp, register_udp,
 };
 pub use registry::{OutboundRegistry, ResolveFn};
