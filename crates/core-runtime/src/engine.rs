@@ -165,6 +165,13 @@ impl Runtime {
             OutboundDnsSocketFactory,
         ));
         // 注入带自定义 DNS 的 HTTP client（避免 reqwest 用 getaddrinfo → fake-IP 循环）
+        //
+        // 注意：reqwest 的底层 HttpConnector 没有 IP_UNICAST_IF / IP_BOUND_IF /
+        // SO_MARK 注入点，订阅/规则集拉取的 TCP socket 不会被 bind_outbound_socket
+        // 加固。Windows / macOS 上这些 socket 的出站包会进 TUN，再被
+        // is_inner_source 检测到走 dial_direct 安全网（功能正确，但每个字节
+        // 多 2 段 user-stack 中转）。彻底修需要写自定义 hyper Connector，规模
+        // 较大；当前只在低频拉取场景命中，先靠安全网兜住。
         if let Ok(client) = reqwest::Client::builder()
             .user_agent("WutherCore/0.3")
             .timeout(std::time::Duration::from_secs(30))
@@ -1292,7 +1299,7 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
         let sock = std::net::UdpSocket::bind(bind_addr)?;
         core_outbound::protect_socket(&sock)?;
         let s2 = socket2::SockRef::from(&sock);
-        // SO_MARK: 让 fwmark rule 路由到物理网卡
+        // SO_MARK: Linux/Android fwmark rule 路由到物理网卡
         if let Err(e) = core_outbound::apply_outbound_mark_for_addr(&s2, peer) {
             let mark = core_outbound::outbound_fwmark();
             if mark != 0 {
@@ -1300,9 +1307,14 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
                 return Err(e);
             }
         }
-        // SO_BINDTODEVICE: 直接绑定到物理网卡，双重保障
-        if let Err(e) = core_outbound::bind_to_device(&s2) {
-            tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS UDP SO_BINDTODEVICE failed (non-fatal)");
+        // 跨平台 OS 级出站绑定：Linux/Android SO_BINDTODEVICE，
+        // Windows IP_UNICAST_IF / IPV6_UNICAST_IF，
+        // macOS / iOS IP_BOUND_IF / IPV6_BOUND_IF。
+        // 这是 DNS 上游 socket 在 Windows / macOS 上唯一能跳过 TUN 默认路由的
+        // 路径——之前只调 bind_to_device 等于这两个平台彻底无防护，DNS 包全
+        // 走 TUN 自循环（safety net 兜得住但有 3 段 user-stack 中转）。
+        if let Err(e) = core_outbound::bind_outbound_socket(&s2, peer) {
+            tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS UDP outbound bind failed (non-fatal)");
         }
         Ok(sock)
     }
@@ -1318,7 +1330,7 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
         };
         let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
         core_outbound::protect_socket(&sock)?;
-        // SO_MARK + SO_BINDTODEVICE: 双重保障绕 TUN
+        // SO_MARK: Linux/Android fwmark rule 路由
         if let Err(e) = core_outbound::apply_outbound_mark_for_addr(&sock, peer) {
             let mark = core_outbound::outbound_fwmark();
             if mark != 0 {
@@ -1326,8 +1338,9 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
                 return Err(e);
             }
         }
-        if let Err(e) = core_outbound::bind_to_device(&sock) {
-            tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS TCP SO_BINDTODEVICE failed (non-fatal)");
+        // 同 create_udp：跨平台 OS 级出站绑定，Windows / macOS 上是唯一防护。
+        if let Err(e) = core_outbound::bind_outbound_socket(&sock, peer) {
+            tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS TCP outbound bind failed (non-fatal)");
         }
         sock.connect_timeout(
             &peer.into(),
