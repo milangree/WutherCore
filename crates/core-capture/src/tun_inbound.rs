@@ -23,10 +23,19 @@ use crate::packet::{ParsedPacket, L4};
 ///
 /// 此前 `tun_dispatch::tun_listener_metadata` / `stack_system::build_inbound_metadata` /
 /// `system_dispatch::build_inbound_metadata` 各持一份副本，现在抽到这里。
+///
+/// **关于 inner**: 本函数**不**接受 inner 参数。TUN ingress 拿到的数据包
+/// src IP 在所有"接口只挂网关 IP"的标准 TUN 拓扑（Android VpnService /
+/// Linux 单 IP tun / macOS utun / Windows wintun）下，对用户进程出站和
+/// kernel 内部 socket 出站两者都等于网关 IP，无法区分；任何包级反推
+/// 都是 100% false positive。`metadata.is_inner` 是发起方的显式 tag
+/// （参考 mihomo `metadata.Type = INNER`），目前本仓库内部组件全部走
+/// `bind_outbound_socket` 在 socket 层绕过 TUN，根本不会进 listener
+/// 路径，因此 `is_inner` 字段当前没有生产 set 点，留作未来"显式 tag
+/// 的内部 RPC 走 tunnel"扩展点。
 pub fn build_inbound_metadata(
     session: &TunSession,
     inbound_addr: Option<SocketAddr>,
-    inner: bool,
 ) -> InboundMetadata {
     let network = match session.network {
         "udp" => NetworkKind::Udp,
@@ -48,9 +57,6 @@ pub fn build_inbound_metadata(
     .with_sniff_host(session.sniff_host.clone().unwrap_or_default());
     if let Some(reason) = session.bypass {
         metadata = metadata.with_force_direct(reason.as_rule_payload());
-    }
-    if inner {
-        metadata = metadata.with_inner();
     }
     metadata
 }
@@ -258,23 +264,20 @@ impl TunInbound {
         &self.plan
     }
 
-    /// 判断 source 是否是 WutherCore 自身发起的内部连接。
-    ///
-    /// 此函数永远返回 `false` —— 历史实现用 `source_ip == tun_gateway` 做检测，
-    /// 但在 Windows wintun / Linux 单 IP tun / macOS utun 这些"接口只挂网关 IP"
-    /// 的常见拓扑上，**所有**用户应用经 TUN 出站时 src IP 也等于网关 IP，
-    /// 导致 100% false positive：用户业务流被误判为内部连接，跳过 rule engine
-    /// 强制 DIRECT，DIRECT 又走 marked DNS 触发同链路超时，整套核心几乎断网。
-    ///
-    /// 内部 socket（resolver / fetch / health-check）已经在创建时通过
-    /// [`core_outbound::bind_outbound_socket`] 走 `IP_UNICAST_IF` /
-    /// `IP_BOUND_IF` / `SO_BINDTODEVICE` 强行绑物理网卡，不会进 TUN，
-    /// 因此本"安全网"在正常工作流里没有补位价值；硬要保留只会再次踩坑。
-    /// 真正可靠的内部连接识别只能由发起方主动 tag（参考 `metadata.is_inner`
-    /// 在 `core-runtime` 内部 RPC 路径上的设置点）。
-    pub fn is_inner_source(&self, _source_ip: IpAddr) -> bool {
-        false
-    }
+    // 历史曾经有 `is_inner_source(src_ip) -> bool` 用 `src_ip == tun_gateway`
+    // 反推内部连接 —— 已删除。原因详见 `build_inbound_metadata` 的
+    // "关于 inner" 段落。
+    //
+    // 简述：
+    // * Android VpnService / Linux 单 IP tun / macOS utun / Windows wintun
+    //   等"接口只挂网关 IP"的标准拓扑里，用户进程出站包的 src IP 与 kernel
+    //   内部 socket 出站包的 src IP 都被 OS 选成了 TUN 网关 IP，包级无法区分。
+    // * 三个参考实现（mihomo / sing-box / sing-tun）都只把"INNER"当作发起方
+    //   显式 tag（mihomo `metadata.Type = INNER`），没有任何一处用包反推；
+    //   sing-tun 的 `acceptLoop` 直接 `handler.NewConnectionEx(...)` 不做检测。
+    // * 本仓库内部组件（DNS upstream / core-fetch / health-check）全部经
+    //   `bind_outbound_socket` 在 socket 层绕过 TUN，正常情况下不会进 ingress
+    //   路径；不需要 ingress 端的"安全网"。
 
     pub fn fake_pool(&self) -> &Arc<FakeIpPool> {
         &self.fake_pool

@@ -669,16 +669,15 @@ async fn run_accept_consumer(
                     }
                     continue;
                 }
-                let inner = inbound.is_inner_source(ev.remote.ip());
                 let prepared = handler
-                    .prepare_tcp(build_inbound_metadata(&target_session, Some(ev.local), inner))
+                    .prepare_tcp(build_inbound_metadata(&target_session, Some(ev.local)))
                     .await;
                 match prepared {
                     Ok(prepared) => {
                         let core_runtime::PreparedTcp { result, guard } = prepared;
                         {
                             let id = guard.id;
-                            let src = if inner { "WutherCore" } else { &ev.remote.to_string() };
+                            let src = ev.remote.to_string();
                             let host = &target_session.target.host;
                             let port = target_session.target.original_dst_port;
                             let proxy = if result.chain.len() > 1 {

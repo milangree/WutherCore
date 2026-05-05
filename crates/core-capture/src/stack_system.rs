@@ -1057,8 +1057,7 @@ async fn handle_accepted_conn(
     }
 
     // 2) 走统一 ListenerHandler 路由 + 拨号
-    let inner = inbound.is_inner_source(source.ip());
-    let metadata = build_inbound_metadata(&target_session, inbound_addr, inner);
+    let metadata = build_inbound_metadata(&target_session, inbound_addr);
     let prepared = match handler.prepare_tcp(metadata).await {
         Ok(p) => p,
         Err(e) => {
@@ -1077,7 +1076,7 @@ async fn handle_accepted_conn(
     };
     let PreparedTcp { result, guard } = prepared;
     let conn_id = guard.id;
-    let src_label = if inner { "WutherCore" } else { &source.to_string() };
+    let src_label = source.to_string();
     let host = &target_session.target.host;
     let port = target_session.target.original_dst_port;
     let proxy = if result.chain.len() > 1 {

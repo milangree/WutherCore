@@ -249,9 +249,8 @@ async fn run_udp_dial_worker(
         port = session_meta.target.original_dst_port,
         "udp dial worker started"
     );
-    let inner = ctx.inbound.is_inner_source(inner_src.ip());
     let prepared = match handler
-        .new_packet(build_inbound_metadata(&session_meta, None, inner))
+        .new_packet(build_inbound_metadata(&session_meta, None))
         .await
     {
         Ok(r) => r,
@@ -274,7 +273,7 @@ async fn run_udp_dial_worker(
     ctx.udp_sessions.remove_pending(&key);
     {
         let id = session.guard.id;
-        let src = if inner { "WutherCore".to_string() } else { inner_src.to_string() };
+        let src = inner_src.to_string();
         let host = &session.target_host;
         let port = session.target_port;
         if let Some(b) = session_meta.bypass {
