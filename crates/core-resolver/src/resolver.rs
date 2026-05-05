@@ -2012,13 +2012,6 @@ fn parse_server_endpoint(
     Ok((host, port, sni))
 }
 
-fn parse_ip_socket(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|_| format!("resolver server host must be IP literal: {host}"))?;
-    Ok(SocketAddr::new(ip, port))
-}
-
 /// host 是 IP literal → 直接组装；否则走 system DNS（mihomo bootstrap 等价）。
 /// 用于 DoT/DoQ/UDP/TCP 上游构造时把 hostname 解析为可连接的 SocketAddr。
 fn resolve_host_to_socket(host: &str, port: u16, kind_label: &str) -> Result<SocketAddr, String> {

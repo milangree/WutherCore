@@ -15,7 +15,6 @@ use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
 use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use hickory_resolver::proto::serialize::binary::BinDecodable;
 use tokio::net::UdpSocket;
-use tracing::{debug, warn};
 
 use super::{DnsError, DnsUpstream};
 
