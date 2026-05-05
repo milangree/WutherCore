@@ -394,9 +394,15 @@ fn parse_uid_gid_from_status(path: &str) -> Option<(u32, u32)> {
     let mut gid = None;
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {
-            uid = rest.split_whitespace().next().and_then(|s| s.parse::<u32>().ok());
+            uid = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok());
         } else if let Some(rest) = line.strip_prefix("Gid:") {
-            gid = rest.split_whitespace().next().and_then(|s| s.parse::<u32>().ok());
+            gid = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok());
         }
         if uid.is_some() && gid.is_some() {
             break;
@@ -468,10 +474,7 @@ mod tests {
 
     #[test]
     fn package_only_constructor_compat() {
-        let filter = UidPacketFilter::from_packages(
-            vec!["com.example.excluded".into()],
-            vec![],
-        );
+        let filter = UidPacketFilter::from_packages(vec!["com.example.excluded".into()], vec![]);
         assert!(filter.is_active());
     }
 

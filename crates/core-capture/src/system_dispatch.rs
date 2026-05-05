@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::eim_nat::EimNatTable;
 use crate::engine::CapturePlan;
-use crate::frame_cache::{write_ip_packet_to_tun, TunFrameFormatCache};
+use crate::frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun};
 use crate::nat::NatTable;
 use crate::packet::parse_tun_frame;
 use crate::stack_system::{ProcessOutcome, SystemStack, SystemStackHandle};
@@ -30,8 +30,8 @@ use crate::tun_inbound::{TunInbound, TunPacket};
 use crate::tun_io::TunIo;
 
 use crate::tun_pump::{
-    TrafficLog, PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL,
-    TUN_IDLE_LOG_INTERVAL, TUN_TRAFFIC_SUMMARY_INTERVAL,
+    PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL,
+    TUN_TRAFFIC_SUMMARY_INTERVAL, TrafficLog,
 };
 
 /* =============================================================

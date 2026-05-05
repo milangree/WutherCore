@@ -48,8 +48,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, Capabilities, DialContext,
-    OutboundAdapter,
+    BoxedStream, Capabilities, DialContext, OutboundAdapter, prepare_outbound_udp_socket_for_addr,
+    resolve_host,
 };
 
 const TUIC_VERSION: u8 = 0x05;

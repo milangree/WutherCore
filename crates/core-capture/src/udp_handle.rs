@@ -11,8 +11,8 @@
 //! 与 mihomo / sing-tun 的语义对齐：fake-DNS 缺失直接 drop（不 fallback 系统 DNS）。
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use core_resolver::DnsService;
@@ -21,9 +21,9 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, trace, warn};
 
-use crate::frame_cache::{write_ip_packet_to_tun, TunFrameFormatCache};
+use crate::frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun};
 use crate::nat::{NatEntry, NatTable};
-use crate::tun_inbound::{build_inbound_metadata, TunDropReason, TunInbound};
+use crate::tun_inbound::{TunDropReason, TunInbound, build_inbound_metadata};
 use crate::tun_io::TunIo;
 use crate::udp_session::{PendingUdpSession, UDP_PENDING_QUEUE_CAPACITY};
 

@@ -132,9 +132,7 @@ pub fn parse(body: &[u8]) -> Result<MrsPayload, ParseError> {
         BEHAVIOR_CLASSICAL => Err(ParseError::UnsupportedBinary(
             "mihomo MRS classical behavior 尚未实现（mihomo 主分支也未提供 mrs converter classical 路径）",
         )),
-        _ => Err(ParseError::UnsupportedBinary(
-            "MRS behavior 未知（>2）",
-        )),
+        _ => Err(ParseError::UnsupportedBinary("MRS behavior 未知（>2）")),
     }
 }
 

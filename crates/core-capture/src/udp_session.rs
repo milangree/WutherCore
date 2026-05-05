@@ -160,11 +160,7 @@ impl UdpSessionTable {
             .iter()
             .filter_map(|e| {
                 let ls = *e.value().last_seen.lock();
-                if ls < cutoff {
-                    Some(*e.key())
-                } else {
-                    None
-                }
+                if ls < cutoff { Some(*e.key()) } else { None }
             })
             .collect();
         let pending_to_remove: Vec<UdpFlowKey> = self

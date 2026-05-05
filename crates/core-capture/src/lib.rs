@@ -33,6 +33,7 @@ pub mod ipset;
 pub mod nat;
 pub mod net_monitor;
 pub mod net_monitor_event;
+pub mod netstack_dispatch;
 pub mod packet;
 pub mod platform;
 pub mod route_table;
@@ -40,41 +41,40 @@ pub mod stack;
 pub mod stack_system;
 pub mod supervisor;
 pub mod sys_proxy;
-pub mod netstack_dispatch;
 pub mod system_dispatch;
 pub mod tcp_nat;
 mod tproxy_rules;
 pub mod tun;
 pub mod tun_dispatch;
-pub mod uid_filter;
-pub(crate) mod tun_pump;
 pub mod tun_inbound;
 pub mod tun_io;
 pub mod tun_logging;
+pub(crate) mod tun_pump;
 pub mod udp_forwarder;
 pub mod udp_handle;
 pub mod udp_session;
+pub mod uid_filter;
 
 pub use android_caps::{AndroidCapability, AndroidTier};
 pub use android_vpn_config::{
-    build_vpn_service_config, build_vpn_service_config_json, AndroidIpPrefix,
-    AndroidVpnServiceConfig,
+    AndroidIpPrefix, AndroidVpnServiceConfig, build_vpn_service_config,
+    build_vpn_service_config_json,
 };
-pub use dial_meta::{build_dial_target, DialTarget, DnsMode};
+pub use dial_meta::{DialTarget, DnsMode, build_dial_target};
 
-pub use doctor::{diagnose, DoctorReport};
+pub use doctor::{DoctorReport, diagnose};
 pub use eim_nat::{EimEntry, EimKey, EimNatTable};
 pub use engine::{
     AutoRedirectMarks, CaptureEngine, CaptureError, CaptureEvent, CaptureFilters, CapturePlan,
     EngineKind,
 };
-pub use ipset::{noop as noop_ipset_provider, IpSetProvider, NoopIpSetProvider};
+pub use ipset::{IpSetProvider, NoopIpSetProvider, noop as noop_ipset_provider};
 pub use nat::{FlowKey, HostPin, NatEntry, NatTable};
-pub use packet::{IpHeader, IpVersion, ParsedPacket, TcpFlags, TcpSummary, UdpSummary, L4};
+pub use packet::{IpHeader, IpVersion, L4, ParsedPacket, TcpFlags, TcpSummary, UdpSummary};
 pub use route_table::{ManagedRoute, RouteBackend, RouteTable, SystemBackend};
 pub use stack::{
-    AcceptedTcp, SharedStack, SmolStream, SpliceManager, StackNotify, UserSpaceStack,
-    VirtualTunDevice, DEFAULT_LISTENER_POOL,
+    AcceptedTcp, DEFAULT_LISTENER_POOL, SharedStack, SmolStream, SpliceManager, StackNotify,
+    UserSpaceStack, VirtualTunDevice,
 };
 pub use stack_system::{ProcessOutcome, SystemStack, SystemStackHandle};
 pub use supervisor::CaptureSupervisor;
@@ -84,6 +84,6 @@ pub use tcp_nat::{NatSession, TcpNat};
 pub use tun::{TunConfig, TunDevice};
 pub use tun_dispatch::{TunDispatcher, TunDispatcherHandles};
 pub use tun_inbound::{TunDropReason, TunInbound, TunOutboundMeta, TunPacket, TunSession};
-pub use tun_io::{open_tun_device, TunIo, TunIoError};
-pub use udp_forwarder::{run_return_loop, send_one as udp_send_one, UdpForwarderConfig};
+pub use tun_io::{TunIo, TunIoError, open_tun_device};
+pub use udp_forwarder::{UdpForwarderConfig, run_return_loop, send_one as udp_send_one};
 pub use udp_session::{UdpFlowKey, UdpSession, UdpSessionTable};

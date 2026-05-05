@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Uri};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, header};
 use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -142,12 +142,12 @@ async fn fetch_inner(url: &str, opts: &FetchOptions) -> Result<FetchResult, Fetc
         let addrs = core_outbound::resolve_host(&host, port)
             .await
             .map_err(FetchError::Resolve)?;
-        let peer = *addrs
-            .first()
-            .ok_or_else(|| FetchError::Resolve(std::io::Error::new(
+        let peer = *addrs.first().ok_or_else(|| {
+            FetchError::Resolve(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "no address resolved",
-            )))?;
+            ))
+        })?;
 
         // 2) 开 TCP 走 bind_outbound_socket —— 这才是本 crate 存在的核心理由。
         let tcp = tokio::time::timeout(opts.connect_timeout, connect_tcp_outbound_bound(peer))
@@ -217,10 +217,12 @@ where
     });
 
     // 构造 request URI —— path + query。host 走 Host header 而不是 absolute URI。
-    let path_query = parsed
-        .path()
-        .to_string()
-        + parsed.query().map(|q| format!("?{q}")).unwrap_or_default().as_str();
+    let path_query = parsed.path().to_string()
+        + parsed
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default()
+            .as_str();
     let uri: Uri = path_query
         .parse()
         .map_err(|e: http::uri::InvalidUri| FetchError::BadUrl(e.to_string()))?;
@@ -323,9 +325,7 @@ fn decode_body(raw: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, FetchError
 /// 3. socket2 connect（nonblocking 模式，立即返回 EINPROGRESS / WOULDBLOCK）
 /// 4. 把裸 socket 交给 tokio TcpStream，等 WRITABLE 就绪
 /// 5. 检 SO_ERROR 区分"连上了"与"被拒"
-async fn connect_tcp_outbound_bound(
-    peer: std::net::SocketAddr,
-) -> std::io::Result<TcpStream> {
+async fn connect_tcp_outbound_bound(peer: std::net::SocketAddr) -> std::io::Result<TcpStream> {
     use socket2::SockAddr;
     use std::io::ErrorKind;
     use tokio::io::Interest;
@@ -425,7 +425,10 @@ mod tests {
         use http::HeaderName;
         let mut h = HeaderMap::new();
         h.insert(HeaderName::from_static("etag"), "\"abc\"".parse().unwrap());
-        h.insert(HeaderName::from_static("content-type"), "text/plain".parse().unwrap());
+        h.insert(
+            HeaderName::from_static("content-type"),
+            "text/plain".parse().unwrap(),
+        );
         let map = response_headers_lower(&h);
         assert_eq!(map.get("etag"), Some(&"\"abc\"".to_string()));
         assert_eq!(map.get("content-type"), Some(&"text/plain".to_string()));

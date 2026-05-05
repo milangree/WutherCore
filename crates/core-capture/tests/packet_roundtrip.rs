@@ -3,7 +3,7 @@
 //! 这些 test 不依赖 OS / TUN，纯 in-process，跨平台都能跑。
 
 use core_capture::packet::{
-    encode_tun_ip_frame, parse_ip_packet, parse_tun_frame, FrameFormat, IpVersion, L4,
+    FrameFormat, IpVersion, L4, encode_tun_ip_frame, parse_ip_packet, parse_tun_frame,
 };
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{

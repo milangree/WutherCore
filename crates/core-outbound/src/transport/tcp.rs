@@ -6,8 +6,8 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::adapter::{
-    apply_outbound_mark_for_addr, protect_socket, resolve_host, resolve_host_for_direct,
-    BoxedStream,
+    BoxedStream, apply_outbound_mark_for_addr, protect_socket, resolve_host,
+    resolve_host_for_direct,
 };
 use crate::loopback::TrackedTcpStream;
 use crate::transport::Transport;

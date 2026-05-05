@@ -11,12 +11,12 @@ use core_config::runtime_plan::RuntimePlan;
 use core_observe::{ConnectionTable, Metrics};
 use core_outbound::{
     adapter::{DialContext, SharedOutbound},
-    registry::{register_nodes, OutboundRegistry},
+    registry::{OutboundRegistry, register_nodes},
 };
 use core_resolver::Resolver;
 use core_route::{FlowContext, NetworkKind, RouteDecision, RouteEngine};
 use core_smart::SmartSelector;
-use core_store::{schema::GROUP_MANUAL, Store};
+use core_store::{Store, schema::GROUP_MANUAL};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -161,9 +161,7 @@ impl Runtime {
         // 才使用 mark 绕过 redirect/tproxy chain。
         let out_mark = outbound_fwmark_for_plan(&plan);
         core_outbound::set_outbound_fwmark(out_mark);
-        core_resolver::upstream::marked::set_dns_socket_factory(Arc::new(
-            OutboundDnsSocketFactory,
-        ));
+        core_resolver::upstream::marked::set_dns_socket_factory(Arc::new(OutboundDnsSocketFactory));
         // 订阅 / 规则集拉取的 HTTP client 由 core-fetch 自管理：内部直接走
         // hyper + tokio-rustls + bind_outbound_socket，net_monitor 同步的
         // 出站 ifindex / 接口名对它即时生效，不需要 client rebuild。
@@ -1272,10 +1270,7 @@ impl core_outbound::DialResolver for ResolverAdapter {
 struct OutboundDnsSocketFactory;
 
 impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFactory {
-    fn create_udp(
-        &self,
-        peer: std::net::SocketAddr,
-    ) -> std::io::Result<std::net::UdpSocket> {
+    fn create_udp(&self, peer: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
         let bind_addr: std::net::SocketAddr = if peer.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
@@ -1304,16 +1299,14 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
         Ok(sock)
     }
 
-    fn create_tcp(
-        &self,
-        peer: std::net::SocketAddr,
-    ) -> std::io::Result<std::net::TcpStream> {
+    fn create_tcp(&self, peer: std::net::SocketAddr) -> std::io::Result<std::net::TcpStream> {
         let domain = if peer.is_ipv4() {
             socket2::Domain::IPV4
         } else {
             socket2::Domain::IPV6
         };
-        let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        let sock =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
         core_outbound::protect_socket(&sock)?;
         // SO_MARK: Linux/Android fwmark rule 路由
         if let Err(e) = core_outbound::apply_outbound_mark_for_addr(&sock, peer) {
@@ -1327,10 +1320,7 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
         if let Err(e) = core_outbound::bind_outbound_socket(&sock, peer) {
             tracing::debug!(target: "dial::dns", %peer, error = %e, "DNS TCP outbound bind failed (non-fatal)");
         }
-        sock.connect_timeout(
-            &peer.into(),
-            std::time::Duration::from_secs(10),
-        )?;
+        sock.connect_timeout(&peer.into(), std::time::Duration::from_secs(10))?;
         Ok(sock.into())
     }
 }

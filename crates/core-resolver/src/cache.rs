@@ -17,8 +17,8 @@
 //! * **泛型 Key**：`(host, qtype)` 组合 key，支持 A / AAAA / 双栈分桶。
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;

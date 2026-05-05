@@ -70,8 +70,8 @@ mod windows_impl {
     use tracing::{info, warn};
     use windows_sys::Win32::Foundation::{HANDLE, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        NotifyIpInterfaceChange, NotifyRouteChange2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW,
-        MIB_NOTIFICATION_TYPE,
+        MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
+        NotifyRouteChange2,
     };
     use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
 
@@ -182,7 +182,7 @@ mod linux_impl {
 
     fn open_netlink_socket() -> nix::Result<std::os::fd::OwnedFd> {
         use nix::sys::socket::{
-            bind, socket, AddressFamily, NetlinkAddr, SockFlag, SockProtocol, SockType,
+            AddressFamily, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, socket,
         };
         let fd = socket(
             AddressFamily::Netlink,
@@ -224,12 +224,7 @@ mod linux_impl {
                 let raw_fd = inner.get_ref().as_raw_fd();
                 // SAFETY: raw recv 调用，buf 在栈上有效，长度精确传入。
                 let n = unsafe {
-                    libc::recv(
-                        raw_fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
+                    libc::recv(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
                 };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
@@ -328,13 +323,8 @@ mod darwin_impl {
             let res = guard.try_io(|inner| {
                 let raw_fd = inner.get_ref().as_raw_fd();
                 // SAFETY: read 标准调用，buf 在栈上有效。
-                let n = unsafe {
-                    libc::read(
-                        raw_fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                    )
-                };
+                let n =
+                    unsafe { libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -343,7 +333,9 @@ mod darwin_impl {
             });
             match res {
                 Ok(Ok(_n)) => notify.notify_one(),
-                Ok(Err(e)) => warn!(target: "capture::net_monitor", error = %e, "PF_ROUTE read error"),
+                Ok(Err(e)) => {
+                    warn!(target: "capture::net_monitor", error = %e, "PF_ROUTE read error")
+                }
                 Err(_) => {} // spurious wakeup
             }
         }
@@ -361,10 +353,7 @@ mod darwin_impl {
     target_os = "macos",
     target_os = "ios"
 ))]
-fn spawn_debounce_loop(
-    notify: std::sync::Arc<tokio::sync::Notify>,
-    exclude: ExcludeList,
-) {
+fn spawn_debounce_loop(notify: std::sync::Arc<tokio::sync::Notify>, exclude: ExcludeList) {
     tokio::spawn(async move {
         loop {
             notify.notified().await;

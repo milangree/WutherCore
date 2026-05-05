@@ -150,11 +150,13 @@ mod tests {
         let v = parse(json).unwrap();
         // 1+1+1+2+1+1+1 = 8
         assert_eq!(v.len(), 8);
-        assert!(v
-            .iter()
-            .any(|e| e.kind == ClassicalKind::DomainKeyword && e.value == "google"));
-        assert!(v
-            .iter()
-            .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000"));
+        assert!(
+            v.iter()
+                .any(|e| e.kind == ClassicalKind::DomainKeyword && e.value == "google")
+        );
+        assert!(
+            v.iter()
+                .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000")
+        );
     }
 }

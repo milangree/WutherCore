@@ -12,8 +12,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::engine::CapturePlan;
 use crate::tun_io::{TunIo, TunIoError};

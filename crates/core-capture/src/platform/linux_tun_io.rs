@@ -32,8 +32,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::engine::CapturePlan;
 use crate::tun_io::{TunIo, TunIoError};
@@ -73,10 +73,10 @@ const TCP_OFFLOAD: u32 = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
 /// UDP 段大段输出（与 sing-tun `tunUDPOffloads` 一致）；TCP 之上叠加。
 const UDP_OFFLOAD: u32 = TUN_F_USO4 | TUN_F_USO6;
 
-use crate::platform::gro_merge::{merge_for_linux_tun_batch, GroOutput};
+use crate::platform::gro_merge::{GroOutput, merge_for_linux_tun_batch};
 use crate::platform::gso_split::process_vnet_segment;
 use crate::platform::vnet_hdr::{
-    encode_vnet_hdr_bytes, strip_vnet_hdr, VIRTIO_NET_HDR_LEN, ZERO_VNET_HDR,
+    VIRTIO_NET_HDR_LEN, ZERO_VNET_HDR, encode_vnet_hdr_bytes, strip_vnet_hdr,
 };
 
 #[repr(C)]

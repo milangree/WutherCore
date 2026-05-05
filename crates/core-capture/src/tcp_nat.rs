@@ -15,8 +15,8 @@
 //! - 已存在 (src, dst) 复用同一端口（命中 5-tuple 缓存）。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;

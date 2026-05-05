@@ -19,7 +19,7 @@ use crate::proto::hysteria2::Hysteria2Outbound;
 use crate::proto::mieru::{MieruCipher, MieruOutbound};
 use crate::proto::shadowsocks::{ShadowsocksOutbound, SsCipher};
 use crate::proto::snell::{SnellCipher, SnellOutbound};
-use crate::proto::ss2022::{Ss2022Outbound, Ss22Cipher};
+use crate::proto::ss2022::{Ss22Cipher, Ss2022Outbound};
 use crate::proto::ssh::SshOutbound;
 use crate::proto::ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol};
 use crate::proto::sudoku::{AeadMethod as SudokuAead, SudokuOutbound};

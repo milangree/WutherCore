@@ -253,7 +253,9 @@ pub fn outbound_fwmark() -> u32 {
 /// 设置全局出站接口名；对标 mihomo `DefaultInterface`。
 /// TUN 启动时由 route_probe 探测物理默认网卡写入。
 pub fn set_outbound_interface(iface: Option<String>) {
-    let mut guard = OUTBOUND_INTERFACE.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = OUTBOUND_INTERFACE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = iface;
 }
 
@@ -273,20 +275,12 @@ pub fn set_outbound_interface_index(v4: Option<u32>, v6: Option<u32>) {
 
 pub fn outbound_interface_index_v4() -> Option<u32> {
     let v = OUTBOUND_IFACE_INDEX_V4.load(Ordering::Acquire);
-    if v == 0 {
-        None
-    } else {
-        Some(v)
-    }
+    if v == 0 { None } else { Some(v) }
 }
 
 pub fn outbound_interface_index_v6() -> Option<u32> {
     let v = OUTBOUND_IFACE_INDEX_V6.load(Ordering::Acquire);
-    if v == 0 {
-        None
-    } else {
-        Some(v)
-    }
+    if v == 0 { None } else { Some(v) }
 }
 
 /// 把 socket 绑定到全局出站接口（SO_BINDTODEVICE）。

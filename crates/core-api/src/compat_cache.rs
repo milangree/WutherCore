@@ -31,8 +31,8 @@
 //!
 //! 100 个并发请求 → 1 次 build → 100 个共享同一份 `Bytes` / `Arc<Value>`。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;

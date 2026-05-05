@@ -54,7 +54,7 @@ use crate::adapter::{
     BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
 };
 use crate::proto::addr::encode_socks_addr;
-use crate::transport::{tcp::TcpTransport, Transport};
+use crate::transport::{Transport, tcp::TcpTransport};
 
 const PAYLOAD_MAX: usize = 0x3fff;
 
@@ -567,7 +567,7 @@ impl AsyncWrite for SnellStream {
         while written < pkt.len() {
             match this.inner.as_mut().poll_write(cx, &pkt[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

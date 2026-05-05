@@ -20,7 +20,7 @@ use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
 };
 
-use super::vnet_hdr::{parse_virtio_net_hdr, GsoType, VirtioNetHdr, VIRTIO_NET_HDR_LEN};
+use super::vnet_hdr::{GsoType, VIRTIO_NET_HDR_LEN, VirtioNetHdr, parse_virtio_net_hdr};
 
 /// IPv4 头中 ID 字段的偏移（仅用于测试断言；运行时通过 smoltcp `ip.ident()`）。
 #[allow(dead_code)]

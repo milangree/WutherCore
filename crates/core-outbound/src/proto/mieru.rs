@@ -34,7 +34,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 use crate::proto::addr::encode_socks_addr;
-use crate::transport::{tcp::TcpTransport, Transport};
+use crate::transport::{Transport, tcp::TcpTransport};
 
 const PAYLOAD_MAX: usize = 0x3fff;
 const SALT_LEN: usize = 16;
@@ -343,7 +343,7 @@ impl AsyncWrite for MieruStream {
         while written < pkt.len() {
             match this.inner.as_mut().poll_write(cx, &pkt[written..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

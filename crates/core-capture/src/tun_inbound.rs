@@ -9,15 +9,15 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use compact_str::ToCompactString;
-use core_observe::{string_list_from, ConnectionMeta};
+use core_observe::{ConnectionMeta, string_list_from};
 use core_resolver::FakeIpPool;
 use core_route::NetworkKind;
 use core_runtime::InboundMetadata;
 
-use crate::dial_meta::{build_dial_target, DialTarget};
+use crate::dial_meta::{DialTarget, build_dial_target};
 use crate::engine::CapturePlan;
 use crate::ipset::IpSetProvider;
-use crate::packet::{ParsedPacket, L4};
+use crate::packet::{L4, ParsedPacket};
 
 /// 由 `TunSession` 构造统一的 `InboundMetadata`（TCP/UDP 共用）。
 ///
@@ -99,10 +99,7 @@ pub fn is_global_unicast(ip: IpAddr) -> bool {
                 && o[0] < 240
         }
         IpAddr::V6(v6) => {
-            !v6.is_unspecified()
-                && !v6.is_loopback()
-                && !v6.is_multicast()
-                && !is_v6_link_local(v6)
+            !v6.is_unspecified() && !v6.is_loopback() && !v6.is_multicast() && !is_v6_link_local(v6)
         }
     }
 }
@@ -354,9 +351,7 @@ impl TunInbound {
         // 不返回 AAAA + outbound 不连 V6，组成 mihomo `ipv6: false` 的完整行为。
         // 不对 ICMPv6 / RA / NS 做特例（mihomo 也不区分），路由器场景下 OS 自己
         // 走 host stack。注意：放在 `match parsed.l4` 之前，TCP/UDP/Other 全覆盖。
-        if !self.plan.ipv6_enabled
-            && matches!(parsed.ip.version, crate::packet::IpVersion::V6)
-        {
+        if !self.plan.ipv6_enabled && matches!(parsed.ip.version, crate::packet::IpVersion::V6) {
             return Err(TunDropReason::Ipv6Disabled);
         }
         match parsed.l4 {
@@ -486,11 +481,7 @@ impl TunInbound {
             inbound_name: "tun".into(),
             host: session.target.host.as_str().into(),
             dns_mode: session.target.dns_mode.as_str().into(),
-            sniff_host: session
-                .sniff_host
-                .as_deref()
-                .unwrap_or_default()
-                .into(),
+            sniff_host: session.sniff_host.as_deref().unwrap_or_default().into(),
             remote_destination: outbound.remote_destination.as_str().into(),
             smart_target: outbound.smart_target.as_str().into(),
             chains: string_list_from(&outbound.chains),
@@ -679,17 +670,17 @@ mod tests {
         let inbound = TunInbound::new(base_plan(), fresh_pool(), crate::ipset::noop());
 
         for bogus in [
-            "0.0.0.0",        // unspecified
-            "0.0.0.1",        // 用户报告的"广告拦截 DNS 黑洞"
-            "0.255.255.255",  // 0.0.0.0/8 上界
-            "224.0.0.1",      // 组播
+            "0.0.0.0",         // unspecified
+            "0.0.0.1",         // 用户报告的"广告拦截 DNS 黑洞"
+            "0.255.255.255",   // 0.0.0.0/8 上界
+            "224.0.0.1",       // 组播
             "239.255.255.250", // SSDP
             "255.255.255.255", // 全局广播
-            "240.0.0.1",      // Class E 保留
-            "169.254.1.1",    // IPv4 link-local
-            "::",             // IPv6 unspecified
-            "ff02::1",        // IPv6 多播
-            "fe80::1",        // IPv6 link-local
+            "240.0.0.1",       // Class E 保留
+            "169.254.1.1",     // IPv4 link-local
+            "::",              // IPv6 unspecified
+            "ff02::1",         // IPv6 多播
+            "fe80::1",         // IPv6 link-local
         ] {
             assert_eq!(
                 inbound.route_policy(bogus.parse().unwrap()),
@@ -699,13 +690,13 @@ mod tests {
         }
 
         for ok in [
-            "8.8.8.8",         // 公网
-            "10.0.0.1",        // RFC1918
-            "172.16.0.1",      // RFC1918
-            "192.168.1.1",     // RFC1918
-            "100.64.0.1",      // CGNAT —— 真实 ISP 段，必须放过
-            "198.18.0.1",      // fake-IP pool（global unicast，独立通过）
-            "2001:db8::1",     // IPv6 公网
+            "8.8.8.8",     // 公网
+            "10.0.0.1",    // RFC1918
+            "172.16.0.1",  // RFC1918
+            "192.168.1.1", // RFC1918
+            "100.64.0.1",  // CGNAT —— 真实 ISP 段，必须放过
+            "198.18.0.1",  // fake-IP pool（global unicast，独立通过）
+            "2001:db8::1", // IPv6 公网
         ] {
             assert!(
                 inbound.route_policy(ok.parse().unwrap()).is_ok(),

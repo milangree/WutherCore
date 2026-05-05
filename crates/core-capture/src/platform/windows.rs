@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::packet::{parse_tun_frame, L4};
+use crate::packet::{L4, parse_tun_frame};
 use crate::platform::windows_tun_io;
 use crate::route_table::{ManagedRoute, RouteTable};
 use crate::tun_io::TunIo;
@@ -146,9 +146,8 @@ impl CaptureEngine for WindowsTun {
         // 给 outbound 全局态注入一个明确的初值更稳妥；后续 net_monitor watcher
         // 会持续追踪变化。submit() 内部会同时刷新 set_outbound_interface 和
         // set_outbound_interface_index。
-        let exclude = crate::default_iface::ExcludeList::from_plan_iface(
-            self.plan.interface_name.clone(),
-        );
+        let exclude =
+            crate::default_iface::ExcludeList::from_plan_iface(self.plan.interface_name.clone());
         let snap = crate::default_iface::probe(&exclude);
         if snap.is_empty() {
             warn!(

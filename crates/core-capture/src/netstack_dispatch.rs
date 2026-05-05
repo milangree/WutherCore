@@ -12,16 +12,16 @@ use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-use crate::engine::CapturePlan;
-use crate::frame_cache::{write_ip_packet_to_tun, TunFrameFormatCache};
-use crate::nat::NatTable;
 use crate::eim_nat::EimNatTable;
+use crate::engine::CapturePlan;
+use crate::frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun};
+use crate::nat::NatTable;
 use crate::packet::parse_tun_frame;
-use crate::tun_inbound::{build_inbound_metadata, TunDropReason, TunInbound, TunPacket};
+use crate::tun_inbound::{TunDropReason, TunInbound, TunPacket, build_inbound_metadata};
 use crate::tun_io::TunIo;
 use crate::tun_pump::{
-    TrafficLog, PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL,
-    TUN_IDLE_LOG_INTERVAL, TUN_TRAFFIC_SUMMARY_INTERVAL,
+    PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL,
+    TUN_TRAFFIC_SUMMARY_INTERVAL, TrafficLog,
 };
 
 pub struct NetstackDispatcher {
@@ -163,7 +163,14 @@ impl NetstackDispatcher {
         self: Arc<Self>,
         device: Arc<dyn TunIo>,
         handler: Arc<ListenerHandler>,
-        stack_sink: Arc<tokio::sync::Mutex<futures::stream::SplitSink<netstack_smoltcp::Stack, netstack_smoltcp::AnyIpPktFrame>>>,
+        stack_sink: Arc<
+            tokio::sync::Mutex<
+                futures::stream::SplitSink<
+                    netstack_smoltcp::Stack,
+                    netstack_smoltcp::AnyIpPktFrame,
+                >,
+            >,
+        >,
         mut stop_rx: oneshot::Receiver<()>,
     ) {
         let mtu = self.plan.mtu as usize;
@@ -254,7 +261,8 @@ impl NetstackDispatcher {
                         if self.inbound.should_hijack_dns(destination) {
                             traffic.record_dns();
                         }
-                        let payload = pkt_bytes[payload_offset..payload_offset + payload_len].to_vec();
+                        let payload =
+                            pkt_bytes[payload_offset..payload_offset + payload_len].to_vec();
                         self.handle_udp(&device, &handler, source, destination, payload)
                             .await;
                     }
@@ -301,7 +309,16 @@ async fn run_tcp_accept_loop(
         let dns_service = dns_service.clone();
         let metrics = metrics.clone();
         tokio::spawn(async move {
-            handle_netstack_tcp(stream, remote_addr, local_addr, handler, inbound, dns_service, metrics).await;
+            handle_netstack_tcp(
+                stream,
+                remote_addr,
+                local_addr,
+                handler,
+                inbound,
+                dns_service,
+                metrics,
+            )
+            .await;
         });
     }
     info!(target: "capture::netstack", "tcp accept loop ended");
@@ -334,21 +351,18 @@ async fn handle_netstack_tcp(
         Err(TunDropReason::FakeDnsMissing) => {
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 8192];
-            let sniff_host = match tokio::time::timeout(
-                Duration::from_millis(200),
-                stream.read(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok(n)) if n > 0 => {
-                    initial_payload = buf[..n].to_vec();
-                    match core_route::sniff_tcp(&initial_payload) {
-                        core_route::L7Proto::Sni(host) if !host.is_empty() => Some(host),
-                        _ => None,
+            let sniff_host =
+                match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await
+                {
+                    Ok(Ok(n)) if n > 0 => {
+                        initial_payload = buf[..n].to_vec();
+                        match core_route::sniff_tcp(&initial_payload) {
+                            core_route::L7Proto::Sni(host) if !host.is_empty() => Some(host),
+                            _ => None,
+                        }
                     }
-                }
-                _ => None,
-            };
+                    _ => None,
+                };
             match inbound.resolve_session("tcp", source, original_dst, sniff_host.as_deref()) {
                 Ok(s) => s,
                 Err(reason) => {
@@ -416,8 +430,12 @@ async fn handle_netstack_tcp(
     let up_s = crate::tun_pump::format_bytes(up);
     let down_s = crate::tun_pump::format_bytes(down);
     match &outcome {
-        Ok(_) => info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} closed | up {up_s} down {down_s} | {elapsed_ms}ms"),
-        Err(e) => warn!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} error: {e} | up {up_s} down {down_s} | {elapsed_ms}ms"),
+        Ok(_) => {
+            info!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} closed | up {up_s} down {down_s} | {elapsed_ms}ms")
+        }
+        Err(e) => {
+            warn!(target: "capture::traffic", "[TCP] #{conn_id} {src_label} --> {host}:{port} error: {e} | up {up_s} down {down_s} | {elapsed_ms}ms")
+        }
     }
 }
 

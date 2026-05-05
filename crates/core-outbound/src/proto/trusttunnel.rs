@@ -57,8 +57,8 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -69,10 +69,10 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper::{Method, Request, Uri};
 use parking_lot::Mutex as PlMutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
 
 const MAGIC_UDP: &str = "_udp2";
 const MAGIC_ICMP: &str = "_icmp";
@@ -542,7 +542,7 @@ pub fn encode_udp_packet_to_server(src_addr: &std::net::SocketAddr, payload: &[u
     // src addr (16B) - 客户端不知道实际 src，全 0
     buf.extend_from_slice(&[0u8; 16]);
     buf.extend_from_slice(&[0u8; 2]); // src port
-                                      // dst addr (16B 填充)
+    // dst addr (16B 填充)
     let dst = pad_ip16(src_addr.ip());
     buf.extend_from_slice(&dst);
     buf.extend_from_slice(&src_addr.port().to_be_bytes());

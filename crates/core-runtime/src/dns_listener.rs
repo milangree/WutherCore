@@ -207,10 +207,7 @@ async fn run_tcp(listener: TcpListener, service: Arc<DnsService>) {
     }
 }
 
-async fn handle_tcp_conn(
-    mut stream: TcpStream,
-    service: Arc<DnsService>,
-) -> std::io::Result<()> {
+async fn handle_tcp_conn(mut stream: TcpStream, service: Arc<DnsService>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     loop {
         // RFC 1035 §4.2.2: 2-byte big-endian length prefix
@@ -238,9 +235,9 @@ async fn handle_tcp_conn(
 mod tests {
     use super::*;
     use core_resolver::{
+        DnsService, ResolverBuilder,
         group::{DnsGroup, GroupStrategy},
         upstream::{DnsError, DnsUpstream},
-        DnsService, ResolverBuilder,
     };
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -293,7 +290,7 @@ mod tests {
         q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
         q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
         q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN/NS/AR=0
-                                                                    // qname: 7 "example" 3 "com" 0
+        // qname: 7 "example" 3 "com" 0
         q.push(7);
         q.extend_from_slice(b"example");
         q.push(3);
@@ -329,13 +326,10 @@ mod tests {
         client.send(&q).await.unwrap();
 
         let mut buf = [0u8; 512];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.recv(&mut buf),
-        )
-        .await
-        .expect("timeout")
-        .unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("timeout")
+            .unwrap();
         assert!(n >= 12);
         assert_eq!(&buf[0..2], &[0xCA, 0xFE], "txid roundtrip");
         assert!(buf[2] & 0x80 != 0, "QR bit should be set in response");
@@ -380,7 +374,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_listen_addr() {
         let svc = test_service();
-        let err = spawn_dns_listener("not-a-host:port", svc).await.unwrap_err();
+        let err = spawn_dns_listener("not-a-host:port", svc)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DnsListenerError::InvalidAddr(_, _)));
     }
 
@@ -403,7 +399,9 @@ mod tests {
     #[tokio::test]
     async fn port_zero_returns_disabled_handle() {
         let svc = test_service();
-        let h = spawn_dns_listener("127.0.0.1:0", svc.clone()).await.unwrap();
+        let h = spawn_dns_listener("127.0.0.1:0", svc.clone())
+            .await
+            .unwrap();
         assert!(h.is_disabled());
         assert!(h.addr().is_none());
 

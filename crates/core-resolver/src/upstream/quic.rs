@@ -135,8 +135,8 @@ impl QuicDnsUpstream {
         let endpoint = self.get_or_create_endpoint().await?;
 
         let connect_fut = endpoint.connect(self.addr, &self.sni);
-        let connecting = connect_fut
-            .map_err(|e| DnsError::Failed(format!("DoQ connect start: {e}")))?;
+        let connecting =
+            connect_fut.map_err(|e| DnsError::Failed(format!("DoQ connect start: {e}")))?;
 
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
             .await
@@ -158,10 +158,9 @@ impl QuicDnsUpstream {
             return Ok(ep.clone());
         }
 
-        let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(
-            self.tls_config.clone(),
-        )
-        .map_err(|e| DnsError::Failed(format!("DoQ TLS config: {e}")))?;
+        let quic_client_config =
+            quinn::crypto::rustls::QuicClientConfig::try_from(self.tls_config.clone())
+                .map_err(|e| DnsError::Failed(format!("DoQ TLS config: {e}")))?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(
@@ -345,8 +344,7 @@ fn parse_dns_response(buf: &[u8], record_type: RecordType) -> Result<Vec<IpAddr>
     use hickory_resolver::proto::op::Message;
     use hickory_resolver::proto::serialize::binary::BinDecodable;
 
-    let msg = Message::from_bytes(buf)
-        .map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
+    let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
 
     let ips: Vec<IpAddr> = msg
         .answers()
@@ -376,8 +374,7 @@ fn parse_dns_records(
     use hickory_resolver::proto::op::Message;
     use hickory_resolver::proto::serialize::binary::BinDecodable;
 
-    let msg = Message::from_bytes(buf)
-        .map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
+    let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
 
     let records: Vec<Record> = msg.answers().to_vec();
     if records.is_empty() {

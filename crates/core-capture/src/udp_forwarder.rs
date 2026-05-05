@@ -194,7 +194,7 @@ fn build_v6(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{parse_ip_packet, IpVersion, L4};
+    use crate::packet::{IpVersion, L4, parse_ip_packet};
 
     #[test]
     fn build_and_parse_v4_udp_roundtrip() {

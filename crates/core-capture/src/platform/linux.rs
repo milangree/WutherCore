@@ -10,12 +10,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::packet::{parse_tun_frame, L4};
+use crate::packet::{L4, parse_tun_frame};
 use crate::platform::linux_tun_io;
 use crate::route_table::{ManagedRoute, RouteTable};
 use crate::tproxy_rules;
@@ -84,7 +84,10 @@ impl LinuxTun {
         }
     }
 
-    fn configure_iface(plan: &CapturePlan, device: &dyn crate::tun_io::TunIo) -> Result<(), CaptureError> {
+    fn configure_iface(
+        plan: &CapturePlan,
+        device: &dyn crate::tun_io::TunIo,
+    ) -> Result<(), CaptureError> {
         // tun-rs DeviceBuilder（Linux/Windows/macOS）已配好地址 + MTU + link up。
         // Android root 走旧 linux_tun_io（仅 ioctl TUNSETIFF），需要手动配置。
         if device.is_preconfigured() {
@@ -219,8 +222,8 @@ fn log_iface_snapshot(iface: &str) -> String {
 /// - The IPv6 module is not loaded
 fn is_ipv6_available(iface: &str) -> bool {
     // Check global IPv6 disable
-    let global = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
-        .unwrap_or_default();
+    let global =
+        std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6").unwrap_or_default();
     if global.trim() == "1" {
         return false;
     }
@@ -472,10 +475,9 @@ impl CaptureEngine for LinuxTun {
             crate::platform::android_tun_io::open(&self.plan)
                 .map_err(|e| CaptureError::DeviceFailed(format!("open tun: {e}")))?;
         #[cfg(not(target_os = "android"))]
-        let device: Arc<dyn crate::tun_io::TunIo> =
-            crate::platform::tunrs_io::open(&self.plan)
-                .map(|d| d as Arc<dyn crate::tun_io::TunIo>)
-                .map_err(|e| CaptureError::DeviceFailed(format!("tun-rs open: {e}")))?;
+        let device: Arc<dyn crate::tun_io::TunIo> = crate::platform::tunrs_io::open(&self.plan)
+            .map(|d| d as Arc<dyn crate::tun_io::TunIo>)
+            .map_err(|e| CaptureError::DeviceFailed(format!("tun-rs open: {e}")))?;
 
         // root TUN 里 `ip tuntap add` 在 Android toybox/部分 ROM 上经常不可用；
         // TUNSETIFF 会真正创建/绑定接口，所以接口地址和路由必须在 open 之后配置。
@@ -502,10 +504,8 @@ impl CaptureEngine for LinuxTun {
                 // `ip rule fwmark ... lookup main` 把这些包从主路由表送出，根本
                 // 不进 TUN（与 mihomo / sing-tun 行为一致）。
                 let bypass_mark = tun_outbound_mark(&effective_plan);
-                let report = crate::platform::linux_identity_bypass::install(
-                    &effective_plan,
-                    bypass_mark,
-                );
+                let report =
+                    crate::platform::linux_identity_bypass::install(&effective_plan, bypass_mark);
                 if !report.backends.is_empty() {
                     info!(
                         target: "capture::linux::tun",
@@ -1031,7 +1031,9 @@ fn probe_outbound_interface() -> Option<String> {
             _ => continue,
         };
         let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(iface) = crate::platform::route_probe::outbound_interface_from_route_get(&stdout) {
+        if let Some(iface) =
+            crate::platform::route_probe::outbound_interface_from_route_get(&stdout)
+        {
             return Some(iface);
         }
     }
@@ -1039,11 +1041,7 @@ fn probe_outbound_interface() -> Option<String> {
 }
 
 fn route_rule_family(net: &ipnet::IpNet) -> &'static str {
-    if net.addr().is_ipv6() {
-        "-6"
-    } else {
-        ""
-    }
+    if net.addr().is_ipv6() { "-6" } else { "" }
 }
 
 fn auto_route_uses_catch_all_rule(plan: &CapturePlan) -> bool {

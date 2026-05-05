@@ -10,7 +10,7 @@
 //! 暂未实现。等上游 spec 稳定再补。
 
 use crate::matcher::ClassicalEntry;
-use crate::parser::{mrs, ParseError};
+use crate::parser::{ParseError, mrs};
 
 /// 老 API：把 MRS 解析成 `Vec<ClassicalEntry>`。
 ///

@@ -66,11 +66,7 @@ pub fn generate_padding(method: PaddingMethod, length: usize) -> String {
         PaddingMethod::RepeatX => "X".repeat(length),
         PaddingMethod::Tokenish => {
             let s = generate_tokenish_padding_base62(length as i32);
-            if s.is_empty() {
-                "X".repeat(length)
-            } else {
-                s
-            }
+            if s.is_empty() { "X".repeat(length) } else { s }
         }
     }
 }

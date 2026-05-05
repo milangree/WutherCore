@@ -236,8 +236,10 @@ mod tests {
         assert_eq!(picked, Some(AndroidTier::IptablesV4Only));
         let notes = c.explain_degradation(picked);
         assert!(!notes.is_empty());
-        assert!(notes
-            .iter()
-            .any(|n| n.contains("nft") || n.contains("TPROXY") || n.contains("NAT")));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("nft") || n.contains("TPROXY") || n.contains("NAT"))
+        );
     }
 }

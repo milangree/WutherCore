@@ -437,7 +437,8 @@ mod tests {
         assert!(rendered.contains(&"iptables -t mangle -A WUTHERCORE_PREROUTING -p tcp -j TPROXY --on-port 7894 --tproxy-mark 0x2d0/0x2d0".to_string()));
         assert!(rendered.contains(&"iptables -t mangle -A WUTHERCORE_PREROUTING -p udp -j TPROXY --on-port 7894 --tproxy-mark 0x2d0/0x2d0".to_string()));
         assert!(
-            rendered.contains(&"iptables -t mangle -I OUTPUT -o lo -j WUTHERCORE_OUTPUT".to_string())
+            rendered
+                .contains(&"iptables -t mangle -I OUTPUT -o lo -j WUTHERCORE_OUTPUT".to_string())
         );
     }
 
@@ -450,10 +451,13 @@ mod tests {
         assert!(
             rendered.contains(&"ip -f inet route del local default dev lo table 0x2d0".to_string())
         );
-        assert!(rendered
-            .contains(&"iptables -t mangle -D PREROUTING -j WUTHERCORE_PREROUTING".to_string()));
         assert!(
-            rendered.contains(&"iptables -t mangle -D OUTPUT -o lo -j WUTHERCORE_OUTPUT".to_string())
+            rendered
+                .contains(&"iptables -t mangle -D PREROUTING -j WUTHERCORE_PREROUTING".to_string())
+        );
+        assert!(
+            rendered
+                .contains(&"iptables -t mangle -D OUTPUT -o lo -j WUTHERCORE_OUTPUT".to_string())
         );
     }
 }

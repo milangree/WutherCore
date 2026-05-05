@@ -9,12 +9,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::packet::{parse_tun_frame, L4};
+use crate::packet::{L4, parse_tun_frame};
 use crate::platform::macos_tun_io;
 use crate::route_table::{ManagedRoute, RouteTable};
 use crate::tun_io::TunIo;
@@ -113,9 +113,8 @@ impl CaptureEngine for MacUtun {
         // 之后物理 default 会被替换，再探就拿到 utun 自己（被 exclude 后变空），
         // 此时 net_monitor::submit() 的 is_empty() 短路确保不会把已存的物理
         // ifindex 清零，让 IP_BOUND_IF 仍指向真实出口。
-        let exclude = crate::default_iface::ExcludeList::from_plan_iface(
-            self.plan.interface_name.clone(),
-        );
+        let exclude =
+            crate::default_iface::ExcludeList::from_plan_iface(self.plan.interface_name.clone());
         let snap = crate::default_iface::probe(&exclude);
         if snap.is_empty() {
             warn!(
@@ -260,4 +259,3 @@ async fn packet_loop(
         }
     }
 }
-

@@ -33,7 +33,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::default_iface::{probe, DefaultInterface, ExcludeList};
+use crate::default_iface::{DefaultInterface, ExcludeList, probe};
 
 /// 跨平台 polling 间隔。事件驱动 watcher 会更快，但 polling 是兜底。
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -204,7 +204,6 @@ pub fn start_watcher(exclude: ExcludeList) {
 }
 
 async fn poll_watcher(exclude: ExcludeList) {
-
     info!(
         target: "capture::net_monitor",
         interval_ms = POLL_INTERVAL.as_millis() as u64,

@@ -29,8 +29,8 @@
 
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::jstring;

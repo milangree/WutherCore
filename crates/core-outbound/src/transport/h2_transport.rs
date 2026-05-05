@@ -16,10 +16,10 @@ use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame, Incoming};
 use parking_lot::Mutex as PlMutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::adapter::BoxedStream;
-use crate::transport::{tls::TlsTransport, TlsOptions, Transport};
+use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
 
 #[derive(Debug, Clone, Default)]
 pub struct H2Options {

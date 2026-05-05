@@ -21,8 +21,8 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ahash::AHasher;

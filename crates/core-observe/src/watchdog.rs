@@ -122,10 +122,8 @@ impl Watchdog {
         // 文件先建好；建不了直接 panic 就好，这是启动期前置条件。
         ensure_parent_dir(&config.panic_log_path);
         ensure_parent_dir(&config.watchdog_log_path);
-        let panic_file = open_append(&config.panic_log_path)
-            .expect("watchdog: open panic.log");
-        let wd_file = open_append(&config.watchdog_log_path)
-            .expect("watchdog: open watchdog.log");
+        let panic_file = open_append(&config.panic_log_path).expect("watchdog: open panic.log");
+        let wd_file = open_append(&config.watchdog_log_path).expect("watchdog: open watchdog.log");
 
         let inner = Arc::new(WatchdogInner {
             config: config.clone(),
@@ -323,10 +321,7 @@ fn ensure_parent_dir(path: &Path) {
 }
 
 fn open_append(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 fn write_line(file: &Mutex<File>, msg: &str) {

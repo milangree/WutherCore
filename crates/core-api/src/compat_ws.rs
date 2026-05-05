@@ -95,11 +95,7 @@ impl WsHub {
     /// 如果还没有快照（hub 从未启动 producer），返回 None。
     pub fn current(&self) -> Option<String> {
         let s = self.tx.borrow();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s.clone())
-        }
+        if s.is_empty() { None } else { Some(s.clone()) }
     }
 
     /// 强制就地刷新（同步，绕过 ticker）。HTTP 非 WS 调用 `/traffic`、
@@ -196,41 +192,26 @@ pub struct WsHubs {
 impl WsHubs {
     /// 工厂：捕获 producer 需要的最小 Arc 集合（避免 NativeState ↔ WsHubs
     /// 形成循环引用）。
-    pub fn new(
-        runtime: Arc<core_runtime::Runtime>,
-        connections_interval_ms: u64,
-    ) -> Arc<Self> {
+    pub fn new(runtime: Arc<core_runtime::Runtime>, connections_interval_ms: u64) -> Arc<Self> {
         let traffic_runtime = runtime.clone();
-        let traffic = WsHub::new(
-            "traffic",
-            Duration::from_secs(1),
-            move || {
-                let (up, down) = traffic_runtime.connections.now();
-                serde_json::to_string(&serde_json::json!({"up": up, "down": down}))
-                    .unwrap_or_else(|_| String::from("{}"))
-            },
-        );
+        let traffic = WsHub::new("traffic", Duration::from_secs(1), move || {
+            let (up, down) = traffic_runtime.connections.now();
+            serde_json::to_string(&serde_json::json!({"up": up, "down": down}))
+                .unwrap_or_else(|_| String::from("{}"))
+        });
 
         let memory_runtime = runtime.clone();
-        let memory = WsHub::new(
-            "memory",
-            Duration::from_secs(1),
-            move || {
-                let v = memory_runtime.metrics.clash_memory();
-                serde_json::to_string(&v).unwrap_or_else(|_| String::from("{}"))
-            },
-        );
+        let memory = WsHub::new("memory", Duration::from_secs(1), move || {
+            let v = memory_runtime.metrics.clash_memory();
+            serde_json::to_string(&v).unwrap_or_else(|_| String::from("{}"))
+        });
 
         // /connections 默认 1000 ms；通过参数允许调慢以减负担（或调快做调试）。
         let conn_runtime = runtime.clone();
         let conn_interval = Duration::from_millis(connections_interval_ms.max(200));
-        let connections = WsHub::new(
-            "connections",
-            conn_interval,
-            move || {
-                serialize_connections(&conn_runtime)
-            },
-        );
+        let connections = WsHub::new("connections", conn_interval, move || {
+            serialize_connections(&conn_runtime)
+        });
 
         Arc::new(Self {
             traffic,
@@ -344,12 +325,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         // 3 个 subscriber 不会触发 3 个 producer。
         let count = n.load(Ordering::Relaxed);
-        assert!(count >= 2 && count <= 6, "expected 2..=6 ticks, got {count}");
+        assert!(
+            count >= 2 && count <= 6,
+            "expected 2..=6 ticks, got {count}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn watch_receiver_sees_latest_immediately() {
-        let hub = WsHub::new("test", Duration::from_millis(10), || String::from("payload"));
+        let hub = WsHub::new("test", Duration::from_millis(10), || {
+            String::from("payload")
+        });
         let mut rx = hub.subscribe();
         // 等 producer 至少一次 tick。
         tokio::time::sleep(Duration::from_millis(40)).await;

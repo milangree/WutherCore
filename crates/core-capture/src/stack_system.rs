@@ -31,8 +31,8 @@
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use core_observe::copy_bidirectional_tracked;
@@ -49,7 +49,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use crate::tcp_nat::{NatSession, TcpNat};
-use crate::tun_inbound::{build_inbound_metadata, TunInbound};
+use crate::tun_inbound::{TunInbound, build_inbound_metadata};
 
 /// 包处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]

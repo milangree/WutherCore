@@ -31,8 +31,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use compact_str::{CompactString, ToCompactString};
 use dashmap::DashMap;
@@ -51,7 +51,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    iter.into_iter().map(|s| CompactString::new(s.as_ref())).collect()
+    iter.into_iter()
+        .map(|s| CompactString::new(s.as_ref()))
+        .collect()
 }
 
 /// 连接 metadata —— Clash dashboard 期望的 metadata 子对象。
@@ -536,7 +538,11 @@ impl ConnectionTable {
             return format!("#{id}");
         };
         let m = &e.meta;
-        let proc_label = if m.process.is_empty() { "?" } else { m.process.as_str() };
+        let proc_label = if m.process.is_empty() {
+            "?"
+        } else {
+            m.process.as_str()
+        };
         let host = if !m.host.is_empty() {
             m.host.as_str()
         } else if !m.destination_ip.is_empty() {
@@ -553,7 +559,10 @@ impl ConnectionTable {
         let entries: Vec<ConnectionEntry> =
             self.entries.iter().map(|e| e.value().clone()).collect();
         let total = entries.len();
-        let tcp = entries.iter().filter(|e| e.meta.network.as_str() == "tcp").count();
+        let tcp = entries
+            .iter()
+            .filter(|e| e.meta.network.as_str() == "tcp")
+            .count();
         let udp = total.saturating_sub(tcp);
 
         let mut dst_hist: HashMap<String, usize> = HashMap::new();
@@ -567,7 +576,9 @@ impl ConnectionTable {
             } else {
                 m.destination_ip.as_str()
             };
-            *dst_hist.entry(format!("{host}:{}", m.destination_port)).or_default() += 1;
+            *dst_hist
+                .entry(format!("{host}:{}", m.destination_port))
+                .or_default() += 1;
             let p = if m.process.is_empty() {
                 "?".to_string()
             } else {
@@ -605,11 +616,7 @@ impl ConnectionTable {
                     } else {
                         e.meta.destination_ip.to_string()
                     },
-                    destination_port: e
-                        .meta
-                        .destination_port
-                        .parse::<u16>()
-                        .unwrap_or(0),
+                    destination_port: e.meta.destination_port.parse::<u16>().unwrap_or(0),
                     age_secs: now_secs.saturating_sub(e.started_at),
                     bytes_up: e.bytes_up.load(Ordering::Relaxed),
                     bytes_down: e.bytes_down.load(Ordering::Relaxed),
@@ -757,7 +764,9 @@ impl ConnectionTable {
 
     fn mark_smart_block(&self, id: u64) -> bool {
         if let Some(entry) = self.entries.get(&id) {
-            entry.smart_block.store(SMART_BLOCK_BLOCKED, Ordering::Relaxed);
+            entry
+                .smart_block
+                .store(SMART_BLOCK_BLOCKED, Ordering::Relaxed);
             true
         } else {
             false
@@ -880,7 +889,8 @@ impl ConnectionGuard {
 
     /// 主动给当前连接打 smart-block 标 —— DELETE /smart-target 等管理路径用。
     pub fn mark_smart_blocked(&self) {
-        self.smart_block.store(SMART_BLOCK_BLOCKED, Ordering::Relaxed);
+        self.smart_block
+            .store(SMART_BLOCK_BLOCKED, Ordering::Relaxed);
     }
 }
 
@@ -1195,8 +1205,16 @@ mod tests {
         assert_eq!(s.tcp, 2);
         assert_eq!(s.udp, 1);
         assert_eq!(s.top_destinations[0], ("cdn.example.com:443".into(), 2));
-        assert!(s.top_processes.iter().any(|(k, v)| k == "chrome.exe" && *v == 2));
-        assert!(s.top_processes.iter().any(|(k, v)| k == "WutherCore" && *v == 1));
+        assert!(
+            s.top_processes
+                .iter()
+                .any(|(k, v)| k == "chrome.exe" && *v == 2)
+        );
+        assert!(
+            s.top_processes
+                .iter()
+                .any(|(k, v)| k == "WutherCore" && *v == 1)
+        );
         assert!(s.by_rule.iter().any(|(k, v)| k == "GEOIP" && *v == 2));
         assert!(s.by_outbound.iter().any(|(k, v)| k == "node-a" && *v == 2));
     }
@@ -1302,7 +1320,10 @@ mod tests {
 
         let snap = t.manager_snapshot();
         assert_eq!(snap.connections.len(), 1);
-        assert_eq!(snap.connections[0].provider_chains.as_slice(), ["provider-a"]);
+        assert_eq!(
+            snap.connections[0].provider_chains.as_slice(),
+            ["provider-a"]
+        );
         assert_eq!(
             snap.connections[0].metadata.remote_destination.as_str(),
             "example.com:443"

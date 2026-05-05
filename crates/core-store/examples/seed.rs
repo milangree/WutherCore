@@ -1,4 +1,4 @@
-use core_store::{store::BatchOp, AsyncWriter, NodeStatsBlob, Store};
+use core_store::{AsyncWriter, NodeStatsBlob, Store, store::BatchOp};
 use std::sync::Arc;
 
 #[tokio::main]

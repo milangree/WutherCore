@@ -41,8 +41,8 @@ pub use group::{DnsGroup, GroupStrategy};
 pub use hosts::HostsTable;
 pub use mapping::IpHostMapping;
 pub use policy::{
-    parse_rule_line, DnsAction, DnsRR, EvalContext, HostMatch, PolicyEngine, PolicyRule, PreRcode,
-    PredefinedResponse, QueryOptions, RejectMethod, RejectOptions, RejectThrottle,
+    DnsAction, DnsRR, EvalContext, HostMatch, PolicyEngine, PolicyRule, PreRcode,
+    PredefinedResponse, QueryOptions, RejectMethod, RejectOptions, RejectThrottle, parse_rule_line,
 };
 pub use resolver::{ResolveAnswer, ResolveError, Resolver, ResolverBuilder, ResolverConfigError};
 pub use service::DnsService;
