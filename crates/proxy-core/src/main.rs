@@ -711,6 +711,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 urltest: urltest.clone(),
                 capture: capture_handle.clone(),
                 feeds: Some(feed_mgr_handle.clone()),
+                cors_origins: plan.ui.cors.clone(),
             };
             handles.push(tokio::spawn(async move {
                 if let Err(e) = server.run().await {

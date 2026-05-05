@@ -23,6 +23,8 @@ serde_json   = { workspace = true }
 anyhow       = { workspace = true }
 tracing      = { workspace = true }
 parking_lot  = { workspace = true }
+bytes        = { workspace = true }
+dashmap      = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

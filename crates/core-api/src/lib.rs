@@ -5,6 +5,9 @@
 #![forbid(unsafe_code)]
 
 pub mod compat;
+pub mod compat_cache;
+pub mod compat_security;
+pub mod compat_ws;
 pub mod native;
 pub mod server;
 

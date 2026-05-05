@@ -28,14 +28,7 @@ nodes: []
 fn build_state() -> NativeState {
     let plan = load_from_str(CFG).expect("plan");
     let runtime = Arc::new(Runtime::build(plan));
-    NativeState {
-        runtime,
-        started_at: std::time::Instant::now(),
-        secret: None,
-        urltest: UrlTester::new(Default::default()),
-        capture: None,
-        feeds: None,
-    }
+    NativeState::for_tests(runtime, UrlTester::new(Default::default()), None)
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -261,14 +254,8 @@ route:
 "#;
     let plan = load_from_str(cfg).unwrap();
     let runtime = Arc::new(Runtime::build(plan));
-    let state = NativeState {
-        runtime: runtime.clone(),
-        started_at: std::time::Instant::now(),
-        secret: None,
-        urltest: UrlTester::new(Default::default()),
-        capture: None,
-        feeds: None,
-    };
+    let state =
+        NativeState::for_tests(runtime.clone(), UrlTester::new(Default::default()), None);
     let app = core_api::compat::router(state);
     let resp = app
         .oneshot(
@@ -311,14 +298,7 @@ route:
     let urltest = UrlTester::new(Default::default());
     let url = urltest.current_config().default_url;
     urltest.ensure_stats("NodeB", &url).record(123, true);
-    let state = NativeState {
-        runtime: runtime.clone(),
-        started_at: std::time::Instant::now(),
-        secret: None,
-        urltest: urltest.clone(),
-        capture: None,
-        feeds: None,
-    };
+    let state = NativeState::for_tests(runtime.clone(), urltest.clone(), None);
     let app = core_api::compat::router(state);
     let _ = app
         .clone()

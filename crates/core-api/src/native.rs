@@ -22,6 +22,34 @@ pub struct NativeState {
     pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
     /// 订阅管理器（始终注入，可能 idle）—— `/providers/proxies` 端点使用。
     pub feeds: Option<Arc<core_feeds::FeedManager>>,
+    /// 端点级响应缓存（singleflight + TTL）。
+    /// 见 [`crate::compat_cache`]。
+    pub caches: Arc<crate::compat_cache::Caches>,
+    /// WS 广播 hub。所有 WS 客户端共享 producer，避免 N×snapshot/sec。
+    /// 见 [`crate::compat_ws`]。
+    pub ws_hubs: Arc<crate::compat_ws::WsHubs>,
+}
+
+impl NativeState {
+    /// 测试用便利构造器：自动 build caches + ws_hubs。production 路径请用
+    /// [`crate::server::ApiServer::run`]，它会传入 connections_interval 配置。
+    pub fn for_tests(
+        runtime: Arc<Runtime>,
+        urltest: Arc<UrlTester>,
+        feeds: Option<Arc<core_feeds::FeedManager>>,
+    ) -> Self {
+        let ws_hubs = crate::compat_ws::WsHubs::new(runtime.clone(), 1000);
+        Self {
+            runtime,
+            started_at: std::time::Instant::now(),
+            secret: None,
+            urltest,
+            capture: None,
+            feeds,
+            caches: crate::compat_cache::Caches::new(),
+            ws_hubs,
+        }
+    }
 }
 
 pub fn router(state: NativeState) -> Router {

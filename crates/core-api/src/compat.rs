@@ -49,17 +49,35 @@ use axum::extract::{
     ws::{Message, WebSocket, WebSocketUpgrade},
     Path, Query, State,
 };
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use core_runtime::Runtime;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use crate::compat_security::WsConnectionLimiter;
 use crate::native::NativeState;
+
+/// 单 dashboard 实例同时打开的 WS 数量上限 —— 5 个端点（traffic / memory /
+/// logs / connections / +1 留用）× 50 个 dashboard = 250。再保守 ×2 = 500。
+const WS_CONNECTION_CAP: usize = 512;
+
+/// JSON content-type，避免每次 IntoResponse 时重复构造 HeaderValue。
+const JSON_CT: &str = "application/json";
+
+fn json_bytes(bytes: Bytes) -> axum::response::Response {
+    let mut h = HeaderMap::new();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(JSON_CT),
+    );
+    (StatusCode::OK, h, bytes).into_response()
+}
 
 pub fn router(state: NativeState) -> Router {
     Router::new()
@@ -134,25 +152,17 @@ async fn traffic(
     ws: Option<WebSocketUpgrade>,
 ) -> axum::response::Response {
     if let Some(ws) = ws {
-        return ws.on_upgrade(move |sock| traffic_ws(sock, s));
+        // 取 hub receiver；连接上限保护避免 fd 耗尽。
+        let Some(permit) = ws_limiter().try_acquire() else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "ws connection limit reached").into_response();
+        };
+        let rx = s.ws_hubs.traffic.subscribe();
+        return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
-    Json(connection_manager_traffic(&s)).into_response()
-}
-
-async fn traffic_ws(mut sock: WebSocket, s: NativeState) {
-    let mut tick = tokio::time::interval(Duration::from_millis(1000));
-    loop {
-        tick.tick().await;
-        let payload = connection_manager_traffic(&s).to_string();
-        if sock.send(Message::Text(payload)).await.is_err() {
-            break;
-        }
-    }
-}
-
-fn connection_manager_traffic(s: &NativeState) -> Value {
-    let (up, down) = s.runtime.connections.now();
-    json!({ "up": up, "down": down })
+    // 非 WS：build_now 同步出一份最新（这会同时 push 到 hub watch，让 WS
+    // subscriber 能立刻拿到）。
+    let payload = s.ws_hubs.traffic.build_now();
+    json_text(payload).into_response()
 }
 
 async fn memory(
@@ -160,20 +170,54 @@ async fn memory(
     ws: Option<WebSocketUpgrade>,
 ) -> axum::response::Response {
     if let Some(ws) = ws {
-        return ws.on_upgrade(move |sock| memory_ws(sock, s));
+        let Some(permit) = ws_limiter().try_acquire() else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "ws connection limit reached").into_response();
+        };
+        let rx = s.ws_hubs.memory.subscribe();
+        return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
-    Json(s.runtime.metrics.clash_memory()).into_response()
+    let payload = s.ws_hubs.memory.build_now();
+    json_text(payload).into_response()
 }
 
-async fn memory_ws(mut sock: WebSocket, s: NativeState) {
-    let mut tick = tokio::time::interval(Duration::from_millis(1000));
-    loop {
-        tick.tick().await;
-        let payload = s.runtime.metrics.clash_memory().to_string();
+/// 把 watch::Receiver<String> 桥接到一条 WebSocket。
+/// 共享 hub 减少 N×snapshot/sec 重复成本；`permit` 持续到连接关闭。
+async fn watch_to_ws(
+    mut sock: WebSocket,
+    mut rx: tokio::sync::watch::Receiver<String>,
+    _permit: crate::compat_security::WsPermit,
+) {
+    // 立刻送当前值（如果非空）。
+    let initial = rx.borrow_and_update().clone();
+    if !initial.is_empty() {
+        if sock.send(Message::Text(initial)).await.is_err() {
+            return;
+        }
+    }
+    // 之后监听变更；watch 永远只保留最新，慢消费者自动跳过中间帧。
+    while rx.changed().await.is_ok() {
+        let payload = rx.borrow_and_update().clone();
         if sock.send(Message::Text(payload)).await.is_err() {
             break;
         }
     }
+}
+
+/// 用 String 直接 build text/json 响应，避免再走一次 serde。
+fn json_text(s: String) -> axum::response::Response {
+    let mut h = HeaderMap::new();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(JSON_CT),
+    );
+    (StatusCode::OK, h, s).into_response()
+}
+
+/// 进程级 WS 连接上限 —— 避免 dashboard 滥连耗尽 fd 表。
+fn ws_limiter() -> &'static Arc<WsConnectionLimiter> {
+    use std::sync::OnceLock;
+    static LIMITER: OnceLock<Arc<WsConnectionLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| WsConnectionLimiter::new("clash_ws", WS_CONNECTION_CAP))
 }
 
 #[derive(Deserialize)]
@@ -271,27 +315,29 @@ async fn connections(
     Query(q): Query<ConnQ>,
     ws: Option<WebSocketUpgrade>,
 ) -> axum::response::Response {
-    // mihomo 默认 1000ms；clamp 到 [200, 60000] 避免被恶意请求打爆。
-    let interval_ms = q.interval.unwrap_or(1000).clamp(200, 60_000);
     if let Some(ws) = ws {
-        return ws.on_upgrade(move |sock| connections_ws(sock, s, interval_ms));
+        // 注意：interval 参数只在历史代码里影响 per-client tick；现在 hub 全局
+        // 用 connections_interval（在 server.rs 启动时配置）。query 参数仍接受
+        // 为了向后兼容，但忽略。
+        let _ = q.interval;
+        let Some(permit) = ws_limiter().try_acquire() else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "ws connection limit reached")
+                .into_response();
+        };
+        let rx = s.ws_hubs.connections.subscribe();
+        return ws.on_upgrade(move |sock| watch_to_ws(sock, rx, permit));
     }
-    Json(connections_snapshot(&s)).into_response()
+    // 非 WS：fetch 缓存（200ms TTL）。多 dashboard 同时打 GET → 一次 build。
+    let runtime = s.runtime.clone();
+    let bytes = s
+        .caches
+        .connections
+        .fetch_bytes(move || build_connections_value(&runtime));
+    json_bytes(bytes)
 }
 
-async fn connections_ws(mut sock: WebSocket, s: NativeState, interval_ms: u64) {
-    let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
-    loop {
-        tick.tick().await;
-        let payload = connections_snapshot(&s).to_string();
-        if sock.send(Message::Text(payload)).await.is_err() {
-            break;
-        }
-    }
-}
-
-fn connections_snapshot(s: &NativeState) -> Value {
-    let manager = s.runtime.connections.manager_snapshot();
+fn build_connections_value(runtime: &Arc<Runtime>) -> Value {
+    let manager = runtime.connections.manager_snapshot();
     let download_total = manager.download_total;
     let upload_total = manager.upload_total;
     let memory = manager.memory;
@@ -299,7 +345,6 @@ fn connections_snapshot(s: &NativeState) -> Value {
         .connections
         .into_iter()
         .map(|conn| {
-            // mihomo 用 uuid 字符串作为外部 id；保留 numeric id 兼容旧脚本。
             json!({
                 "id": conn.id,
                 "metadata": conn.metadata,
@@ -325,6 +370,7 @@ fn connections_snapshot(s: &NativeState) -> Value {
 
 async fn connections_close_all(State(s): State<NativeState>) -> impl IntoResponse {
     let n = s.runtime.connections.close_all();
+    s.caches.invalidate_connection_state();
     // mihomo 在 200 OK 下返回空 body；这里返回 {closed} 兼容已有脚本。
     Json(json!({"closed": n}))
 }
@@ -335,6 +381,7 @@ async fn connections_close_one(
 ) -> impl IntoResponse {
     // 同时兼容 numeric id 与 uuid 字符串（mihomo dashboard 传 uuid）。
     if s.runtime.connections.close_by_uuid_or_numeric(&id) {
+        s.caches.invalidate_connection_state();
         return (StatusCode::NO_CONTENT, Json(json!({}))).into_response();
     }
     (
@@ -354,17 +401,23 @@ async fn connections_smart_block(
 
 /* ====================== proxies ====================== */
 
-async fn proxies(State(s): State<NativeState>) -> Json<Value> {
-    Json(json!({"proxies": collect_proxy_map(&s)}))
+async fn proxies(State(s): State<NativeState>) -> axum::response::Response {
+    let bytes = proxy_map_bytes(&s);
+    json_bytes(bytes)
 }
 
 async fn proxy_one(
     State(s): State<NativeState>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    let map = collect_proxy_map(&s);
-    if let Some(v) = map.get(&name) {
-        Json(v.clone()).into_response()
+    // 使用缓存的 Arc<Value> —— 避免每次单条 lookup 重新解析整张 map。
+    let value = proxy_map_value(&s);
+    if let Some(p) = value
+        .get("proxies")
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.get(&name))
+    {
+        Json(p.clone()).into_response()
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -372,6 +425,22 @@ async fn proxy_one(
         )
             .into_response()
     }
+}
+
+fn proxy_map_bytes(s: &NativeState) -> Bytes {
+    // 闭包必须捕获 s by clone (NativeState: Clone 中只持 Arc 字段)，
+    // FnOnce 调用所有权 OK。
+    let s_for_build = s.clone();
+    s.caches
+        .proxy_map
+        .fetch_bytes(move || json!({"proxies": collect_proxy_map(&s_for_build)}))
+}
+
+fn proxy_map_value(s: &NativeState) -> Arc<Value> {
+    let s_for_build = s.clone();
+    s.caches
+        .proxy_map
+        .fetch_value(move || json!({"proxies": collect_proxy_map(&s_for_build)}))
 }
 
 #[derive(Deserialize)]
@@ -388,7 +457,9 @@ async fn proxy_put(
     // Empty name 与 mihomo / sing-box `URLTest.SelectOutbound("")` 等价 ——
     // 清空当前固定选择。
     if body.name.is_empty() {
-        return clear_pin_inner(&s, &group);
+        let r = clear_pin_inner(&s, &group);
+        s.caches.invalidate_proxy_state();
+        return r;
     }
     let groups = s.runtime.groups.read();
     let Some(g) = groups.get(&group) else {
@@ -407,6 +478,7 @@ async fn proxy_put(
     }
     drop(groups);
     s.runtime.set_group_manual(&group, &body.name);
+    s.caches.invalidate_proxy_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
 
@@ -416,7 +488,9 @@ async fn proxy_clear(
     State(s): State<NativeState>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    clear_pin_inner(&s, &name)
+    let r = clear_pin_inner(&s, &name);
+    s.caches.invalidate_proxy_state();
+    r
 }
 
 fn clear_pin_inner(s: &NativeState, group: &str) -> axum::response::Response {
@@ -556,14 +630,52 @@ async fn group_delay(
         }
     };
     let to = q.timeout.map(Duration::from_millis);
-    let res = s.urltest.test_many(&s.runtime, &members, q.url, to).await;
-    // 与 mihomo `GroupBase.URLTest` 一致：仅包含成功节点；失败节点不放
-    // （dashboard 把缺失视为 timeout，显示 "−"）。
-    let body: Map<String, Value> = res
-        .into_iter()
-        .filter_map(|(n, r)| r.ok().map(|ms| (n, Value::from(ms))))
-        .collect();
+    // sing-box GroupBase.URLTest: 并发上限 4，避免 1000 节点同时拨号互相
+    // 抢带宽导致测速值被网络拥塞放大。
+    let body = group_delay_bounded(&s, &members, q.url, to, 4).await;
     Json(Value::Object(body)).into_response()
+}
+
+/// `test_many` + concurrency cap。对齐 sing-box `batch.WithConcurrencyNum(4)`。
+async fn group_delay_bounded(
+    s: &NativeState,
+    members: &[String],
+    url: Option<String>,
+    timeout: Option<Duration>,
+    max_in_flight: usize,
+) -> Map<String, Value> {
+    use tokio::sync::Semaphore;
+
+    if members.is_empty() {
+        return Map::new();
+    }
+    let sem = Arc::new(Semaphore::new(max_in_flight.max(1)));
+    let mut handles = Vec::with_capacity(members.len());
+    for name in members {
+        // acquire 在 spawn 前完成；保证全局并发 ≤ max_in_flight。
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed (program shutting down)
+        };
+        let urltest = s.urltest.clone();
+        let runtime = s.runtime.clone();
+        let url_for = url.clone();
+        let n = name.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit; // hold until task ends
+            let r = urltest
+                .test_node(&runtime, &n, url_for.as_deref(), timeout)
+                .await;
+            (n, r)
+        }));
+    }
+    let mut out = Map::new();
+    for h in handles {
+        if let Ok((name, Ok(ms))) = h.await {
+            out.insert(name, Value::from(ms));
+        }
+    }
+    out
 }
 
 /* ====================== proxy map ====================== */
@@ -850,12 +962,16 @@ fn map_proto(p: &str) -> &'static str {
 
 /* ====================== providers ====================== */
 
-async fn providers_proxies(State(s): State<NativeState>) -> Json<Value> {
-    let mut providers = Map::new();
-    for (name, _f) in &s.runtime.plan.feeds {
-        providers.insert(name.clone(), provider_json(&s, name));
-    }
-    Json(json!({"providers": providers}))
+async fn providers_proxies(State(s): State<NativeState>) -> axum::response::Response {
+    let s_for_build = s.clone();
+    let bytes = s.caches.providers_proxies.fetch_bytes(move || {
+        let mut providers = Map::new();
+        for (name, _f) in &s_for_build.runtime.plan.feeds {
+            providers.insert(name.clone(), provider_json(&s_for_build, name));
+        }
+        json!({"providers": providers})
+    });
+    json_bytes(bytes)
 }
 
 async fn provider_proxy_one(
@@ -888,6 +1004,7 @@ async fn provider_proxy_refresh(
     if let Some(mgr) = s.feeds.as_ref() {
         mgr.refresh_now(&name);
     }
+    s.caches.invalidate_proxy_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
 
@@ -1035,12 +1152,16 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
     })
 }
 
-async fn providers_rules(State(s): State<NativeState>) -> Json<Value> {
-    let mut providers = Map::new();
-    for (name, set) in &s.runtime.plan.route.sets {
-        providers.insert(name.clone(), rule_provider_json(name, set));
-    }
-    Json(json!({"providers": providers}))
+async fn providers_rules(State(s): State<NativeState>) -> axum::response::Response {
+    let runtime = s.runtime.clone();
+    let bytes = s.caches.providers_rules.fetch_bytes(move || {
+        let mut providers = Map::new();
+        for (name, set) in &runtime.plan.route.sets {
+            providers.insert(name.clone(), rule_provider_json(name, set));
+        }
+        json!({"providers": providers})
+    });
+    json_bytes(bytes)
 }
 
 async fn provider_rule_one(
@@ -1071,6 +1192,7 @@ async fn provider_rule_refresh(
     }
     // RulesetManager 的强制刷新 API 暂未公开（后台 ticker 自动周期刷）；
     // 这里 ack 让 dashboard 不报错。
+    s.caches.invalidate_rule_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
 
@@ -1104,10 +1226,16 @@ fn rule_provider_json(name: &str, set: &core_config::model::RuleSetSpec) -> Valu
 
 /* ====================== rules ====================== */
 
-async fn rules(State(s): State<NativeState>) -> Json<Value> {
+async fn rules(State(s): State<NativeState>) -> axum::response::Response {
+    let runtime = s.runtime.clone();
+    let bytes = s.caches.rules.fetch_bytes(move || build_rules_value(&runtime));
+    json_bytes(bytes)
+}
+
+fn build_rules_value(runtime: &Arc<Runtime>) -> Value {
     use core_config::runtime_plan::{RouteAction, RouteMatcher};
     let mut out = Vec::new();
-    for st in &s.runtime.plan.route.steps {
+    for st in &runtime.plan.route.steps {
         let (rtype, payload) = match &st.matcher {
             RouteMatcher::Any => ("MATCH", String::new()),
             RouteMatcher::Home => ("DOMAIN-SUFFIX", "lan,local,arpa".into()),
@@ -1139,12 +1267,21 @@ async fn rules(State(s): State<NativeState>) -> Json<Value> {
             "proxy": proxy,
         }));
     }
-    Json(json!({"rules": out}))
+    json!({"rules": out})
 }
 
 /* ====================== configs ====================== */
 
-async fn configs(State(s): State<NativeState>) -> Json<Value> {
+async fn configs(State(s): State<NativeState>) -> axum::response::Response {
+    let s_for_build = s.clone();
+    let bytes = s
+        .caches
+        .configs
+        .fetch_bytes(move || build_configs_value(&s_for_build));
+    json_bytes(bytes)
+}
+
+fn build_configs_value(s: &NativeState) -> Value {
     let port = s
         .runtime
         .plan
@@ -1159,7 +1296,7 @@ async fn configs(State(s): State<NativeState>) -> Json<Value> {
         core_config::model::FindProcessMode::Strict => "strict",
         core_config::model::FindProcessMode::Always => "always",
     };
-    Json(json!({
+    json!({
         "port": port,
         "socks-port": port,
         "redir-port": 0,
@@ -1190,7 +1327,7 @@ async fn configs(State(s): State<NativeState>) -> Json<Value> {
         // dashboard 通常会读这俩；空串表示走默认路由。
         "geox-url": {},
         "global-ua": "",
-    }))
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -1236,6 +1373,7 @@ async fn configs_put(
         }
     }
     drop(mc);
+    s.caches.invalidate_config_state();
     (StatusCode::NO_CONTENT, Json(json!({}))).into_response()
 }
 
