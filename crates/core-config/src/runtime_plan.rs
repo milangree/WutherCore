@@ -1165,7 +1165,7 @@ route:
             .any(|m| matches!(m, RouteMatcher::PortRange(1000, 2000))));
         assert!(kinds
             .iter()
-            .any(|m| matches!(m, RouteMatcher::Keyword(ref k) if k == "google")));
+            .any(|m| matches!(m, RouteMatcher::Keyword(k) if k == "google")));
         // 两条 IP-CIDR：第二条尾部 `no-resolve` 在 mapping 形式下不会触发解析路径
         // （outbound 已显式给出），但写出来不应该出错。
         assert_eq!(

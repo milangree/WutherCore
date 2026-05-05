@@ -81,7 +81,7 @@ impl core_outbound::SocketProtector for AndroidVpnServiceProtector {
 }
 
 /// `void setVpnFd(int fd)` —— 把 ParcelFileDescriptor.detachFd() 的 fd 交给本进程。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFd(
     _env: *mut core::ffi::c_void,
     _class: *mut core::ffi::c_void,
@@ -98,7 +98,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFd(
 /// Android VpnService 会捕获本进程自己创建的出站 socket；所有 outbound socket
 /// 在 connect/send 前必须调用 `VpnService.protect(fd)`，否则代理节点连接会再次
 /// 进入 TUN，形成自循环。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
     env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -135,7 +135,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
 /// `routes`, `dns_servers`, `allowed_applications` / `disallowed_applications`
 /// 逐项写入 Builder，随后 `establish()` 并通过 `setVpnFd(fd)` 交给 native。
 /// 如果没有这些 Builder 路由，native 侧即使拿到 fd 也不会有真实应用流量进入。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_vpnServiceConfigJson(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -174,7 +174,7 @@ fn new_jstring(env: &mut JNIEnv<'_>, value: String) -> jstring {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_clearVpnService(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -184,7 +184,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_clearVpnService(
 }
 
 /// `int nativeStart()` —— 标记 native 已就绪；返回 0 / 非 0 表示状态。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_nativeStart(
     _env: *mut core::ffi::c_void,
     _class: *mut core::ffi::c_void,
@@ -194,7 +194,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_nativeStart(
 }
 
 /// `void nativeStop()` —— 仅做标记；真正停止由上层 supervisor 完成。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_nativeStop(
     _env: *mut core::ffi::c_void,
     _class: *mut core::ffi::c_void,
@@ -214,7 +214,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_nativeStop(
 /// // Java side: in ConnectivityManager.NetworkCallback.onAvailable / onLost
 /// VpnBridge.notifyNetworkChanged(activeNetwork.getInterfaceName());
 /// ```
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_notifyNetworkChanged(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -232,7 +232,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_notifyNetworkChanged(
 ///
 /// 供 Android 在启动时或网络切换时主动设置（如 "wlan0" / "rmnet_data0"）。
 /// 设置后，所有新建 outbound 连接会优先 bind 到该接口。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setDefaultInterface(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

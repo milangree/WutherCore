@@ -2,8 +2,8 @@
 
 Rust 实现的代理内核 —— Friendly YAML 配置、节点学习与 URLTest 测速、L4/L7 路由、完整 DNS 系统、透明代理（TUN / TProxy / Redirect / Android VpnService）、HTTP 控制面板。
 
-[![rust](https://img.shields.io/badge/rust-1.75%2B-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![edition](https://img.shields.io/badge/edition-2021-000000)](https://doc.rust-lang.org/edition-guide/)
+[![rust](https://img.shields.io/badge/rust-1.85%2B-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![edition](https://img.shields.io/badge/edition-2024-000000)](https://doc.rust-lang.org/edition-guide/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blueviolet)](LICENSE)
 [![crates](https://img.shields.io/badge/workspace-17%20crates-1f6feb)]()
 

@@ -87,18 +87,18 @@ impl NetworkMonitor {
         if !changed {
             return false;
         }
-        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let gen_id = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         *self.last.write() = current.clone();
         if current.is_empty() {
             warn!(
                 target: "capture::net_monitor",
-                generation = gen,
+                generation = gen_id,
                 "no default interface detected — keeping last known outbound bind"
             );
         } else {
             info!(
                 target: "capture::net_monitor",
-                generation = gen,
+                generation = gen_id,
                 interface = ?current.name,
                 v4_index = ?current.v4_index,
                 v6_index = ?current.v6_index,
@@ -112,7 +112,7 @@ impl NetworkMonitor {
         // 广播 —— supervisor 收到后 reset DNS 持久连接 + 缓存。即便 current
         // 为空也广播，让订阅方知道发生了变化（例如把 DNS 置空闲态）。
         let _ = self.tx.send(NetworkChangeEvent {
-            generation: gen,
+            generation: gen_id,
             interface: current,
         });
         true

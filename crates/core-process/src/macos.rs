@@ -132,7 +132,7 @@ struct SocketFdInfo {
     psi: SocketInfo,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn proc_listpids(
         type_: u32,
         typeinfo: u32,

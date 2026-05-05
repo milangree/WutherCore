@@ -553,25 +553,26 @@ fn recvmsg_with_origdst(
 
 #[allow(unsafe_code)]
 unsafe fn extract_origdst(hdr: &libc::msghdr) -> Option<SocketAddr> {
-    let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+    // SAFETY: 调用方保证 hdr 指向 recvmsg 刚返回的有效 msghdr，cmsg 链由内核填写。
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(hdr) };
     while !cmsg.is_null() {
-        let level = (*cmsg).cmsg_level;
-        let typ = (*cmsg).cmsg_type;
+        let level = unsafe { (*cmsg).cmsg_level };
+        let typ = unsafe { (*cmsg).cmsg_type };
         if level == libc::SOL_IP && typ == libc::IP_ORIGDSTADDR {
-            let data = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in;
-            let sa = std::ptr::read_unaligned(data);
+            let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in;
+            let sa = unsafe { std::ptr::read_unaligned(data) };
             let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
             let port = u16::from_be(sa.sin_port);
             return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
         }
         if level == libc::IPPROTO_IPV6 && typ == libc::IPV6_ORIGDSTADDR {
-            let data = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
-            let sa = std::ptr::read_unaligned(data);
+            let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in6;
+            let sa = unsafe { std::ptr::read_unaligned(data) };
             let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
             let port = u16::from_be(sa.sin6_port);
             return Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
         }
-        cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+        cmsg = unsafe { libc::CMSG_NXTHDR(hdr, cmsg) };
     }
     None
 }

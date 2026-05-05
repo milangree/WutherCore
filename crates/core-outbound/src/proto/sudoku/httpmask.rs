@@ -71,7 +71,7 @@ pub fn build_random_request_header(host: &str, path_root: &str) -> Vec<u8> {
     if pick < 2 {
         let mut ws_key_bytes = [0u8; 16];
         for b in ws_key_bytes.iter_mut() {
-            *b = rng.gen();
+            *b = rng.r#gen();
         }
         let ws_key = base64_std(&ws_key_bytes);
         buf.extend_from_slice(b"GET ");

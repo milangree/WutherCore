@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 static STARTED: AtomicBool = AtomicBool::new(false);
 static INJECTED_FD: Mutex<Option<RawFd>> = Mutex::new(None);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wuthercore_set_packet_tunnel_fd(fd: i32) {
     if fd < 0 {
         return;
@@ -41,13 +41,13 @@ pub extern "C" fn wuthercore_set_packet_tunnel_fd(fd: i32) {
     *INJECTED_FD.lock() = Some(fd as RawFd);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wuthercore_native_start() -> i32 {
     STARTED.store(true, Ordering::SeqCst);
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wuthercore_native_stop() {
     STARTED.store(false, Ordering::SeqCst);
 }

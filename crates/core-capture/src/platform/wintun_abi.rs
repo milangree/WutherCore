@@ -81,7 +81,7 @@ fn get_proc<T: Copy>(module: HMODULE, name: &str) -> Option<T> {
     Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&p) })
 }
 
-extern "system" {
+unsafe extern "system" {
     fn LoadLibraryA(name: *const i8) -> HMODULE;
     fn GetProcAddress(module: HMODULE, name: *const i8) -> *mut c_void;
     fn WaitForSingleObject(handle: HANDLE, ms: u32) -> u32;
