@@ -5,8 +5,12 @@
 //! 其它协议（vmess / vless / trojan / hysteria2 / tuic / wireguard / ssh）
 //! 提供 stub 适配器，并在 dial 时返回"协议尚未实现"。
 
-#![forbid(unsafe_code)]
+// 大多数模块禁 unsafe；adapter 里 Windows IP_UNICAST_IF / macOS IP_BOUND_IF
+// 必须走 raw setsockopt，由 cfg 平台分支控制，按 module 粒度 allow（其它模块
+// 仍受 deny 约束）。
+#![deny(unsafe_code)]
 
+#[allow(unsafe_code)]
 pub mod adapter;
 pub mod loopback;
 pub mod registry;
@@ -22,13 +26,15 @@ pub mod proto;
 pub mod transport;
 
 pub use adapter::{
-    apply_outbound_mark, apply_outbound_mark_for_addr, bind_to_device,
-    create_outbound_udp_socket, global_dial_resolver, has_socket_protector, next_dial_id,
-    outbound_fwmark, outbound_interface, prepare_outbound_udp_socket,
+    apply_outbound_mark, apply_outbound_mark_for_addr, bind_outbound_socket, bind_to_device,
+    create_outbound_udp_socket, global_dial_resolver,
+    has_socket_protector, next_dial_id, outbound_fwmark, outbound_interface,
+    outbound_interface_index_v4, outbound_interface_index_v6, prepare_outbound_udp_socket,
     prepare_outbound_udp_socket_for_addr, protect_socket, resolve_host, set_global_dial_resolver,
-    set_outbound_fwmark, set_outbound_interface, set_socket_protector, should_mark_outbound_addr,
-    BoxedStream, BoxedUdp, Capabilities, DialContext, DialResolver, OutboundAdapter,
-    ProtectedSocket, ProxyStream, SocketProtector, UdpSocketLike,
+    set_outbound_fwmark, set_outbound_interface, set_outbound_interface_index,
+    set_socket_protector, should_mark_outbound_addr, BoxedStream, BoxedUdp, Capabilities,
+    DialContext, DialResolver, OutboundAdapter, ProtectedSocket, ProxyStream, SocketProtector,
+    UdpSocketLike,
 };
 pub use dns_hijack::{
     global_dns_responder, set_global_dns_responder, DnsHijackOutbound, DnsResponder,

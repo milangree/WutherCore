@@ -75,6 +75,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static OUTBOUND_FWMARK: AtomicU32 = AtomicU32::new(0);
 static OUTBOUND_INTERFACE: RwLock<Option<String>> = RwLock::new(None);
+/// 物理出站接口的 v4 / v6 ifindex —— Windows `IP_UNICAST_IF` /
+/// `IPV6_UNICAST_IF`、macOS `IP_BOUND_IF` / `IPV6_BOUND_IF` 都按 ifindex 绑定。
+/// Linux/Android 仍走 `SO_BINDTODEVICE` 名字绑定，这两个值在那里可以为 0。
+///
+/// 为什么必须按 ifindex：在 TUN 创建之后，TUN 接口往往成为系统默认路由
+/// （metric 最低）。若出站 socket 不显式选物理接口，内核就会把出站包送进
+/// TUN，TUN 把它当成新的入站再走一次代理 → 死循环 / 全部出站超时。
+/// Windows 没有 `SO_BINDTODEVICE` 等价物，只能用 `IP_UNICAST_IF`；macOS
+/// 类似只能用 `IP_BOUND_IF`。
+static OUTBOUND_IFACE_INDEX_V4: AtomicU32 = AtomicU32::new(0);
+static OUTBOUND_IFACE_INDEX_V6: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtectedSocket {
@@ -155,19 +166,26 @@ where
 pub fn prepare_outbound_udp_socket(
     socket: &std::net::UdpSocket,
 ) -> std::io::Result<crate::loopback::LoopbackUdpGuard> {
-    prepare_outbound_udp_socket_with(socket, apply_outbound_mark)
+    // 无 peer 信息（连接前 bind 阶段调用 / wildcard 出站）——只能上 SO_MARK + 名字绑定，
+    // ifindex 绑定推迟到 connect 后通过 [`prepare_outbound_udp_socket_for_addr`] 重新加固。
+    prepare_outbound_udp_socket_with(socket, apply_outbound_mark, None)
 }
 
 pub fn prepare_outbound_udp_socket_for_addr(
     socket: &std::net::UdpSocket,
     addr: std::net::SocketAddr,
 ) -> std::io::Result<crate::loopback::LoopbackUdpGuard> {
-    prepare_outbound_udp_socket_with(socket, |sock| apply_outbound_mark_for_addr(sock, addr))
+    prepare_outbound_udp_socket_with(
+        socket,
+        |sock| apply_outbound_mark_for_addr(sock, addr),
+        Some(addr),
+    )
 }
 
 fn prepare_outbound_udp_socket_with(
     socket: &std::net::UdpSocket,
     apply_mark: impl FnOnce(&socket2::Socket) -> std::io::Result<()>,
+    peer: Option<std::net::SocketAddr>,
 ) -> std::io::Result<crate::loopback::LoopbackUdpGuard> {
     protect_socket(socket)?;
     let mark = outbound_fwmark();
@@ -184,8 +202,14 @@ fn prepare_outbound_udp_socket_with(
         }
         tracing::debug!(target: "dial::udp", error = %e, "apply SO_MARK failed (non-fatal)");
     }
-    if let Err(e) = bind_to_device(&sock) {
-        tracing::debug!(target: "dial::udp", error = %e, "SO_BINDTODEVICE failed (non-fatal)");
+    // 有 peer 时走完整 OS 级绑定（含 Windows / macOS ifindex），无 peer 时退化到
+    // 名字绑定 —— 旧接口兼容 + dual-stack wildcard listen 场景。
+    let bind_result = match peer {
+        Some(p) => bind_outbound_socket(&sock, p),
+        None => bind_to_device(&sock),
+    };
+    if let Err(e) = bind_result {
+        tracing::debug!(target: "dial::udp", error = %e, "outbound interface bind failed (non-fatal)");
     }
     let local = socket.local_addr()?;
     Ok(crate::loopback::register_udp(local))
@@ -240,9 +264,33 @@ pub fn outbound_interface() -> Option<String> {
         .clone()
 }
 
+/// 设置物理出站接口的 v4 / v6 ifindex —— Windows / macOS 平台 setsockopt 必需。
+/// 0 视为未设置；TUN 启动时按系统默认路由探测填入。
+pub fn set_outbound_interface_index(v4: Option<u32>, v6: Option<u32>) {
+    OUTBOUND_IFACE_INDEX_V4.store(v4.unwrap_or(0), Ordering::Release);
+    OUTBOUND_IFACE_INDEX_V6.store(v6.unwrap_or(0), Ordering::Release);
+}
+
+pub fn outbound_interface_index_v4() -> Option<u32> {
+    let v = OUTBOUND_IFACE_INDEX_V4.load(Ordering::Acquire);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+pub fn outbound_interface_index_v6() -> Option<u32> {
+    let v = OUTBOUND_IFACE_INDEX_V6.load(Ordering::Acquire);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 /// 把 socket 绑定到全局出站接口（SO_BINDTODEVICE）。
-/// 对标 mihomo `component/dialer/bind_linux.go:bindControl`。
-/// 非 Linux 平台或未配置接口时为 no-op。
+/// 对应 Linux/Android `bindToDevice`。非 Linux 平台或未配置接口时为 no-op。
 ///
 /// 注意：不检查目标地址——所有出站 socket 都绑定到物理接口，
 /// 确保流量不被 TUN catch-all 截走。
@@ -253,6 +301,169 @@ pub fn bind_to_device(_sock: &socket2::Socket) -> std::io::Result<()> {
         if let Some(ref iface) = *guard {
             _sock.bind_device(Some(iface.as_bytes()))?;
         }
+    }
+    Ok(())
+}
+
+/// **跨平台出站接口绑定** —— 把 socket 强制绑到物理出站接口，让出站
+/// 包绕开 TUN 自循环。
+///
+/// * Linux/Android：`SO_BINDTODEVICE` （走 [`bind_to_device`]）+ 配套
+///   `SO_MARK` + `ip rule fwmark`。
+/// * Windows：`IP_UNICAST_IF` (level `IPPROTO_IP`, opt 31) /
+///   `IPV6_UNICAST_IF` (level `IPPROTO_IPV6`, opt 31)。Windows 没有
+///   `SO_BINDTODEVICE` 等价物，此 setsockopt 是唯一让 socket 跳过 TUN
+///   metric 直走物理接口的方法。
+/// * macOS / iOS：`IP_BOUND_IF` (`IPPROTO_IP`, opt 25) /
+///   `IPV6_BOUND_IF` (`IPPROTO_IPV6`, opt 125)。darwin 同样无
+///   `SO_BINDTODEVICE`。
+///
+/// `peer` 用来选择 v4 / v6 ifindex；非 global-unicast 目标（loopback /
+/// 私网 / multicast 等）跳过绑定，避免本机 / LAN 流量被强迫走物理出口。
+pub fn bind_outbound_socket(
+    sock: &socket2::Socket,
+    peer: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    // Linux/Android 名字绑定 —— 不依赖 ifindex。
+    bind_to_device(sock)?;
+
+    // 仅 global-unicast 目标走 ifindex 绑定，本机 / 私网流量保持原状。
+    if !should_mark_outbound_addr(peer.ip()) {
+        return Ok(());
+    }
+
+    let _ = peer;
+    let _ = sock;
+    #[cfg(windows)]
+    {
+        let result = match peer.ip() {
+            std::net::IpAddr::V4(_) => match outbound_interface_index_v4() {
+                Some(idx) => set_unicast_if_v4_windows(sock, idx),
+                None => Ok(()),
+            },
+            std::net::IpAddr::V6(_) => match outbound_interface_index_v6() {
+                Some(idx) => set_unicast_if_v6_windows(sock, idx),
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = result {
+            tracing::debug!(
+                target: "dial::bind",
+                peer = %peer,
+                error = %e,
+                "windows IP_UNICAST_IF bind failed (non-fatal)"
+            );
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let result = match peer.ip() {
+            std::net::IpAddr::V4(_) => match outbound_interface_index_v4() {
+                Some(idx) => set_bound_if_v4_darwin(sock, idx),
+                None => Ok(()),
+            },
+            std::net::IpAddr::V6(_) => match outbound_interface_index_v6() {
+                Some(idx) => set_bound_if_v6_darwin(sock, idx),
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = result {
+            tracing::debug!(
+                target: "dial::bind",
+                peer = %peer,
+                error = %e,
+                "darwin IP_BOUND_IF bind failed (non-fatal)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/* ---------------- Windows IP_UNICAST_IF ---------------- */
+
+#[cfg(windows)]
+fn set_unicast_if_v4_windows(sock: &socket2::Socket, ifindex: u32) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    // ifindex 必须以 host-byte-order 写在 network-byte-order 32-bit 整数里
+    // —— 即对 LE 主机要 .to_be()。Windows IP Helper 文档明确这点。
+    let value: u32 = ifindex.to_be();
+    let raw = sock.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+    let ret = unsafe {
+        windows_sys::Win32::Networking::WinSock::setsockopt(
+            raw,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
+            windows_sys::Win32::Networking::WinSock::IP_UNICAST_IF as i32,
+            &value as *const u32 as *const u8,
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_unicast_if_v6_windows(sock: &socket2::Socket, ifindex: u32) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    // IPV6_UNICAST_IF 不需要字节序转换 —— 直接 host order u32。
+    let value: u32 = ifindex;
+    let raw = sock.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+    let ret = unsafe {
+        windows_sys::Win32::Networking::WinSock::setsockopt(
+            raw,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6 as i32,
+            windows_sys::Win32::Networking::WinSock::IPV6_UNICAST_IF as i32,
+            &value as *const u32 as *const u8,
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/* ---------------- Darwin IP_BOUND_IF ---------------- */
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_bound_if_v4_darwin(sock: &socket2::Socket, ifindex: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // IP_BOUND_IF = 25 (IPPROTO_IP)
+    const IP_BOUND_IF: libc::c_int = 25;
+    let value: libc::c_uint = ifindex as libc::c_uint;
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            IP_BOUND_IF,
+            &value as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_bound_if_v6_darwin(sock: &socket2::Socket, ifindex: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // IPV6_BOUND_IF = 125 (IPPROTO_IPV6)
+    const IPV6_BOUND_IF: libc::c_int = 125;
+    let value: libc::c_uint = ifindex as libc::c_uint;
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            IPV6_BOUND_IF,
+            &value as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -879,12 +1090,16 @@ mod tests {
             local.port(),
         );
 
-        let err = prepare_outbound_udp_socket_with(&socket, |_sock| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "mock SO_MARK failure",
-            ))
-        })
+        let err = prepare_outbound_udp_socket_with(
+            &socket,
+            |_sock| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "mock SO_MARK failure",
+                ))
+            },
+            None,
+        )
         .unwrap_err();
 
         set_outbound_fwmark(0);
@@ -971,5 +1186,78 @@ mod tests {
 
         drop(guard);
         assert!(!crate::loopback::is_loopback_udp_source(local));
+    }
+
+    #[test]
+    fn outbound_interface_index_round_trips() {
+        let _guard = lock_test_protector();
+        set_outbound_interface_index(Some(7), Some(11));
+        assert_eq!(outbound_interface_index_v4(), Some(7));
+        assert_eq!(outbound_interface_index_v6(), Some(11));
+        // 0 视为未设置
+        set_outbound_interface_index(None, None);
+        assert_eq!(outbound_interface_index_v4(), None);
+        assert_eq!(outbound_interface_index_v6(), None);
+    }
+
+    #[test]
+    fn bind_outbound_socket_skips_non_global_target() {
+        let _guard = lock_test_protector();
+        // 本机 / 私网 / multicast 等目标 → 不绑定 ifindex（避免本机或 LAN 流量
+        // 被强迫走外网接口）。函数应返回 Ok 且不报错。
+        set_outbound_interface_index(Some(1), Some(1));
+        let sock =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        // 127.x 走旁路
+        let r = bind_outbound_socket(&sock, "127.0.0.1:80".parse().unwrap());
+        assert!(r.is_ok());
+        // 私网走旁路
+        let r = bind_outbound_socket(&sock, "192.168.1.1:80".parse().unwrap());
+        assert!(r.is_ok());
+        set_outbound_interface_index(None, None);
+    }
+
+    #[test]
+    fn bind_outbound_socket_no_op_when_index_unset() {
+        let _guard = lock_test_protector();
+        // 未设置 ifindex 时即便目标是 global-unicast 也仅 SO_BINDTODEVICE，
+        // 不应报错。
+        set_outbound_interface_index(None, None);
+        let sock =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let r = bind_outbound_socket(&sock, "8.8.8.8:53".parse().unwrap());
+        assert!(r.is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_outbound_socket_sets_unicast_if_on_windows() {
+        use std::os::windows::io::AsRawSocket;
+        let _guard = lock_test_protector();
+        // 取一个真实存在的 ifindex —— loopback (lo) 在 Windows 上 ifindex=1
+        // 通常存在。
+        set_outbound_interface_index(Some(1), Some(1));
+        let sock =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        // 用 global-unicast 目标触发 ifindex 绑定
+        bind_outbound_socket(&sock, "8.8.8.8:53".parse().unwrap()).unwrap();
+        // 通过 getsockopt 验证 IP_UNICAST_IF 已设置（值为 ifindex 的 BE u32）
+        let mut value: u32 = 0;
+        let mut len: i32 = std::mem::size_of::<u32>() as i32;
+        let raw = sock.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+        let ret = unsafe {
+            windows_sys::Win32::Networking::WinSock::getsockopt(
+                raw,
+                windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
+                windows_sys::Win32::Networking::WinSock::IP_UNICAST_IF as i32,
+                &mut value as *mut u32 as *mut u8,
+                &mut len,
+            )
+        };
+        assert_eq!(ret, 0, "getsockopt IP_UNICAST_IF failed");
+        // setsockopt 写 network-byte-order；getsockopt 返回 host-byte-order
+        // —— 直接 == ifindex 比较即可。
+        assert_eq!(value, 1, "IP_UNICAST_IF should round-trip ifindex=1");
+        set_outbound_interface_index(None, None);
     }
 }

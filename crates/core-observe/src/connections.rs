@@ -390,6 +390,42 @@ impl ConnectionTable {
             upload_window,
             download_window,
             smart_block,
+            tracked: true,
+        }
+    }
+
+    /// 旁路 guard —— 给 inner / 自发起 / 不希望出现在 `/connections` API 的
+    /// 连接（DNS resolver、ruleset fetcher、URLTest 等）用。
+    ///
+    /// 行为：
+    /// * 不分配新的 connection id（统一用 0），不写 [`Self::entries`]；
+    /// * counter / cancel token / window 仍可用 —— 上游 splice / accounting
+    ///   代码不必分支判断；
+    /// * Drop 时不调 `remove_silent`，因为根本没有 entry。
+    ///
+    /// 全局总流量（upload_total / download_total）依然累计 —— 内部连接也算
+    /// 进程吞吐，传给 `/traffic` 的整体曲线可以反映真实负载。
+    pub fn open_detached(self: &Arc<Self>) -> ConnectionGuard {
+        let bytes_up = Arc::new(AtomicU64::new(0));
+        let bytes_down = Arc::new(AtomicU64::new(0));
+        let max_upload_rate = Arc::new(AtomicU64::new(0));
+        let max_download_rate = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(Notify::new());
+        let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
+        let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
+        let smart_block = Arc::new(AtomicU8::new(SMART_BLOCK_NONE));
+        ConnectionGuard {
+            table: self.clone(),
+            id: 0,
+            up: bytes_up,
+            down: bytes_down,
+            max_upload_rate,
+            max_download_rate,
+            cancel,
+            upload_window,
+            download_window,
+            smart_block,
+            tracked: false,
         }
     }
 
@@ -793,6 +829,12 @@ impl ConnectionTable {
 
 /// RAII guard：drop 时自动从表移除。所有 splice 路径都应该握住 guard
 /// 直到双向拷贝结束 —— 即使任务 panic / early-return 也能保证表里不留死条目。
+///
+/// `tracked` = false 时是 [`Self::detached`] 构造的"旁路 guard"：counter /
+/// cancel / window 都仍正常工作（让上游 splice 代码不需要分支判断），
+/// 但 Drop 时不去碰 `table` —— 适合 inner 连接（DNS resolver / ruleset
+/// fetcher 等核心组件自身发起的连接），既不入 ConnectionTable 也不污染
+/// `/connections` API。
 pub struct ConnectionGuard {
     table: Arc<ConnectionTable>,
     pub id: u64,
@@ -804,6 +846,9 @@ pub struct ConnectionGuard {
     upload_window: Arc<Mutex<BucketWindow>>,
     download_window: Arc<Mutex<BucketWindow>>,
     smart_block: Arc<AtomicU8>,
+    /// 是否真的入了 ConnectionTable —— [`ConnectionTable::open`] 路径设 true，
+    /// [`Self::detached`] 路径设 false。Drop 用它判断要不要触发 `remove_silent`。
+    tracked: bool,
 }
 
 impl ConnectionGuard {
@@ -841,7 +886,10 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.table.remove_silent(self.id);
+        if self.tracked {
+            self.table.remove_silent(self.id);
+        }
+        // detached：从未入表，无需 remove。
     }
 }
 
@@ -1346,5 +1394,62 @@ mod tests {
         let entry = t.get(g.id).unwrap();
         let cloned = entry.clone();
         assert!(Arc::ptr_eq(&entry.meta, &cloned.meta));
+    }
+
+    #[test]
+    fn open_detached_does_not_appear_in_table_or_snapshot() {
+        // inner 流量旁路：detached guard 不分配 entry，list/snapshot/manager 全部不见。
+        let t = ConnectionTable::new();
+        let _g = t.open_detached();
+        assert_eq!(t.len(), 0, "detached guard must not insert into table");
+        assert!(
+            t.list().is_empty(),
+            "detached guard must not appear in list()"
+        );
+        assert!(
+            t.snapshot().is_empty(),
+            "detached guard must not appear in snapshot()"
+        );
+        let mgr = t.manager_snapshot();
+        assert!(
+            mgr.connections.is_empty(),
+            "detached guard must not appear in manager_snapshot.connections"
+        );
+    }
+
+    #[test]
+    fn open_detached_drop_is_noop_safe() {
+        // 反复开关 detached guard 不应造成表内任何副作用 —— 也不会触发
+        // remove_silent 错误地动到真实 entry。
+        let t = ConnectionTable::new();
+        let real = t.open(ConnectionMeta {
+            host: "real.example.com".into(),
+            destination_port: "443".into(),
+            ..ConnectionMeta::default()
+        });
+        let real_id = real.id;
+        for _ in 0..16 {
+            let _detached = t.open_detached();
+        }
+        assert_eq!(t.len(), 1);
+        assert!(t.get(real_id).is_some());
+        drop(real);
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn open_detached_counters_still_usable_for_inner_accounting() {
+        // detached guard 的 counter / cancel / window 仍然好用 —— 这样 splice
+        // / accounting 代码不需要分支处理"是否旁路"。
+        let t = ConnectionTable::new();
+        let g = t.open_detached();
+        g.record_upload(1024);
+        g.record_download(2048);
+        // 全局 total 仍然累计（内部连接也算进程吞吐）
+        let (up, down) = t.total();
+        assert_eq!(up, 1024);
+        assert_eq!(down, 2048);
+        // 但表里没有它
+        assert_eq!(t.len(), 0);
     }
 }

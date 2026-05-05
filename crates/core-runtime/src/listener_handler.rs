@@ -267,7 +267,15 @@ impl ListenerHandler {
         self.reject_loopback_self_capture(&metadata)?;
         let metadata = self.enrich_with_process(metadata, NetworkKind::Tcp).await;
         let result = self.dial_tcp(&metadata).await?;
-        let guard = self.open_tcp(&metadata, &result);
+        // 内部组件（DNS resolver / ruleset fetcher / URLTest 等）发起的连接
+        // 不进 ConnectionTable，避免污染 dashboard `/connections` —— 这些
+        // 是核心运行时内务流量，不属于用户业务连接。counter/cancel token 仍
+        // 正常工作，只是 entry 旁路。
+        let guard = if metadata.is_inner {
+            self.runtime.connections.open_detached()
+        } else {
+            self.open_tcp(&metadata, &result)
+        };
         Ok(PreparedTcp { result, guard })
     }
 
@@ -296,8 +304,14 @@ impl ListenerHandler {
                 info!(target: "capture::traffic", "[UDP] {} --> {}:{} match {}({}) using {}", src_label, target_host, target_port, result.rule, result.rule_payload, proxy);
             }
         }
-        let meta = udp_connection_meta(&metadata, &result);
-        let guard = self.runtime.connections.open(meta);
+        // 内部组件 UDP 出站（DNS upstream、ruleset 自动刷新等）也旁路 entry，
+        // 与 TCP 路径保持一致。
+        let guard = if metadata.is_inner {
+            self.runtime.connections.open_detached()
+        } else {
+            let meta = udp_connection_meta(&metadata, &result);
+            self.runtime.connections.open(meta)
+        };
         Ok(PreparedUdpPacket {
             socket: result.socket,
             guard,

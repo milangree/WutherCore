@@ -71,3 +71,16 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# IP_UNICAST_IF / IPV6_UNICAST_IF setsockopt —— 出站 socket 强绑物理网卡，
+# 避免 WinTUN metric 最低导致出站包被自家 TUN 接管再走代理（死循环）。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# IP_BOUND_IF / IPV6_BOUND_IF setsockopt —— 同 Windows 思路，darwin 平台
+# 出站 socket 必须按 ifindex 绑定。
+libc = "0.2"

@@ -102,7 +102,10 @@ pub async fn marked_connect(
             let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
             protect_socket(&sock)?;
             apply_outbound_mark_for_addr(&sock, addr)?;
-            crate::adapter::bind_to_device(&sock)?;
+            // 跨平台 OS 级出站接口绑定 —— Linux/Android SO_BINDTODEVICE +
+            // Windows IP_UNICAST_IF + macOS IP_BOUND_IF。让 socket 绕开
+            // TUN 默认路由直走物理出口，杜绝 dial 自循环。
+            crate::adapter::bind_outbound_socket(&sock, addr)?;
             sock.connect_timeout(&addr.into(), timeout)?;
             sock.set_nonblocking(true)?;
             Ok(sock.into())
