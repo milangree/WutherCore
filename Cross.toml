@@ -29,12 +29,19 @@ image = "ghcr.io/cross-rs/aarch64-linux-android:0.2.5"
 pre-build = [
     """\
 set -eux ; \
-SRC=$(find /android-ndk -name 'libunwind.a' -path '*aarch64*' 2>/dev/null | head -1) ; \
-DST=/android-ndk/aarch64-linux-android/lib/libunwind.a ; \
-if [ -n "$SRC" ] && [ ! -e "$DST" ] ; then mkdir -p "$(dirname "$DST")" ; ln -sf "$SRC" "$DST" ; fi ; \
-SRC2=$(find /android-ndk -name 'libunwind.a' -path '*linux/aarch64*' 2>/dev/null | head -1) ; \
-DST2=$(find /android-ndk -type d -name 'aarch64-linux-android' -path '*lib/gcc*' 2>/dev/null | head -1) ; \
-if [ -n "$SRC2" ] && [ -n "$DST2" ] ; then ln -sf "$SRC2" "$DST2/libunwind.a" || true ; fi \
+NDK_PATH=/android-ndk ; \
+TOOLCHAIN_PATH=$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64 ; \
+GCC_PATH=$(find $NDK_PATH -type d -name 'aarch64-linux-android' -path '*/lib/gcc/*' | head -1) ; \
+if [ -z "$GCC_PATH" ]; then \
+  GCC_PATH=$(find $NDK_PATH -type d -name 'aarch64-linux-android*' -path '*/lib/gcc/*' | head -1) ; \
+fi ; \
+if [ -n "$TOOLCHAIN_PATH" ] && [ -d "$TOOLCHAIN_PATH/lib64" ]; then \
+  SRC=$TOOLCHAIN_PATH/lib64/libunwind.a ; \
+  if [ -f "$SRC" ]; then \
+    mkdir -p "$GCC_PATH" && ln -sf "$SRC" "$GCC_PATH/libunwind.a" || true ; \
+  fi ; \
+fi ; \
+find /android-ndk -name 'libunwind.a' 2>/dev/null | head -5 \
 """
 ]
 
@@ -43,9 +50,18 @@ image = "ghcr.io/cross-rs/armv7-linux-androideabi:0.2.5"
 pre-build = [
     """\
 set -eux ; \
-SRC=$(find /android-ndk -name 'libunwind.a' -path '*arm-linux-androideabi*' 2>/dev/null | head -1) ; \
-DST=/android-ndk/arm-linux-androideabi/lib/libunwind.a ; \
-if [ -n "$SRC" ] && [ ! -e "$DST" ] ; then mkdir -p "$(dirname "$DST")" ; ln -sf "$SRC" "$DST" ; fi \
+NDK_PATH=/android-ndk ; \
+TOOLCHAIN_PATH=$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64 ; \
+GCC_PATH=$(find $NDK_PATH -type d -name 'arm-linux-androideabi' -path '*/lib/gcc/*' | head -1) ; \
+if [ -z "$GCC_PATH" ]; then \
+  GCC_PATH=$(find $NDK_PATH -type d -name 'arm-linux-androideabi*' -path '*/lib/gcc/*' | head -1) ; \
+fi ; \
+if [ -n "$TOOLCHAIN_PATH" ] && [ -d "$TOOLCHAIN_PATH/lib" ]; then \
+  SRC=$TOOLCHAIN_PATH/lib/libunwind.a ; \
+  if [ -f "$SRC" ]; then \
+    mkdir -p "$GCC_PATH" && ln -sf "$SRC" "$GCC_PATH/libunwind.a" || true ; \
+  fi ; \
+fi \
 """
 ]
 
