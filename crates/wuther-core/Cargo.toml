@@ -1,12 +1,12 @@
 [package]
-name = "proxy-core"
+name = "wuther-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "WutherCore CLI 入口 —— Friendly YAML 代理内核"
 
 [[bin]]
-name = "proxy-core"
+name = "wuther-core"
 path = "src/main.rs"
 
 [dependencies]

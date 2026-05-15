@@ -17,7 +17,7 @@ members = [
     "crates/core-mesh",
     "crates/core-observe",
     "crates/core-process",
-    "crates/proxy-core",
+    "crates/wuther-core",
     "tests-e2e",
 ]
 
