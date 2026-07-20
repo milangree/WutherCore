@@ -25,9 +25,9 @@ members = [
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 authors = ["WutherCore Contributors"]
-repository = "https://example.com/wuthercore"
+repository = "https://github.com/MiChongs/WutherCore"
 
 [workspace.dependencies]
 # 异步运行时
