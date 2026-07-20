@@ -321,6 +321,15 @@ mod tests {
 
     #[tokio::test]
     async fn socks5_udp_associate_wraps_udp_payloads() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            socks5_udp_associate_round_trip(),
+        )
+        .await
+        .expect("SOCKS5 UDP associate test timed out");
+    }
+
+    async fn socks5_udp_associate_round_trip() {
         let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_addr = udp_server.local_addr().unwrap();
         let tcp_server = TcpListener::bind("127.0.0.1:0").await.unwrap();

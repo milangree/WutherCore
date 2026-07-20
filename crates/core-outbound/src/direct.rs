@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 use crate::{
     adapter::{
         BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
-        prepare_outbound_udp_socket_for_addr, resolve_host_for_direct,
+        resolve_host_for_direct,
     },
     transport::{Transport, tcp::TcpTransport},
 };
@@ -70,6 +70,8 @@ impl OutboundAdapter for DirectOutbound {
                     return Ok(Box::new(DirectUdp {
                         sock: Arc::new(sock),
                         peer: addr,
+                        target_host: ctx.host.clone(),
+                        target_port: ctx.port,
                         loopback_guard,
                     }));
                 }
@@ -102,6 +104,8 @@ impl OutboundAdapter for DirectOutbound {
 struct DirectUdp {
     sock: Arc<UdpSocket>,
     peer: SocketAddr,
+    target_host: String,
+    target_port: u16,
     loopback_guard: crate::loopback::LoopbackUdpGuard,
 }
 
@@ -115,14 +119,16 @@ fn open_direct_udp_socket(
 #[async_trait]
 impl UdpSocketLike for DirectUdp {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize> {
-        if target != self.peer.ip().to_string() || port != self.peer.port() {
-            tracing::trace!(
-                target: "dial::udp",
-                peer = %self.peer,
-                send_target = %target,
-                send_port = port,
-                "send via connected direct udp socket"
-            );
+        if !self.matches_target(target, port) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "direct UDP association is connected to {}:{} ({}) and cannot send to \
+                     {target}:{port}; endpoint-aware UDP receive is required before one \
+                     association can safely serve multiple destinations",
+                    self.target_host, self.target_port, self.peer
+                ),
+            ));
         }
         self.sock.send(buf).await
     }
@@ -131,4 +137,30 @@ impl UdpSocketLike for DirectUdp {
         let _ = &self.loopback_guard;
         self.sock.recv(buf).await
     }
+}
+
+impl DirectUdp {
+    fn matches_target(&self, target: &str, port: u16) -> bool {
+        if port != self.target_port {
+            return false;
+        }
+
+        if normalize_host(target).eq_ignore_ascii_case(normalize_host(&self.target_host)) {
+            return true;
+        }
+
+        parse_ip_literal(target) == Some(self.peer.ip())
+    }
+}
+
+fn normalize_host(host: &str) -> &str {
+    host.trim()
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or_else(|| host.trim())
+        .trim_end_matches('.')
+}
+
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    normalize_host(host).parse().ok()
 }

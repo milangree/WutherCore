@@ -564,11 +564,18 @@ mod tests {
 
     #[tokio::test]
     async fn udp_send_encrypts_socks_address_and_payload() {
-        use tokio::net::UdpSocket;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            shadowsocks_udp_send_and_decrypt(),
+        )
+        .await
+        .expect("Shadowsocks UDP network test timed out");
+    }
 
+    async fn shadowsocks_udp_send_and_decrypt() {
         use crate::adapter::OutboundAdapter;
 
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let ob = ShadowsocksOutbound::new(
             "ss",
