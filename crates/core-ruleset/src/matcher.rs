@@ -7,6 +7,8 @@ use ipnet::IpNet;
 use parking_lot::RwLock;
 use regex::RegexSet;
 
+use crate::ir::{RulesetMatchContext, RulesetProgram};
+
 /// classical 行解析后形态。
 #[derive(Debug, Clone)]
 pub struct ClassicalEntry {
@@ -60,10 +62,15 @@ pub struct RulesetMatcher {
     /// CIDR：v4 与 v6 分桶
     cidr_v4: Vec<ipnet::Ipv4Net>,
     cidr_v6: Vec<ipnet::Ipv6Net>,
+    /// source CIDR 与 destination CIDR 严格分桶。
+    src_cidr_v4: Vec<ipnet::Ipv4Net>,
+    src_cidr_v6: Vec<ipnet::Ipv6Net>,
     /// 进程名（精确）
     processes: AHashSet<String>,
     /// 端口（单值或区间，u16..=u16）
     ports: Vec<(u16, u16)>,
+    /// source 端口，不能退化为 destination 端口。
+    src_ports: Vec<(u16, u16)>,
     /// 原始 classical 条目，便于 explain。
     pub classical_count: usize,
 
@@ -76,6 +83,9 @@ pub struct RulesetMatcher {
     mrs_v6_ranges: Vec<(u128, u128)>,
     /// MRS 原始统计（domain count 或 ipcidr range count）。
     mrs_count: usize,
+
+    /// sing-box JSON / SRS 共享的语义规则程序。
+    semantic_program: Option<RulesetProgram>,
 }
 
 impl RulesetMatcher {
@@ -105,7 +115,7 @@ impl RulesetMatcher {
                 ClassicalKind::DomainRegex => {
                     regex_pats.push(e.value);
                 }
-                ClassicalKind::IpCidr | ClassicalKind::SrcIpCidr => {
+                ClassicalKind::IpCidr => {
                     if let Ok(net) = e.value.parse::<IpNet>() {
                         match net {
                             IpNet::V4(v4) => m.cidr_v4.push(v4),
@@ -113,9 +123,22 @@ impl RulesetMatcher {
                         }
                     }
                 }
-                ClassicalKind::DstPort | ClassicalKind::SrcPort => {
+                ClassicalKind::SrcIpCidr => {
+                    if let Ok(net) = e.value.parse::<IpNet>() {
+                        match net {
+                            IpNet::V4(v4) => m.src_cidr_v4.push(v4),
+                            IpNet::V6(v6) => m.src_cidr_v6.push(v6),
+                        }
+                    }
+                }
+                ClassicalKind::DstPort => {
                     if let Some(range) = parse_port_range(&e.value) {
                         m.ports.push(range);
+                    }
+                }
+                ClassicalKind::SrcPort => {
+                    if let Some(range) = parse_port_range(&e.value) {
+                        m.src_ports.push(range);
                     }
                 }
                 ClassicalKind::ProcessName => {
@@ -131,6 +154,10 @@ impl RulesetMatcher {
         // 排序 CIDR 让长前缀优先（更精确）
         m.cidr_v4.sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
         m.cidr_v6.sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
+        m.src_cidr_v4
+            .sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
+        m.src_cidr_v6
+            .sort_by_key(|n| std::cmp::Reverse(n.prefix_len()));
         m
     }
 
@@ -199,8 +226,17 @@ impl RulesetMatcher {
     pub fn compile_any(name: impl Into<String>, compiled: crate::parser::RulesetCompiled) -> Self {
         match compiled {
             crate::parser::RulesetCompiled::Classical(entries) => Self::compile(name, entries),
+            crate::parser::RulesetCompiled::Semantic(program) => {
+                Self::compile_semantic(name, program)
+            }
             crate::parser::RulesetCompiled::Mrs(payload) => Self::compile_mrs(name, payload),
         }
+    }
+
+    pub fn compile_semantic(name: impl Into<String>, program: RulesetProgram) -> Self {
+        let mut matcher = RulesetMatcher::new(name);
+        matcher.semantic_program = Some(program);
+        matcher
     }
 
     /// 把 mihomo MRS 预编译产物挂到 matcher。
@@ -230,8 +266,23 @@ impl RulesetMatcher {
         port: Option<u16>,
         process: Option<&str>,
     ) -> bool {
+        self.matches_context(&RulesetMatchContext {
+            dst_host: host,
+            dst_ip: ip,
+            dst_port: port,
+            process_name: process,
+            ..Default::default()
+        })
+    }
+
+    /// 结构化匹配入口。新调用方应优先使用它，避免混淆 source / destination。
+    pub fn matches_context(&self, ctx: &RulesetMatchContext<'_>) -> bool {
+        if let Some(program) = &self.semantic_program {
+            return program.matches(ctx);
+        }
+
         // 域名相关
-        let host_lc = normalize_domain(host);
+        let host_lc = normalize_domain(ctx.dst_host);
         if !host_lc.is_empty() {
             if self.domains.contains(&host_lc) {
                 return true;
@@ -257,7 +308,7 @@ impl RulesetMatcher {
             }
         }
         // IP / CIDR
-        let resolved_ip = ip.or_else(|| host.parse::<IpAddr>().ok());
+        let resolved_ip = ctx.dst_ip.or_else(|| ctx.dst_host.parse::<IpAddr>().ok());
         if let Some(ip) = resolved_ip {
             match ip {
                 IpAddr::V4(v) => {
@@ -282,14 +333,33 @@ impl RulesetMatcher {
                 }
             }
         }
+        if let Some(ip) = ctx.src_ip {
+            match ip {
+                IpAddr::V4(v) => {
+                    if self.src_cidr_v4.iter().any(|n| n.contains(&v)) {
+                        return true;
+                    }
+                }
+                IpAddr::V6(v) => {
+                    if self.src_cidr_v6.iter().any(|n| n.contains(&v)) {
+                        return true;
+                    }
+                }
+            }
+        }
         // port
-        if let Some(p) = port {
+        if let Some(p) = ctx.dst_port {
             if self.ports.iter().any(|(lo, hi)| p >= *lo && p <= *hi) {
                 return true;
             }
         }
+        if let Some(p) = ctx.src_port {
+            if self.src_ports.iter().any(|(lo, hi)| p >= *lo && p <= *hi) {
+                return true;
+            }
+        }
         // process
-        if let Some(name) = process {
+        if let Some(name) = ctx.process_name {
             if self.processes.contains(&name.to_ascii_lowercase()) {
                 return true;
             }
@@ -312,10 +382,10 @@ impl RulesetMatcher {
             suffixes: self.suffix_trie.len(),
             keywords: self.keywords.len(),
             regex: self.regex_set.as_ref().map(|r| r.len()).unwrap_or(0),
-            cidr_v4: self.cidr_v4.len() + self.mrs_v4_ranges.len(),
-            cidr_v6: self.cidr_v6.len() + self.mrs_v6_ranges.len(),
+            cidr_v4: self.cidr_v4.len() + self.src_cidr_v4.len() + self.mrs_v4_ranges.len(),
+            cidr_v6: self.cidr_v6.len() + self.src_cidr_v6.len() + self.mrs_v6_ranges.len(),
             processes: self.processes.len(),
-            ports: self.ports.len(),
+            ports: self.ports.len() + self.src_ports.len(),
         }
     }
 }
@@ -541,5 +611,34 @@ mod tests {
         assert!(m.matches("im.qq.com", None, None, None));
         assert!(m.matches("baidu.com", None, None, None));
         assert!(m.matches("a.b.cn", None, None, None));
+    }
+
+    #[test]
+    fn classical_source_predicates_do_not_match_destination_fields() {
+        let m = RulesetMatcher::compile(
+            "source",
+            vec![
+                entry(ClassicalKind::SrcIpCidr, "10.0.0.0/8"),
+                entry(ClassicalKind::SrcPort, "1000-2000"),
+            ],
+        );
+        let destination_only = RulesetMatchContext {
+            dst_ip: Some("10.1.2.3".parse().unwrap()),
+            dst_port: Some(1500),
+            ..Default::default()
+        };
+        assert!(!m.matches_context(&destination_only));
+
+        let source_ip = RulesetMatchContext {
+            src_ip: Some("10.1.2.3".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(m.matches_context(&source_ip));
+
+        let source_port = RulesetMatchContext {
+            src_port: Some(1500),
+            ..Default::default()
+        };
+        assert!(m.matches_context(&source_port));
     }
 }
