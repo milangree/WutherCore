@@ -1,8 +1,7 @@
-//! 多格式 → 统一 [`ClassicalEntry`] 列表 / 预编译 succinct 结构。
+//! 多格式 → classical 列表 / 语义 IR / 预编译 succinct 结构。
 //!
-//! 大部分文本格式（yaml / txt / sing-box JSON / WutherCore RRS）在解析后产出
-//! 统一的 `Vec<ClassicalEntry>`，再交给 [`crate::matcher::RulesetMatcher::compile`]
-//! 编入 trie/regex/cidr 等实际索引。
+//! yaml / txt / WutherCore RRS 产出 `Vec<ClassicalEntry>`；sing-box JSON 产出
+//! [`RulesetProgram`]，保留复合 AND / OR / invert；MRS 保留上游预编译结构。
 //!
 //! mihomo MRS 是个例外：它本身就是 *预编译* 的 succinct trie / 排序 IpRange
 //! 列表。展开成 `Vec<ClassicalEntry>` 既会丢失 wildcard 语义，也会爆内存
@@ -12,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::{format::RulesetFormat, matcher::ClassicalEntry};
+use crate::{format::RulesetFormat, ir::RulesetProgram, matcher::ClassicalEntry};
 
 pub mod binary;
 pub mod mrs;
@@ -28,6 +27,14 @@ pub enum ParseError {
     Yaml(String),
     #[error("JSON 解析失败: {0}")]
     Json(String),
+    #[error("sing-box rule-set 缺少必填 version")]
+    MissingVersion,
+    #[error("不支持的 sing-box rule-set version: {0}（仅支持 1..=5）")]
+    UnsupportedVersion(u64),
+    #[error("sing-box headless rule 字段暂不能求值: {0}")]
+    UnsupportedField(&'static str),
+    #[error("sing-box headless rule 非法: {0}")]
+    InvalidRule(String),
     #[error("非法行 \"{0}\"")]
     BadLine(String),
     #[error("尚未实现该二进制格式: {0}")]
@@ -38,9 +45,10 @@ pub enum ParseError {
     Unknown,
 }
 
-/// 解析结果 —— 兼容文本与预编译两种产物。manager 用这个统一入口。
+/// 解析结果 —— 兼容 classical、语义 IR 与预编译 MRS。manager 用这个统一入口。
 pub enum RulesetCompiled {
     Classical(Vec<ClassicalEntry>),
+    Semantic(RulesetProgram),
     Mrs(MrsPayload),
 }
 
@@ -53,7 +61,11 @@ pub fn parse_ruleset(
     match format {
         RulesetFormat::Yaml => yaml::parse(body),
         RulesetFormat::Text => txt::parse(body),
-        RulesetFormat::SingboxJson => sb_json::parse(body),
+        RulesetFormat::SingboxJson => Err(ParseError::InvalidRule(
+            "sing-box JSON 含复合布尔语义，不能无损转换为 Vec<ClassicalEntry>；请使用 \
+             parse_ruleset_compiled"
+                .into(),
+        )),
         RulesetFormat::Mrs => binary::parse_mrs(body),
         RulesetFormat::Srs => binary::parse_srs(body),
         RulesetFormat::Rrs => crate::rrs::decode(body),
@@ -68,6 +80,7 @@ pub fn parse_ruleset_compiled(
 ) -> Result<RulesetCompiled, ParseError> {
     match format {
         RulesetFormat::Mrs => mrs::parse(body).map(RulesetCompiled::Mrs),
+        RulesetFormat::SingboxJson => sb_json::parse(body).map(RulesetCompiled::Semantic),
         // 其它格式继续走 entries 路径
         _ => parse_ruleset(format, body).map(RulesetCompiled::Classical),
     }

@@ -542,8 +542,11 @@ pub type BoxedStream = Pin<Box<dyn ProxyStream>>;
 ///   的实现才能声明 `capabilities().udp = true`。
 /// * Block：直接返回 ConnectionRefused。
 ///
-/// `target` 是远端目标地址（域名或 IP）；recv_from 返回的 SocketAddr
-/// 可能是 NAT-mapped 后的 src，调用方一般忽略（TUN 转发只关心 payload）。
+/// `target` 是远端目标地址（域名或 IP）。
+///
+/// 当前 `recv_from` ABI 只返回 payload 长度，无法把响应源地址交还给调用方。
+/// 因此基于 connected UDP socket 的实现必须对非初始目标 fail closed；在 ABI
+/// 扩展为返回 endpoint 之前，不能伪装支持一个 association 上的多目标转发。
 #[async_trait]
 pub trait UdpSocketLike: Send + Sync {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize>;
@@ -780,7 +783,11 @@ async fn resolve_host_internal(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use tokio::net::TcpListener;
 
@@ -788,11 +795,71 @@ mod tests {
     use crate::{direct::DirectOutbound, transport::tcp::marked_connect};
 
     static TEST_PROTECTOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const NETWORK_TEST_TIMEOUT: Duration = Duration::from_secs(3);
+    const NETWORK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
     fn lock_test_protector() -> std::sync::MutexGuard<'static, ()> {
         TEST_PROTECTOR_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    async fn network_timeout<T>(label: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(NETWORK_TEST_TIMEOUT, future)
+            .await
+            .unwrap_or_else(|_| panic!("{label} timed out after {NETWORK_TEST_TIMEOUT:?}"))
+    }
+
+    /// Binding `[::1]` can succeed even when the host IPv6 data plane is
+    /// disabled or intercepted. Probe with raw Tokio sockets so such hosts
+    /// skip the Direct-specific assertion instead of hanging the whole suite.
+    async fn ipv6_udp_loopback_available() -> bool {
+        let server = match tokio::net::UdpSocket::bind("[::1]:0").await {
+            Ok(socket) => socket,
+            Err(_) => return false,
+        };
+        let client = match tokio::net::UdpSocket::bind("[::]:0").await {
+            Ok(socket) => socket,
+            Err(_) => return false,
+        };
+        let server_addr = match server.local_addr() {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+
+        match tokio::time::timeout(
+            NETWORK_PROBE_TIMEOUT,
+            client.send_to(b"ipv6-probe", server_addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            _ => return false,
+        }
+
+        let mut request = [0u8; 32];
+        let peer = match tokio::time::timeout(NETWORK_PROBE_TIMEOUT, server.recv_from(&mut request))
+            .await
+        {
+            Ok(Ok((n, peer))) if &request[..n] == b"ipv6-probe" => peer,
+            _ => return false,
+        };
+
+        match tokio::time::timeout(NETWORK_PROBE_TIMEOUT, server.send_to(b"ipv6-reply", peer)).await
+        {
+            Ok(Ok(_)) => {}
+            _ => return false,
+        }
+
+        let mut response = [0u8; 32];
+        matches!(
+            tokio::time::timeout(
+                NETWORK_PROBE_TIMEOUT,
+                client.recv_from(&mut response),
+            )
+            .await,
+            Ok(Ok((n, _))) if &response[..n] == b"ipv6-reply"
+        )
     }
 
     struct CountingProtector {
@@ -928,18 +995,25 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (release_accept, wait_release) = tokio::sync::oneshot::channel::<()>();
         let accept = tokio::spawn(async move {
-            let Ok((_stream, _peer)) = listener.accept().await else {
+            let Ok((_stream, _peer)) =
+                network_timeout("socket protector TCP accept", listener.accept()).await
+            else {
                 return;
             };
-            let _ = wait_release.await;
+            let _ = network_timeout("socket protector TCP release", wait_release).await;
         });
 
-        let stream = marked_connect(addr, std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
+        let stream = network_timeout(
+            "socket protector marked TCP connect",
+            marked_connect(addr, Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
         drop(stream);
         let _ = release_accept.send(());
-        let _ = accept.await;
+        network_timeout("socket protector TCP task", accept)
+            .await
+            .unwrap();
 
         set_socket_protector(None);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -954,22 +1028,27 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (release_accept, wait_release) = tokio::sync::oneshot::channel::<()>();
         let accept = tokio::spawn(async move {
-            let Ok((_stream, _peer)) = listener.accept().await else {
+            let Ok((_stream, _peer)) =
+                network_timeout("tracked TCP accept", listener.accept()).await
+            else {
                 return;
             };
-            let _ = wait_release.await;
+            let _ = network_timeout("tracked TCP release", wait_release).await;
         });
 
-        let stream = marked_connect(addr, std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
+        let stream = network_timeout(
+            "tracked marked TCP connect",
+            marked_connect(addr, Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
         let local = stream.local_addr().unwrap();
 
         assert!(crate::loopback::is_loopback_tcp_source(local));
 
         drop(stream);
         let _ = release_accept.send(());
-        let _ = accept.await;
+        network_timeout("tracked TCP task", accept).await.unwrap();
         assert!(!crate::loopback::is_loopback_tcp_source(local));
     }
 
@@ -982,10 +1061,12 @@ mod tests {
         })));
 
         let outbound = DirectOutbound::new();
-        let udp = outbound
-            .dial_udp(DialContext::udp("1.1.1.1", 53))
-            .await
-            .unwrap();
+        let udp = network_timeout(
+            "protected Direct UDP dial",
+            outbound.dial_udp(DialContext::udp("1.1.1.1", 53)),
+        )
+        .await
+        .unwrap();
         drop(udp);
 
         set_socket_protector(None);
@@ -1001,25 +1082,83 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let echo = tokio::spawn(async move {
             let mut buf = [0u8; 64];
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let (n, peer) = network_timeout("IPv4 UDP echo receive", server.recv_from(&mut buf))
+                .await
+                .unwrap();
             assert_eq!(&buf[..n], b"ping");
-            server.send_to(b"pong", peer).await.unwrap();
+            network_timeout("IPv4 UDP echo send", server.send_to(b"pong", peer))
+                .await
+                .unwrap();
         });
 
         let outbound = DirectOutbound::new();
-        let udp = outbound
-            .dial_udp(DialContext::udp("127.0.0.1", server_addr.port()))
-            .await
-            .unwrap();
-        udp.send_to(b"ping", "127.0.0.1", server_addr.port())
-            .await
-            .unwrap();
+        let udp = network_timeout(
+            "IPv4 Direct UDP dial",
+            outbound.dial_udp(DialContext::udp("127.0.0.1", server_addr.port())),
+        )
+        .await
+        .unwrap();
+        network_timeout(
+            "IPv4 Direct UDP send",
+            udp.send_to(b"ping", "127.0.0.1", server_addr.port()),
+        )
+        .await
+        .unwrap();
 
         let mut buf = [0u8; 64];
-        let n = udp.recv_from(&mut buf).await.unwrap();
+        let n = network_timeout("IPv4 Direct UDP receive", udp.recv_from(&mut buf))
+            .await
+            .unwrap();
 
         assert_eq!(&buf[..n], b"pong");
-        let _ = echo.await;
+        network_timeout("IPv4 UDP echo task", echo).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_udp_fails_closed_for_a_different_target() {
+        let _guard = lock_test_protector();
+        set_socket_protector(None);
+
+        let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+
+        let outbound = DirectOutbound::new();
+        let udp = network_timeout(
+            "fixed-target Direct UDP dial",
+            outbound.dial_udp(DialContext::udp("127.0.0.1", first_addr.port())),
+        )
+        .await
+        .unwrap();
+
+        let same_family_err = udp
+            .send_to(b"wrong-peer", "127.0.0.1", second_addr.port())
+            .await
+            .unwrap_err();
+        assert_eq!(same_family_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            same_family_err
+                .to_string()
+                .contains("multiple destinations")
+        );
+
+        let cross_family_err = udp
+            .send_to(b"wrong-family", "::1", first_addr.port())
+            .await
+            .unwrap_err();
+        assert_eq!(cross_family_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let mut first_buf = [0u8; 64];
+        let mut second_buf = [0u8; 64];
+        let (first_receive, second_receive) = tokio::join!(
+            tokio::time::timeout(NETWORK_PROBE_TIMEOUT, first.recv_from(&mut first_buf),),
+            tokio::time::timeout(NETWORK_PROBE_TIMEOUT, second.recv_from(&mut second_buf),)
+        );
+        assert!(
+            first_receive.is_err() && second_receive.is_err(),
+            "a rejected Direct UDP send must not leak to either destination"
+        );
     }
 
     #[tokio::test]
@@ -1027,31 +1166,64 @@ mod tests {
         let _guard = lock_test_protector();
         set_socket_protector(None);
 
-        let Ok(server) = tokio::net::UdpSocket::bind("[::1]:0").await else {
-            return;
+        let server = match network_timeout(
+            "IPv6 UDP echo bind",
+            tokio::net::UdpSocket::bind("[::1]:0"),
+        )
+        .await
+        {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                eprintln!(
+                    "skipping Direct IPv6 UDP assertion: host cannot bind IPv6 loopback: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("IPv6 UDP echo bind failed: {error}"),
         };
         let server_addr = server.local_addr().unwrap();
-        let echo = tokio::spawn(async move {
-            let mut buf = [0u8; 64];
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"ping6");
-            server.send_to(b"pong6", peer).await.unwrap();
-        });
 
         let outbound = DirectOutbound::new();
-        let udp = outbound
-            .dial_udp(DialContext::udp("::1", server_addr.port()))
-            .await
-            .unwrap();
-        udp.send_to(b"ping6", "::1", server_addr.port())
-            .await
-            .unwrap();
+        let udp = network_timeout(
+            "IPv6 Direct UDP dial",
+            outbound.dial_udp(DialContext::udp("::1", server_addr.port())),
+        )
+        .await
+        .unwrap();
+
+        if !ipv6_udp_loopback_available().await {
+            eprintln!(
+                "Direct created an IPv6 association, but the host IPv6 loopback data plane is \
+                 unavailable; skipping datagram round-trip"
+            );
+            return;
+        }
+
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (n, peer) = network_timeout("IPv6 UDP echo receive", server.recv_from(&mut buf))
+                .await
+                .unwrap();
+            assert_eq!(&buf[..n], b"ping6");
+            network_timeout("IPv6 UDP echo send", server.send_to(b"pong6", peer))
+                .await
+                .unwrap();
+        });
+
+        network_timeout(
+            "IPv6 Direct UDP send",
+            udp.send_to(b"ping6", "::1", server_addr.port()),
+        )
+        .await
+        .unwrap();
 
         let mut buf = [0u8; 64];
-        let n = udp.recv_from(&mut buf).await.unwrap();
+        let n = network_timeout("IPv6 Direct UDP receive", udp.recv_from(&mut buf))
+            .await
+            .unwrap();
 
         assert_eq!(&buf[..n], b"pong6");
-        let _ = echo.await;
+        network_timeout("IPv6 UDP echo task", echo).await.unwrap();
     }
 
     #[test]

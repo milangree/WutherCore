@@ -189,9 +189,11 @@ impl RulesetManager {
         let format = detect_format(spec.format.as_deref(), src, &body);
         debug!(target: "ruleset", name, ?format, bytes = body.len(), "parse");
         let compiled = parse_ruleset_compiled(format, &body).map_err(|e| e.to_string())?;
-        // 统计 size：classical 用 Vec.len()；MRS 用 payload.count（header 字段）。
+        // 统计 size：classical 用 Vec.len()；语义格式用顶层 rule 数；
+        // MRS 用 payload.count（header 字段）。
         let total = match &compiled {
             crate::parser::RulesetCompiled::Classical(v) => v.len(),
+            crate::parser::RulesetCompiled::Semantic(program) => program.rule_count(),
             crate::parser::RulesetCompiled::Mrs(p) => p.count(),
         };
         if let crate::parser::RulesetCompiled::Mrs(p) = &compiled {

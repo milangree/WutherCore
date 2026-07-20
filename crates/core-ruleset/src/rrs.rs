@@ -428,82 +428,111 @@ pub fn entries_to_txt(entries: &[ClassicalEntry]) -> String {
 
 pub fn entries_to_singbox_json(entries: &[ClassicalEntry]) -> String {
     use std::collections::BTreeMap;
-    let mut bucket: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
-    let mut ports: Vec<&str> = Vec::new();
+
+    use serde_json::{Map, Value, json};
+
+    // ClassicalEntry 列表是顶层 OR。sing-box default rule 内部却是字段组间
+    // AND，因此只能合并官方定义为同一 OR 组的 destination domain/IP 字段；
+    // source IP、process、source/destination port 必须拆成独立顶层规则。
+    let mut destination: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
+    let mut source_ips = Vec::new();
+    let mut processes = Vec::new();
+    let mut destination_ports = Vec::new();
+    let mut destination_port_ranges = Vec::new();
+    let mut source_ports = Vec::new();
+    let mut source_port_ranges = Vec::new();
+
     for e in entries {
-        let key = match e.kind {
-            ClassicalKind::Domain => "domain",
-            ClassicalKind::DomainSuffix => "domain_suffix",
-            ClassicalKind::DomainKeyword => "domain_keyword",
-            ClassicalKind::DomainRegex => "domain_regex",
-            ClassicalKind::IpCidr => "ip_cidr",
-            ClassicalKind::SrcIpCidr => "source_ip_cidr",
-            ClassicalKind::DstPort | ClassicalKind::SrcPort => {
-                ports.push(e.value.as_str());
-                continue;
-            }
-            ClassicalKind::ProcessName => "process_name",
-        };
-        bucket.entry(key).or_default().push(e.value.as_str());
-    }
-    let mut out = String::from("{\n  \"version\": 2,\n  \"rules\": [\n    {");
-    let mut first = true;
-    for (k, v) in &bucket {
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push_str(&format!("\n      \"{k}\": ["));
-        for (i, s) in v.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!(
-                "\"{}\"",
-                s.replace('\\', "\\\\").replace('"', "\\\"")
-            ));
-        }
-        out.push(']');
-    }
-    if !ports.is_empty() {
-        if !first {
-            out.push(',');
-        }
-        let mut singles: Vec<&str> = Vec::new();
-        let mut ranges: Vec<&str> = Vec::new();
-        for p in &ports {
-            if p.contains('-') {
-                ranges.push(p);
-            } else {
-                singles.push(p);
-            }
-        }
-        if !singles.is_empty() {
-            out.push_str("\n      \"port\": [");
-            for (i, s) in singles.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
+        match e.kind {
+            ClassicalKind::Domain => destination
+                .entry("domain")
+                .or_default()
+                .push(json!(e.value)),
+            ClassicalKind::DomainSuffix => {
+                // WutherCore classical DomainSuffix 始终是 root + subdomain；
+                // sing-box leading dot 却表示仅 subdomain，因此导出时必须剥点。
+                let suffix = e.value.trim().trim_start_matches('.').trim_end_matches('.');
+                if !suffix.is_empty() {
+                    destination
+                        .entry("domain_suffix")
+                        .or_default()
+                        .push(json!(suffix));
                 }
-                out.push_str(s);
             }
-            out.push(']');
-        }
-        if !ranges.is_empty() {
-            if !singles.is_empty() {
-                out.push(',');
-            }
-            out.push_str("\n      \"port_range\": [");
-            for (i, s) in ranges.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
+            ClassicalKind::DomainKeyword => destination
+                .entry("domain_keyword")
+                .or_default()
+                .push(json!(e.value)),
+            ClassicalKind::DomainRegex => destination
+                .entry("domain_regex")
+                .or_default()
+                .push(json!(e.value)),
+            ClassicalKind::IpCidr => destination
+                .entry("ip_cidr")
+                .or_default()
+                .push(json!(e.value)),
+            ClassicalKind::SrcIpCidr => source_ips.push(json!(e.value)),
+            ClassicalKind::DstPort => {
+                if let Some((start, end)) = parse_port_range(&e.value) {
+                    if start == end {
+                        destination_ports.push(json!(start));
+                    } else {
+                        destination_port_ranges.push(json!(format!("{start}:{end}")));
+                    }
                 }
-                out.push_str(&format!("\"{}\"", s.replace('-', ":")));
             }
-            out.push(']');
+            ClassicalKind::SrcPort => {
+                if let Some((start, end)) = parse_port_range(&e.value) {
+                    if start == end {
+                        source_ports.push(json!(start));
+                    } else {
+                        source_port_ranges.push(json!(format!("{start}:{end}")));
+                    }
+                }
+            }
+            ClassicalKind::ProcessName => processes.push(json!(e.value)),
         }
     }
-    out.push_str("\n    }\n  ]\n}\n");
-    out
+
+    let mut rules = Vec::new();
+    if !destination.is_empty() {
+        let mut rule = Map::new();
+        for (field, values) in destination {
+            rule.insert(field.into(), Value::Array(values));
+        }
+        rules.push(Value::Object(rule));
+    }
+    if !source_ips.is_empty() {
+        rules.push(json!({"source_ip_cidr": source_ips}));
+    }
+    if !destination_ports.is_empty() || !destination_port_ranges.is_empty() {
+        let mut rule = Map::new();
+        if !destination_ports.is_empty() {
+            rule.insert("port".into(), Value::Array(destination_ports));
+        }
+        if !destination_port_ranges.is_empty() {
+            rule.insert("port_range".into(), Value::Array(destination_port_ranges));
+        }
+        rules.push(Value::Object(rule));
+    }
+    if !source_ports.is_empty() || !source_port_ranges.is_empty() {
+        let mut rule = Map::new();
+        if !source_ports.is_empty() {
+            rule.insert("source_port".into(), Value::Array(source_ports));
+        }
+        if !source_port_ranges.is_empty() {
+            rule.insert("source_port_range".into(), Value::Array(source_port_ranges));
+        }
+        rules.push(Value::Object(rule));
+    }
+    if !processes.is_empty() {
+        rules.push(json!({"process_name": processes}));
+    }
+
+    let mut output = serde_json::to_string_pretty(&json!({"version": 2, "rules": rules}))
+        .expect("serializing a JSON value cannot fail");
+    output.push('\n');
+    output
 }
 
 fn kind_str(k: ClassicalKind) -> &'static str {
@@ -626,26 +655,31 @@ mod tests {
     #[test]
     fn singbox_json_export_parseable() {
         let input = vec![
-            entry(ClassicalKind::DomainSuffix, "example.com"),
+            entry(ClassicalKind::DomainSuffix, ".example.com"),
             entry(ClassicalKind::DstPort, "443"),
             entry(ClassicalKind::DstPort, "1000-2000"),
         ];
+        let direct_json = entries_to_singbox_json(&input);
+        let direct_value: serde_json::Value = serde_json::from_str(&direct_json).unwrap();
+        assert_eq!(
+            direct_value["rules"][0]["domain_suffix"][0],
+            serde_json::Value::String("example.com".into())
+        );
         let bin = encode(&input);
         let out = decode(&bin).unwrap();
         let json = entries_to_singbox_json(&out);
-        // 用 sing-box parser 反解
-        let back = crate::parser::sb_json::parse(json.as_bytes()).unwrap();
-        assert!(
-            back.iter()
-                .any(|e| e.kind == ClassicalKind::DomainSuffix && e.value == "example.com")
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["rules"][0]["domain_suffix"][0],
+            serde_json::Value::String("example.com".into())
         );
-        assert!(
-            back.iter()
-                .any(|e| e.kind == ClassicalKind::DstPort && e.value == "443")
-        );
-        assert!(
-            back.iter()
-                .any(|e| e.kind == ClassicalKind::DstPort && e.value == "1000-2000")
-        );
+        // 用语义 parser 反解；原 classical 列表的顶层 OR 必须保持。
+        let program = crate::parser::sb_json::parse(json.as_bytes()).unwrap();
+        let matcher = crate::RulesetMatcher::compile_semantic("roundtrip", program);
+        assert!(matcher.matches("example.com", None, Some(80), None));
+        assert!(matcher.matches("www.example.com", None, Some(80), None));
+        assert!(matcher.matches("unrelated.test", None, Some(443), None));
+        assert!(matcher.matches("unrelated.test", None, Some(1500), None));
+        assert!(!matcher.matches("unrelated.test", None, Some(80), None));
     }
 }

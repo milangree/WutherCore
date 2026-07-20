@@ -1063,6 +1063,7 @@ fn should_manage_linux_tun_config(device: &dyn TunIo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TunConfigProbe {
         preconfigured: bool,
@@ -1230,6 +1231,54 @@ mod tests {
                 .all(|r| r.table == Some(plan.iproute2_table_index)),
             "auto_route split defaults must live in the custom table; main table is the outbound mark bypass"
         );
+    }
+
+    #[test]
+    fn tproxy_rule_failure_drops_prebound_listeners_and_reverts() {
+        #[derive(Debug)]
+        struct ListenerDropProbe(Arc<AtomicBool>);
+
+        impl Drop for ListenerDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let listener_dropped = Arc::new(AtomicBool::new(false));
+        let rules_reverted = Arc::new(AtomicBool::new(false));
+        let dropped = listener_dropped.clone();
+        let reverted = rules_reverted.clone();
+
+        let result = prepare_tproxy_start(
+            || Ok(ListenerDropProbe(dropped)),
+            || Err(CaptureError::Doctor("injected rule failure".into())),
+            || reverted.store(true, Ordering::SeqCst),
+        );
+
+        assert!(matches!(result, Err(CaptureError::Doctor(_))));
+        assert!(listener_dropped.load(Ordering::SeqCst));
+        assert!(rules_reverted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn tproxy_bind_failure_never_installs_or_reverts_rules() {
+        let install_called = Arc::new(AtomicBool::new(false));
+        let revert_called = Arc::new(AtomicBool::new(false));
+        let installed = install_called.clone();
+        let reverted = revert_called.clone();
+
+        let result: Result<(), CaptureError> = prepare_tproxy_start(
+            || Err(CaptureError::DeviceFailed("address already in use".into())),
+            || {
+                installed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || reverted.store(true, Ordering::SeqCst),
+        );
+
+        assert!(matches!(result, Err(CaptureError::DeviceFailed(_))));
+        assert!(!install_called.load(Ordering::SeqCst));
+        assert!(!revert_called.load(Ordering::SeqCst));
     }
 }
 
@@ -2015,6 +2064,19 @@ struct TproxyState {
     stop_udp: Option<oneshot::Sender<()>>,
 }
 
+struct TproxyRuleCleanup<'a> {
+    plan: &'a CapturePlan,
+    armed: bool,
+}
+
+impl Drop for TproxyRuleCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            LinuxTproxy::revert_rules(self.plan);
+        }
+    }
+}
+
 impl LinuxTproxy {
     pub fn new(plan: CapturePlan) -> Self {
         Self {
@@ -2035,19 +2097,13 @@ impl LinuxTproxy {
             ));
         }
 
-        let mut failed = Vec::new();
         for cmd in tproxy_rules::setup_commands(plan, outbound_mark) {
-            if !matches!(run_tproxy_command(&cmd), Some(s) if s.success()) {
-                failed.push(cmd.render());
-            }
-        }
-        if !failed.is_empty() {
-            warn!(
-                target: "capture::tproxy::rules",
-                failed = failed.len(),
-                first = %failed[0],
-                "some TPROXY rule commands failed (continuing like mihomo iptables setup)"
-            );
+            run_tproxy_command(&cmd).map_err(|reason| {
+                CaptureError::Doctor(format!(
+                    "TPROXY rule command failed: `{}`: {reason}",
+                    cmd.render()
+                ))
+            })?;
         }
         info!(
             target: "capture::tproxy::rules",
@@ -2060,19 +2116,48 @@ impl LinuxTproxy {
 
     fn revert_rules(plan: &CapturePlan) {
         for cmd in tproxy_rules::cleanup_commands(plan) {
-            let _ = run_tproxy_command(&cmd);
+            if let Err(reason) = run_tproxy_command(&cmd) {
+                debug!(
+                    target: "capture::tproxy::rules",
+                    cmd = %cmd.render(),
+                    %reason,
+                    "TPROXY cleanup command failed"
+                );
+            }
         }
     }
 }
 
-fn run_tproxy_command(cmd: &tproxy_rules::TproxyCommand) -> Option<std::process::ExitStatus> {
+fn run_tproxy_command(cmd: &tproxy_rules::TproxyCommand) -> Result<(), String> {
     debug!(target: "capture::tproxy::rules", cmd = %cmd.render(), "exec");
-    std::process::Command::new(cmd.program)
+    let output = std::process::Command::new(cmd.program)
         .args(&cmd.args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        Err(format!("exit status {}", output.status))
+    } else {
+        Err(format!("exit status {}: {stderr}", output.status))
+    }
+}
+
+fn prepare_tproxy_start<L>(
+    bind: impl FnOnce() -> Result<L, CaptureError>,
+    install_rules: impl FnOnce() -> Result<(), CaptureError>,
+    revert_rules: impl FnOnce(),
+) -> Result<L, CaptureError> {
+    let listeners = bind()?;
+    if let Err(error) = install_rules() {
+        drop(listeners);
+        revert_rules();
+        return Err(error);
+    }
+    Ok(listeners)
 }
 
 #[async_trait]
@@ -2097,42 +2182,44 @@ impl CaptureEngine for LinuxTproxy {
             .auto_redirect_marks
             .output
             .unwrap_or(tproxy_rules::TPROXY_FWMARK);
-        Self::install_rules(&self.plan, outbound_mark)?;
-
-        // 启动 TCP TPROXY 监听 :7894（默认；与 nft 规则中的端口一致）。
-        let bind_tcp: std::net::SocketAddr = format!("127.0.0.1:{}", tproxy_rules::TPROXY_PORT)
-            .parse()
-            .unwrap();
-        let bind_udp: std::net::SocketAddr = format!("127.0.0.1:{}", tproxy_rules::TPROXY_PORT)
-            .parse()
-            .unwrap();
-        let (stop_tcp_tx, mut stop_tcp_rx) = oneshot::channel::<()>();
-        let (stop_udp_tx, mut stop_udp_rx) = oneshot::channel::<()>();
+        let bind = crate::platform::linux_tproxy::ipv4_tproxy_bind_addr(tproxy_rules::TPROXY_PORT);
+        let listeners = prepare_tproxy_start(
+            || crate::platform::linux_tproxy::bind_tproxy_listeners(bind),
+            || Self::install_rules(&self.plan, outbound_mark),
+            || Self::revert_rules(&self.plan),
+        )?;
+        let (tcp_listener, udp_socket, bound) = listeners.into_parts();
+        let (stop_tcp_tx, stop_tcp_rx) = oneshot::channel::<()>();
+        let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
 
         // TCP TPROXY listener —— accept 后由 listener 自身 dial+splice，不再
         // 依赖 supervisor 的事件路径（旧逻辑会 dial 然后 drop stream）。
         let evt_tcp = events.clone();
         let rt_tcp = runtime.clone();
         let tcp_handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = &mut stop_tcp_rx => {}
-                r = crate::platform::linux_tproxy::run_tcp_tproxy(bind_tcp, evt_tcp, rt_tcp) => {
-                    if let Err(e) = r {
-                        warn!(target: "capture::tproxy", error = %e, "tcp tproxy exited");
-                    }
-                }
+            if let Err(e) = crate::platform::linux_tproxy::run_tcp_tproxy(
+                tcp_listener,
+                evt_tcp,
+                rt_tcp,
+                stop_tcp_rx,
+            )
+            .await
+            {
+                warn!(target: "capture::tproxy", error = %e, "tcp tproxy exited");
             }
         });
         let evt_udp = events.clone();
         let rt_udp = runtime.clone();
         let udp_handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = &mut stop_udp_rx => {}
-                r = crate::platform::linux_tproxy::run_udp_tproxy(bind_udp, evt_udp, rt_udp) => {
-                    if let Err(e) = r {
-                        warn!(target: "capture::tproxy", error = %e, "udp tproxy exited");
-                    }
-                }
+            if let Err(e) = crate::platform::linux_tproxy::run_udp_tproxy(
+                udp_socket,
+                evt_udp,
+                rt_udp,
+                stop_udp_rx,
+            )
+            .await
+            {
+                warn!(target: "capture::tproxy", error = %e, "udp tproxy exited");
             }
         });
 
@@ -2141,7 +2228,7 @@ impl CaptureEngine for LinuxTproxy {
         g.stop_tcp = Some(stop_tcp_tx);
         g.stop_udp = Some(stop_udp_tx);
         g.on = true;
-        info!(target: "capture", "linux tproxy started (TCP+UDP listeners on :7894)");
+        info!(target: "capture", addr = %bound, "linux tproxy started (TCP+UDP listeners ready)");
         Ok(())
     }
     async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
@@ -2149,20 +2236,34 @@ impl CaptureEngine for LinuxTproxy {
         if !g.on {
             return Ok(());
         }
+        // Keep cleanup cancellation-safe: after the stop signals are sent,
+        // any cancellation while awaiting child tasks still removes policy
+        // routing/firewall state through this synchronous Drop guard.
+        let mut rule_cleanup = TproxyRuleCleanup {
+            plan: &self.plan,
+            armed: true,
+        };
         if let Some(tx) = g.stop_tcp.take() {
             let _ = tx.send(());
         }
         if let Some(tx) = g.stop_udp.take() {
             let _ = tx.send(());
         }
+        // No await has occurred yet, so both listeners have received stop
+        // before the externally visible state flips to off.
+        g.on = false;
         if let Some(h) = g.tcp_handle.take() {
-            h.abort();
+            if let Err(e) = h.await {
+                warn!(target: "capture::tproxy", error = %e, "tcp tproxy task join failed");
+            }
         }
         if let Some(h) = g.udp_handle.take() {
-            h.abort();
+            if let Err(e) = h.await {
+                warn!(target: "capture::tproxy", error = %e, "udp tproxy task join failed");
+            }
         }
         Self::revert_rules(&self.plan);
-        g.on = false;
+        rule_cleanup.armed = false;
         info!(target: "capture", "linux tproxy stopped");
         Ok(())
     }

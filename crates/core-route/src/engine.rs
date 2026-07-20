@@ -6,7 +6,7 @@
 use std::{net::IpAddr, sync::Arc};
 
 use core_config::runtime_plan::{RouteAction, RouteMatcher, RoutePlan};
-use core_ruleset::RulesetIndex;
+use core_ruleset::{RulesetIndex, RulesetMatchContext};
 use ipnet::IpNet;
 
 use crate::builtin;
@@ -192,7 +192,17 @@ fn step_matches(
         RouteMatcher::Set(name) => match rulesets {
             Some(idx) => idx
                 .get(name)
-                .map(|m| m.matches(&ctx.host, ctx.ip, Some(ctx.port), ctx.process.as_deref()))
+                .map(|m| {
+                    m.matches_context(&RulesetMatchContext {
+                        dst_host: &ctx.host,
+                        dst_ip: ctx.ip,
+                        dst_port: Some(ctx.port),
+                        src_ip: None,
+                        src_port: None,
+                        network: Some(ctx.network.as_str()),
+                        process_name: ctx.process.as_deref(),
+                    })
+                })
                 .unwrap_or(false),
             None => false,
         },
@@ -276,6 +286,7 @@ fn match_cidr(ctx: &FlowContext, cidr: &str, extra: &[IpNet]) -> bool {
 #[cfg(test)]
 mod tests {
     use core_config::runtime_plan::{RoutePlan, RouteStep};
+    use core_ruleset::{RulesetFormat, RulesetIndex, RulesetMatcher, parse_ruleset_compiled};
 
     use super::*;
 
@@ -400,5 +411,46 @@ mod tests {
         // 80/udp 不命中（网络对，端口不对）
         let (d_other, _, _) = eng.decide(&FlowContext::for_domain("a.com", 80, NetworkKind::Udp));
         assert_eq!(d_other, RouteDecision::Group("main".into()));
+    }
+
+    #[test]
+    fn set_matcher_receives_network_context() {
+        let compiled = parse_ruleset_compiled(
+            RulesetFormat::SingboxJson,
+            br#"{"version":1,"rules":[{"domain":"dns.example","network":"udp"}]}"#,
+        )
+        .unwrap();
+        let index = RulesetIndex::new();
+        index.insert(Arc::new(RulesetMatcher::compile_any("dns", compiled)));
+        let plan = RoutePlan {
+            preset: "custom".into(),
+            r#final: "main".into(),
+            steps: vec![
+                RouteStep {
+                    matcher: RouteMatcher::Set("dns".into()),
+                    action: RouteAction::Group("hijack".into()),
+                    source: "set-network".into(),
+                },
+                RouteStep {
+                    matcher: RouteMatcher::Any,
+                    action: RouteAction::Group("main".into()),
+                    source: "any".into(),
+                },
+            ],
+            sets: Default::default(),
+        };
+        let engine = RouteEngine::with_rulesets(plan, index);
+        let udp = engine.decide(&FlowContext::for_domain(
+            "dns.example",
+            53,
+            NetworkKind::Udp,
+        ));
+        let tcp = engine.decide(&FlowContext::for_domain(
+            "dns.example",
+            53,
+            NetworkKind::Tcp,
+        ));
+        assert_eq!(udp.0, RouteDecision::Group("hijack".into()));
+        assert_eq!(tcp.0, RouteDecision::Group("main".into()));
     }
 }
