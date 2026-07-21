@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `auto_route` / TPROXY / REDIRECT 下 capture 启动失败改为 fail-closed。
+
 ### Added
 
 - 组网后端能力/附件模型、冻结 descriptor、强类型宿主资源声明与语义化系统资源冲突预检；
