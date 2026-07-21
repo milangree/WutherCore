@@ -1,8 +1,13 @@
-# Changelog
+﻿# Changelog
 
 本文件记录用户可见的重要变化。正式版本的发布说明由 GitHub Release 根据 `.github/release.yml` 分类生成，并补充兼容性、已知限制和升级方式。
 
 ## [Unreleased]
+
+### Security
+
+- URLTest 与订阅/规则集 fetch 默认拒绝 loopback/私网/链路本地/云元数据目标（含 redirect 跳后复查）；
+- fetch 日志只记录 host，避免订阅 token 落入 debug/warn。
 
 ### Added
 
