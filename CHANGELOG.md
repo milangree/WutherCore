@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Security
+
+- 非本机管理面板（`listen.share: home|all` 或非 loopback `listen.panel`）在 `ui.secret` 为空时拒绝编译/启动。
+
+### Fixed
+
+- `groups.*.choose: chain` 在配置编译期拒绝，避免静默退化为单跳第一节点。
+
 ### Added
 
 - 组网后端能力/附件模型、冻结 descriptor、强类型宿主资源声明与语义化系统资源冲突预检；
