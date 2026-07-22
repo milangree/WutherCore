@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/MiChongs/WutherCore/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/MiChongs/WutherCore/ci.yml?branch=main&label=Required%20CI&logo=github" alt="Required CI"></a>
   <a href="https://github.com/MiChongs/WutherCore/releases"><img src="https://img.shields.io/github/v/release/MiChongs/WutherCore?include_prereleases&sort=semver&logo=github" alt="GitHub Release"></a>
+  <a href="https://t.me/wuther_core_chat"><img src="https://img.shields.io/badge/Telegram-Chat-26A5E4?logo=telegram&logoColor=white" alt="Telegram Chat"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.85%2B-CE422B?logo=rust&logoColor=white" alt="Rust 1.85+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3DA639" alt="MIT License"></a>
 </p>
